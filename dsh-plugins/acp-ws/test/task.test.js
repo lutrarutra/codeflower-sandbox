@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { Readable } from 'node:stream';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -7,10 +8,11 @@ import test from 'node:test';
 import { findChoice, firstPrompt, parseStatus, renderInstructions, requestedSettings, runTask } from '../src/task.js';
 
 const fakeAgent = fileURLToPath(new URL('../fixtures/fake-acp.js', import.meta.url));
+const fakePty = fileURLToPath(new URL('../fixtures/fake-pty.js', import.meta.url));
 const template = 'Headless.{{#report}} Report to {{output}}/report.html.{{/report}}{{^report}} No report.{{/report}}';
 
 function fakeAgentDefinition(options = {}) {
-  const { signedIn = true, args = [] } = options;
+  const { signedIn = true, args = [], usageFd } = options;
   const goal = 'goal' in options ? options.goal : { maxLength: 4000 };
   return {
     label: 'Fake',
@@ -18,9 +20,10 @@ function fakeAgentDefinition(options = {}) {
       return [process.execPath, fakeAgent, ...args];
     },
     env: {},
+    usageFd,
     goal,
     async signedIn() {
-      return signedIn;
+      return typeof signedIn === 'function' ? signedIn() : signedIn;
     }
   };
 }
@@ -45,23 +48,38 @@ async function setup(t, task, checkExit = 0) {
 async function run(t, task, agentOptions, extra = {}) {
   const { checkExit = 0, ...runOptions } = extra;
   const context = await setup(t, task, checkExit);
+  const claudeHome = join(context.root, 'claude-home');
+  await mkdir(claudeHome);
+  const signedIn =
+    agentOptions?.signedIn === 'login-file'
+      ? async () => {
+          try {
+            await stat(join(claudeHome, '.credentials.json'));
+            return true;
+          } catch {
+            return false;
+          }
+        }
+      : agentOptions?.signedIn;
   let printed = '';
+  let authOutput = '';
   const result = await runTask({
     agentName: 'claude',
-    agent: fakeAgentDefinition(agentOptions),
+    agent: fakeAgentDefinition({ ...agentOptions, signedIn }),
     taskFile: context.taskFile,
     sessionsDirectory: join(context.root, 'sessions'),
     instanceId: 'instance-1',
     workspace: join(context.root, 'workspace'),
     instructionsTemplate: template,
-    environment: { ...process.env, VIRTUAL_ENV: context.venv },
+    environment: { ...process.env, CLAUDE_CONFIG_DIR: claudeHome, VIRTUAL_ENV: context.venv },
     out: { write: (text) => (printed += text) },
+    authOut: { write: (text) => (authOutput += text) },
     log: () => {},
     ...runOptions
   });
   const written = JSON.parse(await readFile(join(context.root, 'tasks', 'one', 'result.json'), 'utf8'));
   assert.deepEqual(written, result);
-  return { ...context, result, printed };
+  return { ...context, result, printed, authOutput };
 }
 
 async function transcript(root, key) {
@@ -130,6 +148,29 @@ test('a task runs as a recorded session, with permissions allowed and questions 
   await assert.rejects(stat(join(root, 'sessions', result.sessionKey, 'lease.json')));
 });
 
+test('attached task progress is structured and includes usage and quota updates', async (t) => {
+  const { result, printed } = await run(t, { task: 'task: use tokens', report: false, progress: 'json' });
+  const events = printed.trim().split('\n').map((line) => JSON.parse(line));
+  assert.ok(events.every((event) => event.codeflowerTask));
+  assert.ok(events.some((event) => event.type === 'text'));
+  assert.ok(events.some((event) => event.type === 'settings'));
+  const stats = events.filter((event) => event.type === 'stats').at(-1).usage;
+  assert.equal(stats.auth.plan, 'max');
+  assert.equal(stats.totals.tokens.totalTokens, 170);
+  assert.equal(stats.totals.cost.amount, 0.25);
+  assert.equal(stats.limits[0].label, '5-hour');
+  assert.equal(result.usage.totals.tokens.totalTokens, 170);
+});
+
+test('attached task progress includes dsh token reports from its usage pipe', async (t) => {
+  const { result } = await run(
+    t,
+    { task: 'task: use tokens', report: false, progress: 'json' },
+    { usageFd: 3 }
+  );
+  assert.equal(result.usage.totals.tokens.totalTokens, 19);
+});
+
 test('an agent without a system prompt gets the instructions in its first prompt', async (t) => {
   const { root, result } = await run(t, { task: 'task: cluster', report: false }, { goal: undefined, args: ['--no-system-prompt'] });
   assert.equal(result.status, 'completed');
@@ -175,6 +216,30 @@ test('a task stops when its agent is not signed in', async (t) => {
   const { result } = await run(t, { task: 'task: x' }, { signedIn: false });
   assert.equal(result.status, 'not_signed_in');
   assert.match(result.message, /codeflower interactive/);
+});
+
+test('a task signs in through the agent terminal method before it starts', async (t) => {
+  const { result, authOutput, printed } = await run(
+    t,
+    { task: 'task: cluster', progress: 'json' },
+    { signedIn: 'login-file' },
+    {
+      interactive: true,
+      ptyHelper: [process.execPath, fakePty],
+      input: Readable.from(['LOGIN-CODE\n'])
+    }
+  );
+  assert.equal(result.status, 'completed');
+  assert.match(authOutput, /Starting Claude Subscription/);
+  assert.match(authOutput, /Paste code here if prompted/);
+  assert.match(authOutput, /Signed in\. Starting the task/);
+  const authProgress = printed
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line))
+    .filter((event) => event.type === 'auth-start' || event.type === 'auth-end')
+    .map((event) => event.type);
+  assert.deepEqual(authProgress, ['auth-start', 'auth-end']);
 });
 
 test('cancelling a task ends its turn and records it', async (t) => {

@@ -92,13 +92,13 @@ function configOptions(sessionId) {
   return options;
 }
 
-function reply(sessionId, id, text) {
+function reply(sessionId, id, text, usage) {
   send({
     jsonrpc: '2.0',
     method: 'session/update',
     params: { sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } } }
   });
-  send({ jsonrpc: '2.0', id, result: { stopReason: 'end_turn' } });
+  send({ jsonrpc: '2.0', id, result: { stopReason: 'end_turn', ...(usage ? { usage } : {}) } });
 }
 
 input.on('line', async (line) => {
@@ -258,6 +258,38 @@ input.on('line', async (line) => {
         const state = tasks.get(sessionId);
         state.task ??= text;
         state.turns = (state.turns ?? 0) + 1;
+        if (state.task.includes('use tokens')) {
+          const fd = Number(process.env.CODEFLOWER_USAGE_FD);
+          send({
+            jsonrpc: '2.0',
+            method: '_auth/status_update',
+            params: { authStatus: { kind: 'account', label: 'Claude Max', account: { plan: 'max' } } }
+          });
+          send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId,
+              update: {
+                sessionUpdate: 'usage_update',
+                cost: { amount: 0.25, currency: 'USD' },
+                _meta: { '_claude/rateLimit': { rateLimitType: 'five_hour', utilization: 0.25, resetsAt: 1800000000 } }
+              }
+            }
+          });
+          if (fd) {
+            writeSync(fd, `${JSON.stringify({ sessionId, usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 2, totalTokens: 17 } })}\n`);
+            writeSync(fd, `${JSON.stringify({ sessionId: 'sub-1', parentSessionId: sessionId, usage: { inputTokens: 1, outputTokens: 1 } })}\n`);
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+          reply(
+            sessionId,
+            message.id,
+            'worked with usage',
+            fd ? undefined : { inputTokens: 100, outputTokens: 20, cachedReadTokens: 50, totalTokens: 170 }
+          );
+          break;
+        }
         if (text.includes('hang')) {
           pendingPrompt = message.id;
           break;
