@@ -7,6 +7,7 @@ on:
       - Dockerfile
       - entrypoint.sh
       - bin/**
+      - test/**
       - templates/**
       - dsh-plugins/**
       - package.json
@@ -42,6 +43,9 @@ jobs:
 
       - name: Run bridge tests
         run: make bridge-test
+
+      - name: Run sandbox diagnostics tests
+        run: node --test test/*.test.js
 
   image:
     name: Image build and smoke test
@@ -86,10 +90,13 @@ jobs:
             node --version
             python --version
             uv --version
+            rg --version
             claude --version
             codex --version
             dsh --version
             test -x /opt/codeflower/entrypoint.sh
+            CODEFLOWER_AGENT=codex CODEFLOWER_MOUNTS="[]" codeflower-doctor --write-startup /tmp/environment.md
+            CODEFLOWER_ENVIRONMENT_FILE=/tmp/environment.md codeflower-doctor
             test -f /opt/codeflower/acp-ws/src/server.js
             test -f /opt/codeflower/src/storyteller/skill/SKILL.md
             export PYTHONPATH=/opt/codeflower/src/storyteller/src

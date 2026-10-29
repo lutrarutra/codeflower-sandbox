@@ -118,6 +118,16 @@ for folder in /data/skills/*; do
   fi
 done
 
+# Keep launch facts per worker: several workers can share the same project.
+if [ -n "${CODEFLOWER_INSTANCE_ID:-}" ]; then
+  CODEFLOWER_ENVIRONMENT_FILE="${CODEFLOWER_RUN_DIR:-$state/run}/environment-$CODEFLOWER_INSTANCE_ID.md"
+  export CODEFLOWER_ENVIRONMENT_FILE
+  if ! codeflower-doctor --write-startup "$CODEFLOWER_ENVIRONMENT_FILE"; then
+    echo "Could not write sandbox environment facts" >&2
+    unset CODEFLOWER_ENVIRONMENT_FILE
+  fi
+fi
+
 # The launcher's development --inspect-port sets this; the agents never
 # inherit an inspector because it is a node flag, not NODE_OPTIONS.
 if [ -n "${CODEFLOWER_BRIDGE_INSPECT:-}" ]; then

@@ -32,15 +32,36 @@ The user's folders are mounted under `/data`, each in a subfolder named after it
   - `figures/`, `results/` (tables, intermediate data such as `.h5ad` or `.parquet`), `reports/`, `logs/`
 - `/codeflower-state/env`: the project's persistent software environment.
 
+## Sandbox capabilities
+
+The image includes Python 3.14, conda, uv, Node.js, git, curl, ripgrep (`rg`) and
+`build-essential` (including a C/C++ compiler and make). The project venv can see the image's Python
+packages. R, OpenCV, ffmpeg, extra native libraries and GPU tooling are not guaranteed: check before
+relying on them, and install what you need in a project environment.
+
+At the start of a task, run `codeflower-doctor` for this worker's startup facts and current CPU,
+memory, disk, GPU and network information. Resource figures can change, and the reported host memory
+or CPU affinity may exceed container or scheduler limits. The startup snapshot is also at
+`$CODEFLOWER_ENVIRONMENT_FILE`; the doctor reports the current allowlist when networking is isolated.
+`codeflower-show` displays results, `codeflower-env-export` records installed environments, and
+`codeflower-network` checks the isolated network's allowlist and hosts.
+
 ## Installing software
 
 You manage the environment yourself: install what the analysis needs, without asking.
 
 - Python packages: `uv pip install <package>` (fast) or `pip install <package>`, into the active virtual
   environment `/codeflower-state/env/venv`, which is first on `PATH`.
-- Other tools, R and Bioconductor: create a conda environment, e.g.
-  `conda create -y -n r -c conda-forge -c bioconda r-base r-seurat`, then `conda run -n r Rscript script.R`.
-  Environments are stored in the project. R is not installed in the image.
+- For a separate Python environment, create a project-local venv with
+  `uv venv /codeflower-state/env/venvs/<name>`, install with
+  `uv pip install --python /codeflower-state/env/venvs/<name>/bin/python <package>`, and run scripts
+  with that environment's `bin/python`.
+- For other tools, R, Bioconductor, or Python packages that need native dependencies, use a conda
+  environment, e.g. `conda create -y -n r -c conda-forge -c bioconda r-base r-seurat`, then
+  `conda run -n r Rscript script.R`. Environments are stored in the project. R is not explicitly
+  installed in the image.
+- The image includes `build-essential` for packages that need compiling, but not every native library
+  or header. Prefer a prebuilt wheel or conda package when a build needs dependencies not in the image.
 - Do **not** use `apt-get`, `sudo` or write to system directories: the image is read-only and such changes are lost.
 - After installing or removing packages, run `codeflower-env-export` so the environment recipe in
   `/codeflower-state/env/exports` stays current.
@@ -48,10 +69,21 @@ You manage the environment yourself: install what the analysis needs, without as
   If the host is not on the allowlist (`codeflower-network` tells), ask the user to allow it as the
   codeflower-network skill describes.
 
+### Troubleshooting
+
+- Missing compiler headers or libraries: try a prebuilt wheel or a conda package containing the
+  needed native dependencies; the compiler alone does not provide every header.
+- `Read-only file system`: write to the project workspace or an appropriate read-write mount, not the
+  image. `/data/input` is read-only by design; do not try to change permissions to write there.
+- Proxy `403` or a failed download in isolated mode: run `codeflower-network` and follow its skill;
+  do not bypass the allowlist.
+
 ## How to analyse
 
 1. **Look before you compute.** List `/data/input`, check sizes and formats, and read a few rows or the
    object's summary. Do not print large data to the console.
+   `rg` (ripgrep) is preinstalled; prefer `rg <pattern> <path>` for text searches and
+   `rg --files <path>` to list files. Use domain-aware tools for large or binary data.
 2. **Write scripts, run them, read the output.** Prefer scripts in `scripts/` over long one-liners, so
    every result can be reproduced. Save intermediate results so later steps do not recompute them.
 3. **Look at every figure you make.** Open the image file yourself (your file-reading tool shows

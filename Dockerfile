@@ -38,6 +38,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
     git \
+    ripgrep \
     && rm -rf /var/lib/apt/lists/* \
     && conda install --yes --freeze-installed -c conda-forge \
         python=3.14 \

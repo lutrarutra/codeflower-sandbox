@@ -1,0 +1,114 @@
+#!/usr/local/bin/node --no-warnings
+import { execFileSync } from 'node:child_process';
+import { readFileSync, statfsSync, writeFileSync } from 'node:fs';
+import { availableParallelism, freemem, totalmem } from 'node:os';
+
+const state = '/codeflower-state';
+const gib = (bytes) => `${(bytes / 1024 ** 3).toFixed(2)} GiB`;
+
+function resources() {
+  const lines = [
+    `- CPUs available to this process (affinity): ${availableParallelism()}`,
+    `- Host memory: ${gib(totalmem())} total, ${gib(freemem())} currently free (not container limits)`
+  ];
+  try {
+    const [quota, period] = readFileSync('/sys/fs/cgroup/cpu.max', 'utf8').trim().split(/\s+/);
+    if (!/^\d+$/.test(period) || Number(period) === 0 || (quota !== 'max' && !/^\d+$/.test(quota))) {
+      throw new Error('invalid CPU quota');
+    }
+    lines.push(`- Current cgroup CPU quota: ${quota === 'max' ? 'unlimited at this level' : `${(Number(quota) / Number(period)).toFixed(2)} CPUs`} (parent limits may also apply)`);
+  } catch (error) {
+    lines.push(`- Current cgroup CPU quota: unavailable (${error.message})`);
+  }
+  try {
+    const limit = readFileSync('/sys/fs/cgroup/memory.max', 'utf8').trim();
+    if (limit !== 'max' && (!/^\d+$/.test(limit) || !Number.isSafeInteger(Number(limit)))) {
+      throw new Error('invalid memory limit');
+    }
+    lines.push(`- Current cgroup memory limit: ${limit === 'max' ? 'unlimited at this level' : gib(Number(limit))} (parent limits may also apply)`);
+  } catch (error) {
+    lines.push(`- Current cgroup memory limit: unavailable (${error.message})`);
+  }
+  try {
+    const disk = statfsSync(state);
+    lines.push(`- Space available on ${state}: ${gib(disk.bavail * disk.bsize)}`);
+  } catch (error) {
+    lines.push(`- Space available on ${state}: unavailable (${error.message})`);
+  }
+  try {
+    const gpu = execFileSync('nvidia-smi', ['--query-gpu=name,memory.total', '--format=csv,noheader'],
+      { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    lines.push(`- NVIDIA GPU query: ${gpu || 'no devices reported'}`);
+  } catch (error) {
+    lines.push(`- NVIDIA GPU query: unavailable (${error.code === 'ENOENT' ? 'nvidia-smi not found' : error.message}); other GPU types are not checked`);
+  }
+  return lines;
+}
+
+function launchFacts() {
+  const lines = [
+    '# Sandbox environment at worker startup',
+    '',
+    `- Agent: ${process.env.CODEFLOWER_AGENT || 'not reported'}`,
+    `- Engine: ${process.env.CODEFLOWER_ENGINE || 'not reported'}`,
+    `- Network: ${process.env.CODEFLOWER_NETWORK === 'isolated' ? 'isolated; run codeflower-network for the current allowlist' : 'no code flower isolation reported; other network restrictions may apply'}`,
+    '- Agent tool limits and permissions: not reported here; check the active harness.',
+    '- Project state: /codeflower-state (read-write)',
+    '',
+    '## Configured user mounts'
+  ];
+  try {
+    const mounts = JSON.parse(process.env.CODEFLOWER_MOUNTS ?? 'null');
+    if (!Array.isArray(mounts)) throw new Error('mount metadata not provided or not an array');
+    for (const mount of mounts) {
+      if (typeof mount.target !== 'string' || typeof mount.readOnly !== 'boolean') {
+        throw new Error('invalid mount metadata');
+      }
+    }
+    lines.push(...(mounts.length
+      ? mounts.map((mount) => `- ${JSON.stringify(mount.target)}: ${mount.readOnly ? 'read-only' : 'read-write'}`)
+      : ['- No user mounts reported.']));
+  } catch (error) {
+    lines.push(`- Mount metadata unavailable: ${error.message}`);
+  }
+  lines.push('', '## Resources at startup', ...resources(), '');
+  return lines.join('\n');
+}
+
+const args = process.argv.slice(2);
+try {
+  if (args.length === 2 && args[0] === '--write-startup') {
+    writeFileSync(args[1], launchFacts(), { mode: 0o600 });
+  } else if (args.length === 0) {
+    const file = process.env.CODEFLOWER_ENVIRONMENT_FILE;
+    if (file) {
+      try {
+        process.stdout.write(readFileSync(file, 'utf8'));
+      } catch (error) {
+        console.error(`codeflower-doctor: cannot read startup facts: ${error.message}`);
+        process.exitCode = 1;
+      }
+    } else {
+      console.log('Startup facts are unavailable: CODEFLOWER_ENVIRONMENT_FILE is not set.');
+      process.exitCode = 1;
+    }
+    console.log('\n## Current resources\n' + resources().join('\n'));
+    if (process.env.CODEFLOWER_NETWORK === 'isolated') {
+      console.log('\n## Current network allowlist');
+      try {
+        process.stdout.write(execFileSync('codeflower-network', [], {
+          encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe']
+        }));
+      } catch (error) {
+        console.error(`codeflower-doctor: cannot retrieve allowlist: ${error.stderr?.toString().trim() || error.message}`);
+        process.exitCode = 1;
+      }
+    }
+  } else {
+    console.error('Usage: codeflower-doctor');
+    process.exitCode = 2;
+  }
+} catch (error) {
+  console.error(`codeflower-doctor: ${error.message}`);
+  process.exitCode = 1;
+}

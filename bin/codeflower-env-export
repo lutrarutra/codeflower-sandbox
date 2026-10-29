@@ -1,6 +1,6 @@
 #!/bin/sh
-# Writes a readable recipe of everything installed in the project
-# environment, so it can be recreated or turned into a new image.
+# Writes a readable recipe of the environments installed in the project,
+# so they can be recreated or turned into a new image.
 set -eu
 
 state=/codeflower-state
@@ -9,6 +9,12 @@ out="$state/env/exports"
 mkdir -p "$out"
 
 uv pip freeze --python "$venv/bin/python" > "$out/venv-requirements.txt"
+
+for prefix in "$state"/env/venvs/*/; do
+  if [ -x "$prefix/bin/python" ]; then
+    uv pip freeze --python "$prefix/bin/python" > "$out/uv-venv-$(basename "$prefix")-requirements.txt"
+  fi
+done
 
 for prefix in "${CONDA_ENVS_DIRS:-$state/env/conda}"/*/; do
   if [ -d "$prefix/conda-meta" ]; then
