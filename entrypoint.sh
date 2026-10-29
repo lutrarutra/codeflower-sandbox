@@ -41,6 +41,33 @@ for name in AGENTS.md CLAUDE.md; do
   fi
 done
 
+# storyteller, the report library, lives in the project as an editable install, so
+# the agent can fix or extend it. A new image's version replaces that copy only
+# while it is unchanged (a pristine copy in run/ tells, as for the templates);
+# an edited copy is kept. Its dependencies are in the image, so this works offline.
+storyteller_image=/opt/codeflower/src/storyteller
+storyteller="$state/env/src/storyteller"
+storyteller_installed="$state/run/storyteller"
+same_tree() {
+  diff -rq -x __pycache__ -x '*.egg-info' -x .pytest_cache -x .ruff_cache "$1" "$2" >/dev/null 2>&1
+}
+if [ -d "$storyteller_image" ]; then
+  if [ -z "$(ls -A "$storyteller" 2>/dev/null)" ] || { [ -d "$storyteller_installed" ] && same_tree "$storyteller" "$storyteller_installed"; }; then
+    if ! same_tree "$storyteller_image" "$storyteller"; then
+      rm -rf "$storyteller" "$storyteller_installed"
+      mkdir -p "$(dirname "$storyteller")"
+      cp -R "$storyteller_image" "$storyteller"
+      cp -R "$storyteller_image" "$storyteller_installed"
+    fi
+  elif ! same_tree "$storyteller_image" "$storyteller_installed"; then
+    echo "Keeping the edited storyteller in $storyteller (the image has another version in $storyteller_image)" >&2
+  fi
+  if ! "$venv/bin/python" -I -c 'import storyteller.report' 2>/dev/null; then
+    uv pip install --quiet --offline --no-deps --no-build-isolation --python "$venv/bin/python" -e "$storyteller" \
+      || echo "Could not install storyteller from $storyteller" >&2
+  fi
+fi
+
 # Skills the user mounted (--skills), and the network skill in an isolated
 # sandbox, are linked where each harness looks for skills. A mounted folder is
 # one skill when it has a SKILL.md, otherwise a folder of skills. Links from
@@ -51,14 +78,14 @@ for root in $skill_roots; do
   for link in "$root"/*; do
     if [ -L "$link" ]; then
       case "$(readlink "$link")" in
-        /data/skills/* | /opt/codeflower/skills/*) rm -f "$link" ;;
+        /data/skills/* | /opt/codeflower/skills/* | "$state"/env/src/*) rm -f "$link" ;;
       esac
     fi
   done
 done
 linked=" "
 link_skill() {
-  name=$(basename "$1")
+  name=${2:-$(basename "$1")}
   case "$linked" in
     *" $name "*)
       echo "Skipping the skill $1: another skill is already called $name" >&2
@@ -76,6 +103,9 @@ link_skill() {
 }
 if [ "${CODEFLOWER_NETWORK:-}" = isolated ]; then
   link_skill /opt/codeflower/skills/codeflower-network
+fi
+if [ -f "$storyteller/skill/SKILL.md" ]; then
+  link_skill "$storyteller/skill" storyteller
 fi
 for folder in /data/skills/*; do
   [ -d "$folder" ] || continue

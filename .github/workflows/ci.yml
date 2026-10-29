@@ -91,4 +91,8 @@ jobs:
             dsh --version
             test -x /opt/codeflower/entrypoint.sh
             test -f /opt/codeflower/acp-ws/src/server.js
+            test -f /opt/codeflower/src/storyteller/skill/SKILL.md
+            export PYTHONPATH=/opt/codeflower/src/storyteller/src
+            python -c "import storyteller as sty; r = sty.Report(\"Smoke\", \"/tmp/smoke.html\"); r.text(\"ok\", key=\"t\"); r.save()"
+            python -m storyteller.cli check /tmp/smoke.html
           '

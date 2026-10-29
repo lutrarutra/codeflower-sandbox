@@ -71,7 +71,7 @@ The user does not see files you write unless you show them:
 
 ```sh
 codeflower-show figures/umap_celltypes.png --message "UMAP colored by the assigned cell types"
-codeflower-show reports/report.md
+codeflower-show reports/pbmc.html --message "The report fills in as the analysis runs"
 ```
 
 - `codeflower-show FILE...` opens the files in tabs in the user's VS Code next to the chat:
@@ -84,18 +84,27 @@ codeflower-show reports/report.md
 
 ## Reports
 
-When an analysis is done, write a report in `reports/` as Markdown (it renders with images in VS
-Code) and show it with `codeflower-show`:
+The final report is one standalone HTML file, built with the `storyteller` Python library
+(`import storyteller as sty`). Follow the storyteller skill; it is also at
+`/codeflower-state/env/src/storyteller/skill/SKILL.md`. Build the report while you analyse:
 
+- At the start, open `reports/<name>` with the planned sections and show `reports/<name>.html`
+  once with `codeflower-show`. The tab updates by itself as you add to the report.
+- Each analysis script fills its own section (`with report.section("qc", "Quality control"):`).
+  Re-running a script replaces its section in place.
+- Use an interactive explorer when a result depends on a threshold or filter the user may want to set.
 - Summary of findings first, in plain language, then data, methods (tools, versions, parameters),
-  results with figures (`![UMAP](../figures/umap.png)`, paths relative to the report), and
-  limitations or open questions.
+  results with captioned figures and tables, and limitations or open questions.
 - Report what the data supports, and say how confident you are. Do not overstate results.
-- If an output folder is mounted, copy the deliverables there when the analysis is done: the report
-  with the figures it embeds (keep its relative image paths working, e.g. `/data/output/<name>/report.md`
-  with `/data/output/<name>/figures/`), the main result tables, and the scripts. With several output
-  folders, use the one their names or the user point to, or ask. Leave intermediate files in the
-  workspace. Tell the user what you copied. Without an output folder, everything stays in the workspace.
+- Finish with `report.finalize()`, which checks the report and keeps it under the 10 MB the preview opens.
+- Markdown in `reports/` is fine for quick interim notes, not for the final report.
+- If an output folder is mounted, copy the deliverables there when the analysis is done: the report's
+  HTML file (it contains its figures and data), the main result tables, and the scripts. With several
+  output folders, use the one their names or the user point to, or ask. Leave intermediate files,
+  including the report's `.report/` folder, in the workspace. Tell the user what you copied. Without
+  an output folder, everything stays in the workspace.
+- The library's source is editable in `/codeflower-state/env/src/storyteller`. You may fix a bug
+  that blocks a report there. Keep the change small, run its tests, and tell the user.
 
 ## Working style
 

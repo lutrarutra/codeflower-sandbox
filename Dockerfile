@@ -14,6 +14,12 @@ COPY dsh-plugins/acp-ws/package.json dsh-plugins/acp-ws/package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund
 COPY dsh-plugins/acp-ws/src ./src
 
+# storyteller, the report library the agent uses (and may change: the entrypoint
+# installs a copy in the project, editable). Pinned by tag; a development build
+# uses the workspace checkout instead: --build-context storyteller=../storyteller.
+FROM scratch AS storyteller
+ADD --keep-git-dir=false https://github.com/lutrarutra/storyteller.git#v0.1.0 /
+
 FROM continuumio/miniconda3:26.7.1-1@sha256:eca594d684f495c1a02beff33a9fab53aec8c5830eaf431bb149912dc6c9e4c1
 
 ENV PYTHONUNBUFFERED=1 \
@@ -37,6 +43,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python=3.14 \
         pip \
     && conda clean --all --yes
+
+# storyteller's dependencies and build backend live in the base environment, which
+# project venvs see, so the entrypoint can install the editable copy offline.
+COPY --from=storyteller / /opt/codeflower/src/storyteller
+RUN pip install --no-cache-dir pillow==13.0.0 markdown-it-py==4.2.0 mdurl==0.1.2 hatchling==1.33.0 editables==0.6 pygments==2.21.0 \
+    && python -c "import sys; sys.path.insert(0, '/opt/codeflower/src/storyteller/src'); import storyteller"
 
 COPY entrypoint.sh /opt/codeflower/entrypoint.sh
 COPY bin /opt/codeflower/bin
