@@ -54,6 +54,14 @@ try {
     console.log(`\nThe agent's service (always allowed):\n  ${list.agent.join('\n  ') || '(none)'}`);
     console.log(`\nAllowed by the user:\n  ${list.allowed.join('\n  ') || '(none)'}`);
     console.log(`\nTo allow more, the user adds lines to this file on their computer (changes apply immediately):\n  ${list.file}`);
+    // Older launchers do not send presets.
+    if (list.presets?.length) {
+      console.log('\nPresets: one line "@name" in that file allows every host of one service:');
+      for (const preset of list.presets) {
+        const uploads = preset.uploads ? ' (also accepts uploads)' : '';
+        console.log(`  @${preset.name.padEnd(13)} ${preset.description}${uploads}: ${preset.hosts.join(' ')}`);
+      }
+    }
   } else if (args[0] === 'check' && args[1]) {
     const target = args[1].includes(':') ? args[1] : `${args[1]}:443`;
     const { status, body } = await ask(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n\r\n`);

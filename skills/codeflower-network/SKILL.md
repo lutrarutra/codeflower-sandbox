@@ -26,11 +26,10 @@ refused or unlisted host fails with errors like:
 2. When a task needs a host that is not allowed, **stop and ask the user**. Say
    exactly which lines to add to which file, and why, for example:
 
-   > Installing scanpy needs the Python package index. To allow it, add these
-   > lines to `/home/ana/.codeflower/projects/study42.allowed-hosts.txt`:
+   > Installing scanpy needs the Python package index. To allow it, add this
+   > line to `/home/ana/.codeflower/projects/study42.allowed-hosts.txt`:
    > ```
-   > pypi.org
-   > files.pythonhosted.org
+   > @pypi
    > ```
    > Tell me when it is done; changes apply immediately, no restart needed.
 
@@ -47,16 +46,21 @@ decision about their data.
 
 Ask only for what the task needs. Every allowed host is also a place data
 could be sent to, so prefer hosts that only serve downloads, and mention it
-when a host also accepts uploads (e.g. `github.com`, `api.github.com`).
+when a host also accepts uploads (`@github`, `@huggingface`).
 
-| Need | Lines for the allowlist |
+A line `@name` in the file allows every host of one service. `codeflower-network`
+lists the presets with their hosts; prefer a preset to single hosts when one fits:
+
+| Need | Line |
 |---|---|
-| pip / uv (PyPI) | `pypi.org`, `files.pythonhosted.org` |
-| conda (conda-forge, bioconda) | `conda.anaconda.org`, `repo.anaconda.com` |
-| R packages (CRAN, Bioconductor) | `cloud.r-project.org`, `bioconductor.org` |
-| npm | `registry.npmjs.org` |
-| Hugging Face models and datasets | `huggingface.co`, `*.huggingface.co`, `*.hf.co` |
-| GitHub downloads (`git clone`, release files) | `github.com`, `codeload.github.com`, `objects.githubusercontent.com` |
+| pip / uv (PyPI) | `@pypi` |
+| conda (conda-forge, bioconda) | `@conda` |
+| R packages | `@cran`, `@bioconductor` |
+| npm | `@npm` |
+| Hugging Face models and datasets | `@huggingface` |
+| GitHub downloads (`git clone`, release files, raw files) | `@github` |
+| NCBI (E-utilities, Datasets, GEO, SRA) | `@ncbi` |
+| Ensembl, UniProt, EMBL-EBI (ENA, Expression Atlas) | `@ensembl`, `@uniprot`, `@ebi` |
 
-Lines may use `*.example.org` for every subdomain and `example.org:8443` for
-another port.
+For anything else, ask for single hosts. Lines may use `*.example.org` for
+every subdomain and `example.org:8443` for another port.
