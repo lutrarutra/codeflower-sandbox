@@ -9,8 +9,8 @@ import test from 'node:test';
 import WebSocket from 'ws';
 import { createAgents } from '../src/agents.js';
 import { writeCommentsSlot } from '../src/files.js';
-import { startBridge } from '../src/server.js';
-import { sessionKey } from '../src/sessions.js';
+import { agentEnvironment, startBridge } from '../src/server.js';
+import { readTranscript, sessionKey } from '../src/sessions.js';
 
 const fakeAgent = fileURLToPath(new URL('../fixtures/fake-acp.js', import.meta.url));
 const token = 'k'.repeat(43);
@@ -82,6 +82,15 @@ const ptyHelper = [
   'python3',
   fileURLToPath(new URL('../../../bin/codeflower-pty', import.meta.url))
 ];
+
+test('does not pass the initial prompt file path to the agent', () => {
+  const environment = agentEnvironment({
+    CODEFLOWER_INITIAL_PROMPT_FILE: '/codeflower-state/runs/run-id/prompt.txt',
+    CODEFLOWER_TOKEN: token
+  });
+  assert.equal(environment.CODEFLOWER_INITIAL_PROMPT_FILE, undefined);
+  assert.equal(environment.CODEFLOWER_TOKEN, undefined);
+});
 
 async function startTestBridge(t, { agentName = 'claude', ...overrides } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'codeflower-acp-ws-'));
@@ -204,6 +213,33 @@ test('starts the worker agent on connect without passing it any credentials', as
 
   const apiKey = await call(socket, 'authenticate', { methodId: 'api-key', _meta: { 'api-key': { apiKey: 'sk-test' } } });
   assert.equal(apiKey.result.keyLength, 7);
+  await closeSocket(socket);
+});
+
+test('starts and records an initial prompt in a session that VS Code can resume', async (t) => {
+  const { bridge, directory, sessionsDirectory } = await startTestBridge(t, {
+    initialPrompt: 'Analyse the input and generate a report'
+  });
+  assert.equal(JSON.parse(await readFile(join(directory, 'instance.json'), 'utf8')).initialPrompt, true);
+  const nativeSessionId = 'session-1';
+  const key = sessionKey('claude', nativeSessionId);
+  await waitFor(async () => (await readTranscript(sessionsDirectory, key)).some((entry) => entry.kind === 'turn_end'));
+
+  const transcript = await readTranscript(sessionsDirectory, key);
+  assert.deepEqual(transcript.map((entry) => entry.kind), ['prompt', 'update', 'turn_end']);
+  assert.equal(transcript[0].prompt[0].text, 'Analyse the input and generate a report');
+
+  const socket = await openSocket(bridge.address);
+  await initialize(socket);
+  const sessions = (await call(socket, '_codeflower/sessions/list')).result.sessions;
+  assert.equal(sessions.find((session) => session.key === key)?.nativeSessionId, nativeSessionId);
+  const resumed = (await call(socket, 'session/resume', {
+    sessionId: nativeSessionId,
+    cwd: '/workspace',
+    mcpServers: []
+  })).result;
+  assert.equal(resumed._meta['codeflower/transcriptEntries'], transcript.length);
+  assert.equal(resumed._meta['codeflower/busy'], false);
   await closeSocket(socket);
 });
 

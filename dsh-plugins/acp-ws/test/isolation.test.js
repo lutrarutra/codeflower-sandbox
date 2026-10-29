@@ -89,11 +89,15 @@ test('the agent keeps the proxy settings but not the socket paths', () => {
   const environment = agentEnvironment({
     HTTPS_PROXY: 'http://127.0.0.1:3128',
     CODEFLOWER_NETWORK: 'isolated',
+    CODEFLOWER_ENVIRONMENT_FILE: '/codeflower-state/run/environment-worker.md',
+    CODEFLOWER_MOUNTS: '[{"target":"/data/input","readOnly":true}]',
     CODEFLOWER_LISTEN_SOCKET: '/codeflower-net/bridge.sock',
     CODEFLOWER_EGRESS_SOCKET: '/codeflower-net/egress.sock'
   });
   assert.equal(environment.HTTPS_PROXY, 'http://127.0.0.1:3128');
   assert.equal(environment.CODEFLOWER_NETWORK, 'isolated');
+  assert.equal(environment.CODEFLOWER_ENVIRONMENT_FILE, '/codeflower-state/run/environment-worker.md');
+  assert.equal(environment.CODEFLOWER_MOUNTS, undefined);
   assert.equal(environment.CODEFLOWER_LISTEN_SOCKET, undefined);
   assert.equal(environment.CODEFLOWER_EGRESS_SOCKET, undefined);
 });

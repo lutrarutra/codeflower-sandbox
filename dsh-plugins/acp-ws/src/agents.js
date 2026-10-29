@@ -2,6 +2,9 @@ import { access, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 
+// Where the launcher passes the API key from its config, for the worker's agent.
+export const PROVIDED_KEY_VARIABLE = 'CODEFLOWER_API_KEY';
+
 // Every credential variable any agent understands. The bridge never passes
 // them to an agent: logins and keys live in the agents' own files in the
 // project, written by their sign-in flows.
@@ -12,7 +15,9 @@ export const CREDENTIAL_VARIABLES = [
   'OPENAI_API_KEY',
   'CODEX_API_KEY',
   'DEEPSEEK_API_KEY',
-  'CODEFLOWER_OPENAI_COMPAT_API_KEY'
+  'CODEFLOWER_OPENAI_COMPAT_API_KEY',
+  // The key the launcher's config gives this worker's agent; see provideKey.
+  PROVIDED_KEY_VARIABLE
 ];
 
 export const AGENT_NAMES = ['dsh', 'claude', 'codex'];
@@ -21,12 +26,25 @@ const ENDPOINT_PATCH = 'codeflower-endpoint.patch.yml';
 
 export class InvalidRequest extends Error {}
 
+export async function terminalAuthCommand(agent, method) {
+  const methodId = method?.id ?? 'unknown';
+  const meta = method?._meta?.['terminal-auth'];
+  if (meta && typeof meta.command === 'string') {
+    return [meta.command, ...(Array.isArray(meta.args) ? meta.args.map(String) : [])];
+  }
+  if (method?.type === 'terminal') {
+    return [...(await agent.command()), ...(Array.isArray(method.args) ? method.args.map(String) : [])];
+  }
+  throw new InvalidRequest(`${methodId} is not a terminal sign-in`);
+}
+
 async function exists(path) {
   try {
     await access(path);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    if (error.code === 'ENOENT') return false;
+    throw error;
   }
 }
 
@@ -37,6 +55,26 @@ async function readText(path) {
     if (error.code === 'ENOENT') return '';
     throw error;
   }
+}
+
+async function readJson(path) {
+  let text;
+  try {
+    text = await readFile(path, 'utf8');
+  } catch (error) {
+    if (error.code === 'ENOENT') return undefined;
+    throw error;
+  }
+  let value;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    throw new Error(`Invalid JSON in ${path}`);
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`Expected a JSON object in ${path}`);
+  }
+  return value;
 }
 
 async function writePrivate(path, content) {
@@ -144,6 +182,10 @@ export function createAgents({
         const env = dshHome ? await readText(join(dshHome, '.env')) : '';
         return /^(DEEPSEEK_API_KEY|CODEFLOWER_OPENAI_COMPAT_API_KEY)=./m.test(env);
       },
+      // The launcher config's key goes where setCredentials puts it.
+      async provideKey(key) {
+        await this.setCredentials({ deepseekApiKey: key });
+      },
       // dsh has no ACP sign-in; its keys go into its own .env in the project.
       async setCredentials(params) {
         if (!dshHome) throw new InvalidRequest('DSH_HOME is not set');
@@ -182,7 +224,23 @@ export function createAgents({
       async authKind() {
         if (!claudeHome) return undefined;
         if (await exists(join(claudeHome, '.credentials.json'))) return 'subscription';
-        return /"primaryApiKey"\s*:\s*"[^"]+"/.test(await readText(join(claudeHome, '.claude.json'))) ? 'api_key' : undefined;
+        if (/"primaryApiKey"\s*:\s*"[^"]+"/.test(await readText(join(claudeHome, '.claude.json')))) return 'api_key';
+        return (await readJson(join(claudeHome, 'settings.json')))?.env?.ANTHROPIC_API_KEY ? 'api_key' : undefined;
+      },
+      // The launcher config's key goes into the env of Claude Code's own
+      // settings, which it applies to its sessions. A subscription login is kept.
+      async provideKey(key) {
+        if (!claudeHome) throw new InvalidRequest('CLAUDE_CONFIG_DIR is not set');
+        if (await exists(join(claudeHome, '.credentials.json'))) return 'kept the existing subscription login';
+        const file = join(claudeHome, 'settings.json');
+        const settings = (await readJson(file)) ?? {};
+        if (settings.env !== undefined &&
+            (!settings.env || typeof settings.env !== 'object' || Array.isArray(settings.env))) {
+          throw new Error(`Expected env to be a JSON object in ${file}`);
+        }
+        if (settings.env?.ANTHROPIC_API_KEY === key) return undefined;
+        await writePrivate(file, `${JSON.stringify({ ...settings, env: { ...settings.env, ANTHROPIC_API_KEY: key } }, null, 2)}\n`);
+        return undefined;
       },
       // Asks for the rate limit events, which the adapter otherwise passes on
       // only once a turn's first answer has started.
@@ -214,6 +272,17 @@ export function createAgents({
         }
         if (auth?.auth_mode === 'apikey' || (auth?.OPENAI_API_KEY && !auth?.tokens)) return 'api_key';
         return auth?.tokens ? 'subscription' : undefined;
+      },
+      // The launcher config's key goes into Codex's own auth.json, as its
+      // API-key login does. A subscription login is kept.
+      async provideKey(key) {
+        if (!codexHome) throw new InvalidRequest('CODEX_HOME is not set');
+        const file = join(codexHome, 'auth.json');
+        const auth = await readJson(file);
+        if (auth?.tokens) return 'kept the existing subscription login';
+        if (auth?.OPENAI_API_KEY === key) return undefined;
+        await writePrivate(file, `${JSON.stringify({ auth_mode: 'apikey', OPENAI_API_KEY: key }, null, 2)}\n`);
+        return undefined;
       },
       // A separate app-server reads the account's rate limits.
       limitsCommand: codexBin ? () => [nodePath, codexBin, 'app-server'] : undefined

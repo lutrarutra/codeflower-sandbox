@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { WebSocket, WebSocketServer } from 'ws';
 import { createActivity } from './activity.js';
-import { CREDENTIAL_VARIABLES, InvalidRequest } from './agents.js';
+import { CREDENTIAL_VARIABLES, InvalidRequest, terminalAuthCommand } from './agents.js';
 import { readCodexLimits } from './codex-limits.js';
 import { listDirectory, readClientFile, resolveFile, saveReportComments, startShowServer } from './files.js';
 import {
@@ -115,6 +115,8 @@ export function agentEnvironment(environment, harnessEnvironment = {}) {
   delete result.CODEFLOWER_ENGINE;
   delete result.CODEFLOWER_MOUNTS;
   delete result.CODEFLOWER_TASK_FILE;
+  delete result.CODEFLOWER_TASK_INTERACTIVE;
+  delete result.CODEFLOWER_INITIAL_PROMPT_FILE;
   for (const name of CREDENTIAL_VARIABLES) {
     delete result[name];
   }
@@ -350,6 +352,7 @@ export async function startBridge(options) {
     slurmJobId,
     agentName,
     agent,
+    initialPrompt,
     sessionsDirectory,
     describe = async () => ({}),
     ptyHelper,
@@ -371,6 +374,9 @@ export async function startBridge(options) {
   }
   if (typeof agentName !== 'string' || !agent || typeof agent.command !== 'function') {
     throw new Error('An agent is required');
+  }
+  if (initialPrompt !== undefined && (typeof initialPrompt !== 'string' || !initialPrompt.trim())) {
+    throw new Error('The initial prompt must be a non-empty string');
   }
   if (!Number.isInteger(port) || port < 0 || port > 65535) {
     throw new Error('CODEFLOWER_PORT must be an integer between 0 and 65535');
@@ -635,6 +641,10 @@ export async function startBridge(options) {
       if (stdoutBuffer.trim()) log('ACP child exited with an incomplete stdio frame');
       if (code !== 0 && code !== null) log(`${agentName} exited with status ${code}`);
       else if (signal) log(`${agentName} exited on signal ${signal}`);
+      for (const request of started.requests.values()) {
+        request.reject?.(new Error(`${agentName} exited before answering ${request.method}`));
+      }
+      started.requests.clear();
       if (agentHost === started) {
         agentHost = undefined;
         activity.clear();
@@ -663,6 +673,54 @@ export async function startBridge(options) {
       webSocket.pause();
       host.child.stdin.once('drain', () => webSocket.resume());
     }
+  };
+
+  const requestAgent = (host, method, params = {}) =>
+    new Promise((resolve, reject) => {
+      if (!childRunning(host.child)) {
+        reject(new Error(`${agentName} exited before ${method}`));
+        return;
+      }
+      const id = `cf-${host.nextRequest++}`;
+      const key = requestKey(id);
+      const request = { client: null, id, key, method, params, resolve, reject };
+      if (method === 'initialize') {
+        host.initialized = new Promise((initialize) => {
+          request.initialized = initialize;
+        });
+      }
+      host.requests.set(key, request);
+      if (method === 'session/prompt' && typeof params.sessionId === 'string') {
+        activity.turnStarted(key, params.sessionId);
+      }
+      writeToAgent(host, withSessionMeta({ jsonrpc: '2.0', id, method, params }));
+    });
+
+  const startInitialSession = async () => {
+    const host = await ensureAgent();
+    if (host.initialized) {
+      if (!(await host.initialized)) throw new Error('The agent could not be initialized');
+    } else {
+      await requestAgent(host, 'initialize', {
+        protocolVersion: 1,
+        clientCapabilities: {
+          fs: { readTextFile: false, writeTextFile: false },
+          terminal: false,
+          auth: { terminal: true },
+          elicitation: { url: {}, form: {} },
+          _meta: { 'terminal-auth': true }
+        },
+        clientInfo: { name: 'codeflower-vscode', title: 'code flower', version: '0.0.0' }
+      });
+    }
+    const session = await requestAgent(host, 'session/new', { cwd: workspace, mcpServers: [] });
+    if (typeof session?.sessionId !== 'string') {
+      throw new Error('The agent did not return a session id');
+    }
+    await requestAgent(host, 'session/prompt', {
+      sessionId: session.sessionId,
+      prompt: [{ type: 'text', text: initialPrompt.trim() }]
+    });
   };
 
   // A permission request or question goes to the window once, after it has
@@ -778,7 +836,10 @@ export async function startBridge(options) {
       const turn = request.method === 'session/prompt' ? endTurn(request, message) : undefined;
       recorder?.fromAgent(message, turn);
       // Attaches answer once the recorder caught up.
-      if (settleRequest(host, request, message)) return;
+      const attached = settleRequest(host, request, message);
+      if (message.error) request.reject?.(new Error(message.error.message ?? `${request.method} failed`));
+      else request.resolve?.(message.result);
+      if (attached) return;
       if (request.client === client) client.send({ ...message, id: request.id });
       return;
     }
@@ -977,14 +1038,7 @@ export async function startBridge(options) {
     const terminalCommand = async (methodId) => {
       const method = (self.agent?.authMethods ?? []).find((candidate) => candidate?.id === methodId);
       if (!method) throw new InvalidRequest(`The agent offers no sign-in method ${String(methodId)}`);
-      const meta = method._meta?.['terminal-auth'];
-      if (meta && typeof meta.command === 'string') {
-        return [meta.command, ...(Array.isArray(meta.args) ? meta.args.map(String) : [])];
-      }
-      if (method.type === 'terminal') {
-        return [...(await agent.command()), ...(Array.isArray(method.args) ? method.args.map(String) : [])];
-      }
-      throw new InvalidRequest(`${methodId} is not a terminal sign-in`);
+      return terminalAuthCommand(agent, method);
     };
 
     const startTerminal = async (params) => {
@@ -1353,6 +1407,7 @@ export async function startBridge(options) {
     pid: launcherPid,
     started_at: new Date().toISOString(),
     agent: agentName,
+    ...(initialPrompt !== undefined ? { initialPrompt: true } : {}),
     ...(slurmJobId ? { slurm_job_id: slurmJobId } : {})
   };
   metadata.url = connectionUrl(metadata.host, metadata.port, token);
@@ -1363,6 +1418,12 @@ export async function startBridge(options) {
     clearInterval(pings);
     await new Promise((resolve) => server.close(resolve));
     throw error;
+  }
+
+  if (initialPrompt !== undefined) {
+    void startInitialSession().catch((error) => {
+      if (!closing) log(`Could not start the initial task session: ${error.message}`);
+    });
   }
 
   return {
