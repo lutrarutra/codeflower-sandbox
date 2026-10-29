@@ -46,7 +46,8 @@ in-memory data and long computations to fit it, and save intermediate results be
 no allocation is reported, go by the effective cgroup limits; host memory and CPU affinity may
 exceed what the job may use. The startup snapshot is also at
 `$CODEFLOWER_ENVIRONMENT_FILE`; the doctor reports the current allowlist when networking is isolated.
-`codeflower-show` displays results, `codeflower-env-export` records installed environments, and
+`codeflower-show` displays results, `codeflower-inventory` describes data folders,
+`codeflower-env-export` records installed environments, and
 `codeflower-network` checks the isolated network's allowlist and hosts.
 
 ## Installing software
@@ -83,8 +84,11 @@ You manage the environment yourself: install what the analysis needs, without as
 
 ## How to analyse
 
-1. **Look before you compute.** List `/data/input`, check sizes and formats, and read a few rows or the
-   object's summary. Do not print large data to the console.
+1. **Look before you compute.** Start with the data inventory written when this worker started, at
+   `$CODEFLOWER_INVENTORY_FILE`: every folder in `/data/input` with its files' formats, sizes, shapes
+   and columns. Run `codeflower-inventory /data/input/<name>` for a folder it did not finish or after
+   the data changed. Then read a few rows or the object's summary of what you will use. Do not print
+   large data to the console.
    `rg` (ripgrep) is preinstalled; prefer `rg <pattern> <path>` for text searches and
    `rg --files <path>` to list files. Use domain-aware tools for large or binary data.
 2. **Write scripts, run them, read the output.** Prefer scripts in `scripts/` over long one-liners, so

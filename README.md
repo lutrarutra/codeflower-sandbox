@@ -6,7 +6,8 @@ and DeepSeek Harness), and the bridge that connects it to VS Code.
 - `Dockerfile`, `entrypoint.sh`: the image (`codeflower-sandbox`) and its start script
 - `package.json`: the agent runtimes, pinned exactly
 - `bin/`: `codeflower-show`, `codeflower-pty`, `codeflower-env-export`, `codeflower-network`,
-  and `codeflower-doctor` for per-worker environment facts and live diagnostics
+  `codeflower-doctor` for per-worker environment facts and live diagnostics, and
+  `codeflower-inventory`, which describes the mounted data (formats, shapes, columns)
 - `templates/`: the agent instructions copied into a new workspace
 - `dsh-plugins/acp-ws/`: the authenticated ACP WebSocket bridge, session recorder, and sign-in relay
 
@@ -35,5 +36,7 @@ snapshot and checks current resources and, when isolated, the current network al
 reports the allocation the launcher found (`CODEFLOWER_ALLOCATION_*`: the batch job's CPUs, memory,
 GPUs and end, or `--cpus`, `--memory`, `--time-limit`) and the tightest cgroup limit above the
 process, found through `/proc/self/cgroup` because Apptainer shows the host's cgroup tree.
+It also writes a data inventory of `/data/input` there (`CODEFLOWER_INVENTORY_FILE`, at most
+`CODEFLOWER_INVENTORY_SECONDS`, default 10 s), which the agent instructions point to.
 For development, clone [codeflower-workspace](https://github.com/lutrarutra/codeflower-workspace),
 which has this repo as the `sandbox/` submodule.

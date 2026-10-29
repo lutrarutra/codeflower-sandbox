@@ -128,6 +128,19 @@ if [ -n "${CODEFLOWER_INSTANCE_ID:-}" ]; then
   fi
 fi
 
+# What the user's data holds (formats, shapes, columns), so the agent knows it
+# before listing anything. Workers of a project may mount different data, so
+# each writes its own. A short time limit keeps big folders from delaying the
+# start; the agent can run the command again for more.
+if [ -n "${CODEFLOWER_INSTANCE_ID:-}" ]; then
+  CODEFLOWER_INVENTORY_FILE="${CODEFLOWER_RUN_DIR:-$state/run}/inventory-$CODEFLOWER_INSTANCE_ID.md"
+  export CODEFLOWER_INVENTORY_FILE
+  if ! codeflower-inventory --time-limit "${CODEFLOWER_INVENTORY_SECONDS:-10}" --write "$CODEFLOWER_INVENTORY_FILE"; then
+    echo "Could not describe the data in /data/input" >&2
+    unset CODEFLOWER_INVENTORY_FILE
+  fi
+fi
+
 # The launcher's development --inspect-port sets this; the agents never
 # inherit an inspector because it is a node flag, not NODE_OPTIONS.
 if [ -n "${CODEFLOWER_BRIDGE_INSPECT:-}" ]; then

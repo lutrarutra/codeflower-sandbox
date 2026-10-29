@@ -1,0 +1,762 @@
+#!/usr/bin/env python3
+"""Describes the user's data: what each mounted folder holds, in Markdown.
+
+At startup the entrypoint writes it for the agent, so it knows the data's
+formats, shapes and columns before it lists anything. It reads only the start
+or the footer of each file, stops describing when its time is up, and needs
+only the standard library; with h5py or pyarrow in the environment it also
+looks inside HDF5 (AnnData, loom, 10x) and Parquet files.
+"""
+
+import argparse
+import csv
+import gzip
+import io
+import json
+import os
+import re
+import sqlite3
+import struct
+import sys
+import time
+import zipfile
+from datetime import datetime, timezone
+from urllib.parse import quote
+
+USAGE_NOTE = "Rerun `codeflower-inventory PATH` for a folder in more detail, or after the data changed."
+# A folder with more files than this is summarised by kind, with a few examples described.
+LIST_LIMIT = 12
+EXAMPLES_PER_KIND = 2
+MAX_DESCRIBED = 150
+MAX_COLUMNS = 30
+HEAD_BYTES = 64 * 1024
+DATASET_SUFFIXES = (".zarr", ".zarr.zip")
+
+budget_end = float("inf")
+
+
+def out_of_time():
+    return time.monotonic() > budget_end
+
+
+def size_text(size):
+    for unit in ("B", "kB", "MB", "GB", "TB"):
+        if size < 1000 or unit == "TB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1000
+    return ""
+
+
+def count_text(number):
+    return f"{number:,}"
+
+
+def names_text(names, limit=MAX_COLUMNS):
+    names = [str(name) for name in names]
+    shown = ", ".join(names[:limit])
+    return shown + (f", … ({len(names) - limit} more)" if len(names) > limit else "")
+
+
+def kind_of(name):
+    """The file's kind for grouping: its extension, with a compression suffix."""
+    lower = name.lower()
+    stem, extension = os.path.splitext(lower)
+    if extension in (".gz", ".bz2", ".xz", ".zst", ".zip") and os.path.splitext(stem)[1]:
+        return os.path.splitext(stem)[1] + extension
+    return extension or "(no extension)"
+
+
+def open_text(path):
+    if path.lower().endswith(".gz"):
+        return io.TextIOWrapper(gzip.open(path, "rb"), encoding="utf-8", errors="replace")
+    return open(path, encoding="utf-8", errors="replace")
+
+
+def read_head(path, limit=HEAD_BYTES):
+    with open_text(path) as handle:
+        return handle.read(limit)
+
+
+# ---- tables in text ----
+
+TABLE_KINDS = {".csv", ".tsv", ".tab", ".txt", ".csv.gz", ".tsv.gz", ".tab.gz", ".txt.gz"}
+
+
+def value_type(values):
+    kinds = set()
+    for value in values:
+        value = value.strip()
+        if value in ("", "NA", "NaN", "nan", "null", "None"):
+            continue
+        try:
+            int(value)
+            kinds.add("int")
+            continue
+        except ValueError:
+            pass
+        try:
+            float(value)
+            kinds.add("float")
+        except ValueError:
+            kinds.add("text")
+    if not kinds:
+        return "empty"
+    if "text" in kinds:
+        return "text"
+    return "float" if "float" in kinds else "int"
+
+
+def describe_table(path, size):
+    head = read_head(path)
+    complete = len(head) < HEAD_BYTES
+    lines = head.splitlines()
+    if not complete and lines:
+        lines = lines[:-1]  # cut off mid-line
+    if not lines:
+        return "empty"
+    sample = "\n".join(lines[:50])
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=",\t;|")
+        delimiter = dialect.delimiter
+    except csv.Error:
+        if path.lower().endswith((".txt", ".txt.gz")):
+            return f"text, starts: {lines[0][:120]!r}"
+        delimiter = "\t" if ".tsv" in path.lower() or ".tab" in path.lower() else ","
+    rows = list(csv.reader(lines[:51], delimiter=delimiter))
+    if not rows or len(rows[0]) < 2:
+        return f"text, starts: {lines[0][:120]!r}"
+    header, body = rows[0], rows[1:]
+    try:
+        has_header = csv.Sniffer().has_header(sample) if body else True
+    except csv.Error:
+        has_header = True
+    name = {",": "CSV", "\t": "TSV", ";": "semicolon-separated", "|": "pipe-separated"}[delimiter]
+    if not has_header:
+        header, body = [f"column {index + 1}" for index in range(len(rows[0]))], rows
+    columns = []
+    for index, column in enumerate(header[:MAX_COLUMNS]):
+        kind = value_type(row[index] for row in body if index < len(row))
+        columns.append(f"{column} ({kind})" if body else column)
+    text = f"{name}, {len(header)} columns{'' if has_header else ' (no header)'}: {', '.join(columns)}"
+    if len(header) > MAX_COLUMNS:
+        text += f", … ({len(header) - MAX_COLUMNS} more)"
+    if complete:
+        text += f"; {count_text(len(lines) - (1 if has_header else 0))} rows"
+    elif not path.lower().endswith(".gz"):
+        average = max(1, len("\n".join(lines).encode()) / len(lines))
+        text += f"; ~{count_text(int(size / average))} rows (estimated)"
+    return text
+
+
+def describe_jsonl(path, size):
+    first = read_head(path, 16 * 1024).split("\n", 1)[0]
+    try:
+        record = json.loads(first)
+    except json.JSONDecodeError:
+        return "JSON lines, not parseable"
+    keys = f", keys: {names_text(record)}" if isinstance(record, dict) else ""
+    return f"JSON lines{keys}"
+
+
+def describe_json(path, size):
+    if size > 20_000_000:
+        head = read_head(path, 200).lstrip()
+        return f"JSON ({'object' if head.startswith('{') else 'array' if head.startswith('[') else 'value'}), too large to read here"
+    with open_text(path) as handle:
+        try:
+            data = json.load(handle)
+        except json.JSONDecodeError:
+            return "JSON, not parseable"
+    if isinstance(data, dict):
+        return f"JSON object, keys: {names_text(data)}"
+    if isinstance(data, list):
+        first = f"; items have keys: {names_text(data[0])}" if data and isinstance(data[0], dict) else ""
+        return f"JSON array of {count_text(len(data))}{first}"
+    return "JSON value"
+
+
+# ---- Parquet, read with pyarrow or from its footer ----
+
+
+class CompactReader:
+    """Just enough of Thrift's compact protocol for Parquet's footer."""
+
+    def __init__(self, data):
+        self.data, self.position = data, 0
+
+    def byte(self):
+        value = self.data[self.position]
+        self.position += 1
+        return value
+
+    def varint(self):
+        shift = result = 0
+        while True:
+            byte = self.byte()
+            result |= (byte & 0x7F) << shift
+            if not byte & 0x80:
+                return result
+            shift += 7
+
+    def integer(self):
+        value = self.varint()
+        return (value >> 1) ^ -(value & 1)
+
+    def binary(self):
+        length = self.varint()
+        value = self.data[self.position : self.position + length]
+        self.position += length
+        return value
+
+    def skip(self, kind):
+        if kind in (1, 2):
+            return
+        if kind == 3:
+            self.position += 1
+        elif kind in (4, 5, 6):
+            self.varint()
+        elif kind == 7:
+            self.position += 8
+        elif kind == 8:
+            self.binary()
+        elif kind in (9, 10):
+            header = self.byte()
+            count = header >> 4
+            if count == 15:
+                count = self.varint()
+            for _ in range(count):
+                self.skip(header & 0x0F)
+        elif kind == 11:
+            count = self.varint()
+            if count:
+                kinds = self.byte()
+                for _ in range(count):
+                    self.skip(kinds >> 4)
+                    self.skip(kinds & 0x0F)
+        elif kind == 12:
+            self.struct(lambda field, kind: self.skip(kind))
+        else:
+            raise ValueError(f"unknown Thrift type {kind}")
+
+    def struct(self, on_field):
+        field = 0
+        while True:
+            header = self.byte()
+            if header == 0:
+                return
+            delta, kind = header >> 4, header & 0x0F
+            field = field + delta if delta else self.integer()
+            on_field(field, kind)
+
+    def list(self, read_item):
+        header = self.byte()
+        count = header >> 4
+        if count == 15:
+            count = self.varint()
+        return [read_item(header & 0x0F) for _ in range(count)]
+
+
+PARQUET_TYPES = ["boolean", "int32", "int64", "int96", "float", "double", "binary", "fixed_len_byte_array"]
+
+
+def parquet_footer(path):
+    with open(path, "rb") as handle:
+        handle.seek(-8, os.SEEK_END)
+        length, magic = struct.unpack("<I4s", handle.read(8))
+        if magic != b"PAR1":
+            raise ValueError("not a Parquet file")
+        handle.seek(-8 - length, os.SEEK_END)
+        reader = CompactReader(handle.read(length))
+    schema, rows = [], None
+
+    def element(_kind):
+        item = {}
+
+        def field(number, kind):
+            if number == 1 and kind == 5:
+                item["type"] = reader.integer()
+            elif number == 4 and kind == 8:
+                item["name"] = reader.binary().decode("utf-8", "replace")
+            elif number == 5 and kind == 5:
+                item["children"] = reader.integer()
+            elif number == 6 and kind == 5:
+                item["converted"] = reader.integer()
+            else:
+                reader.skip(kind)
+
+        reader.struct(field)
+        return item
+
+    def meta(number, kind):
+        nonlocal schema, rows
+        if number == 2 and kind == 9:
+            schema = reader.list(element)
+        elif number == 3 and kind == 6:
+            rows = reader.integer()
+        else:
+            reader.skip(kind)
+
+    reader.struct(meta)
+    # The first element is the root; its children are the columns.
+    columns, index = [], 1
+    while index < len(schema):
+        item = schema[index]
+        kind = PARQUET_TYPES[item["type"]] if "type" in item and item["type"] < len(PARQUET_TYPES) else "group"
+        if kind == "binary" and item.get("converted") == 0:  # UTF8
+            kind = "string"
+        columns.append(f"{item.get('name', '?')} ({kind})")
+        index += 1
+        # Skip the nested elements of a group column.
+        pending = item.get("children", 0)
+        while pending and index < len(schema):
+            pending += schema[index].get("children", 0) - 1
+            index += 1
+    return rows, columns
+
+
+def describe_parquet(path, size):
+    try:
+        import pyarrow.parquet as pq
+
+        metadata = pq.read_metadata(path)
+        rows = metadata.num_rows
+        columns = [f"{field.name} ({field.type})" for field in metadata.schema.to_arrow_schema()]
+    except ImportError:
+        rows, columns = parquet_footer(path)
+    text = f"Parquet, {len(columns)} columns: {names_text(columns)}"
+    return text + (f"; {count_text(rows)} rows" if rows is not None else "")
+
+
+# ---- HDF5: AnnData, loom, 10x; needs h5py ----
+
+HDF5_SIGNATURE = b"\x89HDF\r\n\x1a\n"
+
+
+def h5_attribute(item, name):
+    value = item.attrs.get(name)
+    if isinstance(value, bytes):
+        return value.decode()
+    return value
+
+
+def anndata_shape(file):
+    matrix = file.get("X")
+    if matrix is None:
+        return None
+    if hasattr(matrix, "shape"):
+        return tuple(matrix.shape)
+    shape = h5_attribute(matrix, "shape") if hasattr(matrix, "attrs") else None
+    return tuple(int(value) for value in shape) if shape is not None else None
+
+
+def frame_columns(group):
+    if group is None:
+        return []
+    order = h5_attribute(group, "column-order")
+    if order is not None:
+        return [value.decode() if isinstance(value, bytes) else str(value) for value in order]
+    return [name for name in group.keys() if name not in ("_index", "__categories")]
+
+
+def describe_hdf5(path, size):
+    with open(path, "rb") as handle:
+        if handle.read(8) != HDF5_SIGNATURE:
+            return "not an HDF5 file"
+    try:
+        import h5py
+    except ImportError:
+        return "HDF5 (install h5py to see inside)"
+    with h5py.File(path, "r") as file:
+        encoding = h5_attribute(file, "encoding-type")
+        if encoding == "anndata" or {"X", "obs", "var"} <= set(file.keys()):
+            shape = anndata_shape(file)
+            parts = ["AnnData"]
+            if shape:
+                parts.append(f"{count_text(shape[0])} observations × {count_text(shape[1])} variables")
+            obs = frame_columns(file.get("obs"))
+            if obs:
+                parts.append(f"obs: {names_text(obs)}")
+            var = frame_columns(file.get("var"))
+            if var:
+                parts.append(f"var: {names_text(var)}")
+            for name in ("layers", "obsm", "varm", "obsp", "uns"):
+                if name in file and len(file[name]):
+                    parts.append(f"{name}: {names_text(file[name].keys(), 15)}")
+            return "; ".join(parts)
+        if "matrix" in file and isinstance(file["matrix"], h5py.Group) and "barcodes" in file["matrix"]:
+            matrix = file["matrix"]
+            shape = matrix["shape"][()] if "shape" in matrix else None
+            text = "10x Genomics feature-barcode matrix"
+            return text + (f": {count_text(int(shape[0]))} features × {count_text(int(shape[1]))} barcodes" if shape is not None else "")
+        if "matrix" in file and "row_attrs" in file and "col_attrs" in file:
+            shape = file["matrix"].shape
+            return (
+                f"loom: {count_text(shape[0])} rows × {count_text(shape[1])} columns; "
+                f"row attributes: {names_text(file['row_attrs'].keys(), 15)}; "
+                f"column attributes: {names_text(file['col_attrs'].keys(), 15)}"
+            )
+        items = []
+
+        def visit(name, item):
+            if len(items) >= 25 or name.count("/") > 1:
+                return
+            if isinstance(item, h5py.Dataset):
+                items.append(f"{name} {item.dtype} {tuple(item.shape)}")
+            else:
+                items.append(f"{name}/")
+
+        file.visititems(visit)
+        return f"HDF5: {', '.join(items)}" if items else "HDF5, empty"
+
+
+# ---- Zarr (AnnData or arrays), 10x folders ----
+
+
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def zarr_meta(path):
+    """A Zarr node's attributes and array shape, for format 2 or 3."""
+    v3 = read_json(os.path.join(path, "zarr.json"))
+    if v3 is not None:
+        return v3.get("attributes", {}), v3.get("shape"), v3.get("node_type") == "array"
+    attributes = read_json(os.path.join(path, ".zattrs")) or {}
+    array = read_json(os.path.join(path, ".zarray"))
+    return attributes, array.get("shape") if array else None, array is not None
+
+
+def describe_zarr(path):
+    attributes, _, _ = zarr_meta(path)
+    children = sorted(name for name in os.listdir(path) if not name.startswith(".") and name != "zarr.json")
+    if attributes.get("encoding-type") == "anndata" or {"X", "obs", "var"} <= set(children):
+        parts = ["AnnData (Zarr)"]
+        x_attributes, x_shape, _ = zarr_meta(os.path.join(path, "X"))
+        shape = x_shape or x_attributes.get("shape")
+        if shape:
+            parts.append(f"{count_text(shape[0])} observations × {count_text(shape[1])} variables")
+        for name in ("obs", "var"):
+            frame, _, _ = zarr_meta(os.path.join(path, name))
+            if frame.get("column-order"):
+                parts.append(f"{name}: {names_text(frame['column-order'])}")
+        for name in ("layers", "obsm", "uns"):
+            folder = os.path.join(path, name)
+            if os.path.isdir(folder):
+                keys = [key for key in sorted(os.listdir(folder)) if not key.startswith(".") and key != "zarr.json"]
+                if keys:
+                    parts.append(f"{name}: {names_text(keys, 15)}")
+        return "; ".join(parts)
+    items = []
+    for name in children[:25]:
+        _, shape, is_array = zarr_meta(os.path.join(path, name))
+        items.append(f"{name} {tuple(shape)}" if is_array and shape is not None else f"{name}/")
+    return f"Zarr group: {', '.join(items)}" if items else "Zarr store"
+
+
+def matrix_market_header(path):
+    with open_text(path) as handle:
+        first = handle.readline()
+        if not first.startswith("%%MatrixMarket"):
+            return None
+        for line in handle:
+            if not line.startswith("%"):
+                rows, columns, nonzero = (int(value) for value in line.split()[:3])
+                return rows, columns, nonzero
+    return None
+
+
+def describe_mtx(path, size):
+    header = matrix_market_header(path)
+    if not header:
+        return "Matrix Market, header not readable"
+    rows, columns, nonzero = header
+    return f"Matrix Market sparse matrix: {count_text(rows)} × {count_text(columns)}, {count_text(nonzero)} nonzero"
+
+
+def tenx_folder(path, names):
+    matrix = next((name for name in names if name in ("matrix.mtx", "matrix.mtx.gz")), None)
+    if not matrix:
+        return None
+    header = matrix_market_header(os.path.join(path, matrix))
+    text = "10x Genomics matrix folder"
+    if header:
+        text += f": {count_text(header[0])} features × {count_text(header[1])} barcodes, {count_text(header[2])} nonzero"
+    return text + f" ({', '.join(sorted(names))})"
+
+
+# ---- other formats ----
+
+
+def describe_xlsx(path, size):
+    with zipfile.ZipFile(path) as archive:
+        workbook = archive.read("xl/workbook.xml").decode("utf-8", "replace")
+        sheets = re.findall(r'<sheet [^>]*name="([^"]+)"', workbook)
+        dimensions = []
+        for index, sheet in enumerate(sheets[:10], start=1):
+            try:
+                with archive.open(f"xl/worksheets/sheet{index}.xml") as handle:
+                    match = re.search(rb'<dimension ref="([^"]+)"', handle.read(4096))
+                dimensions.append(f"{sheet} ({match.group(1).decode()})" if match else sheet)
+            except KeyError:
+                dimensions.append(sheet)
+    return f"Excel workbook, sheets: {', '.join(dimensions)}{', …' if len(sheets) > 10 else ''}"
+
+
+def describe_vcf(path, size):
+    with open_text(path) as handle:
+        version = ""
+        for number, line in enumerate(handle):
+            if line.startswith("##fileformat="):
+                version = line.strip().split("=", 1)[1]
+            elif line.startswith("#CHROM"):
+                samples = line.rstrip("\n").split("\t")[9:]
+                return f"VCF{f' ({version})' if version else ''}, {count_text(len(samples))} samples: {names_text(samples, 10)}"
+            if number > 100_000:
+                break
+    return "VCF, no #CHROM header found"
+
+
+def describe_npy(path, size):
+    with open(path, "rb") as handle:
+        if handle.read(6) != b"\x93NUMPY":
+            return "not a NumPy file"
+        major = handle.read(2)[0]
+        length = struct.unpack("<H" if major == 1 else "<I", handle.read(2 if major == 1 else 4))[0]
+        header = handle.read(length).decode("latin1")
+    shape = re.search(r"'shape':\s*\(([^)]*)\)", header)
+    dtype = re.search(r"'descr':\s*'([^']+)'", header)
+    return f"NumPy array {dtype.group(1) if dtype else ''} ({shape.group(1).strip() if shape else '?'})"
+
+
+def describe_npz(path, size):
+    with zipfile.ZipFile(path) as archive:
+        return f"NumPy archive: {names_text([name.removesuffix('.npy') for name in archive.namelist()], 20)}"
+
+
+def describe_sqlite(path, size):
+    uri = f"file:{quote(os.path.abspath(path))}?mode=ro&immutable=1"
+    with sqlite3.connect(uri, uri=True, timeout=1) as connection:
+        tables = [row[0] for row in connection.execute("select name from sqlite_master where type = 'table' order by name")]
+    return f"SQLite database, tables: {names_text(tables, 20)}" if tables else "SQLite database, no tables"
+
+
+def describe_fasta(path, size):
+    first = read_head(path, 4096).split("\n", 1)[0]
+    return f"FASTA, first record: {first[:100]}" if first.startswith(">") else "FASTA"
+
+
+LABELS = {
+    ".fastq": "FASTQ reads", ".fq": "FASTQ reads", ".fastq.gz": "FASTQ reads (gzip)", ".fq.gz": "FASTQ reads (gzip)",
+    ".bam": "BAM alignments", ".cram": "CRAM alignments", ".sam": "SAM alignments", ".bai": "BAM index",
+    ".bed": "BED intervals", ".bed.gz": "BED intervals", ".gtf": "GTF annotation", ".gtf.gz": "GTF annotation",
+    ".gff": "GFF annotation", ".gff3": "GFF annotation", ".gff3.gz": "GFF annotation",
+    ".bigwig": "bigWig track", ".bw": "bigWig track", ".rds": "R object (RDS)", ".rda": "R data", ".rdata": "R data",
+    ".pkl": "Python pickle (do not unpickle untrusted data)", ".pickle": "Python pickle (do not unpickle untrusted data)",
+    ".feather": "Feather/Arrow table", ".arrow": "Arrow table", ".tif": "TIFF image", ".tiff": "TIFF image",
+    ".png": "PNG image", ".jpg": "JPEG image", ".jpeg": "JPEG image", ".czi": "Zeiss CZI image", ".nd2": "Nikon ND2 image",
+    ".pdf": "PDF", ".md": "Markdown", ".html": "HTML", ".ipynb": "Jupyter notebook", ".py": "Python script",
+    ".r": "R script", ".pt": "PyTorch weights", ".pth": "PyTorch weights", ".safetensors": "safetensors weights",
+    ".sav": "SPSS data", ".dta": "Stata data", ".sas7bdat": "SAS data", ".xls": "Excel workbook (old format)",
+}
+
+DESCRIBERS = {
+    ".parquet": describe_parquet, ".pq": describe_parquet,
+    ".h5": describe_hdf5, ".hdf5": describe_hdf5, ".h5ad": describe_hdf5, ".loom": describe_hdf5, ".h5mu": describe_hdf5,
+    ".mtx": describe_mtx, ".mtx.gz": describe_mtx,
+    ".json": describe_json, ".jsonl": describe_jsonl, ".ndjson": describe_jsonl, ".jsonl.gz": describe_jsonl,
+    ".xlsx": describe_xlsx, ".vcf": describe_vcf, ".vcf.gz": describe_vcf, ".npy": describe_npy, ".npz": describe_npz,
+    ".sqlite": describe_sqlite, ".sqlite3": describe_sqlite, ".db": describe_sqlite,
+    ".fa": describe_fasta, ".fasta": describe_fasta, ".fa.gz": describe_fasta, ".fasta.gz": describe_fasta, ".fna": describe_fasta,
+}
+
+
+def describe_file(path, size):
+    kind = kind_of(os.path.basename(path))
+    describer = DESCRIBERS.get(kind) or (describe_table if kind in TABLE_KINDS else None)
+    if describer is None:
+        return LABELS.get(kind, "")
+    try:
+        return describer(path, size)
+    except Exception as error:  # A damaged or unusual file must not stop the inventory.
+        label = LABELS.get(kind, kind.lstrip(".").upper())
+        return f"{label}, could not read it ({type(error).__name__}: {str(error)[:80]})"
+
+
+# ---- walking ----
+
+
+class Folder:
+    def __init__(self, path):
+        self.path = path
+        self.files = []  # (name, size)
+        self.datasets = []  # (name, description)
+        self.truncated = False
+
+
+def walk(root, deadline_walk, max_entries):
+    """Folders under root with their files; dataset folders are not entered."""
+    folders, seen, entries = [], set(), 0
+    stack = [root]
+    while stack:
+        path = stack.pop()
+        try:
+            info = os.stat(path)
+        except OSError:
+            continue
+        if (info.st_dev, info.st_ino) in seen:
+            continue
+        seen.add((info.st_dev, info.st_ino))
+        folder = Folder(path)
+        folders.append(folder)
+        try:
+            items = sorted(os.scandir(path), key=lambda item: item.name)
+        except OSError:
+            folder.truncated = True
+            continue
+        names = [item.name for item in items]
+        tenx = tenx_folder(path, names)
+        if tenx:
+            folder.datasets.append((".", tenx))
+        subfolders = []
+        for item in items:
+            entries += 1
+            if entries > max_entries or time.monotonic() > deadline_walk:
+                folder.truncated = True
+                return folders, True
+            if item.name.startswith("."):
+                continue
+            try:
+                if item.is_dir():
+                    if item.name.lower().endswith(DATASET_SUFFIXES):
+                        folder.datasets.append((item.name + "/", None))
+                    else:
+                        subfolders.append(item.path)
+                elif item.is_file():
+                    folder.files.append((item.name, item.stat().st_size))
+            except OSError:
+                continue
+        stack.extend(reversed(subfolders))
+    return folders, False
+
+
+def inventory(root, lines, state):
+    started = time.monotonic()
+    folders, cut = walk(root, started + max(1.0, (budget_end - started) / 2), state["max_entries"])
+    files = [(folder, name, size) for folder in folders for name, size in folder.files]
+    total = sum(size for _, _, size in files)
+    access = "read-only" if not os.access(root, os.W_OK) else "writable"
+    lines.append(f"## {root}")
+    lines.append("")
+    lines.append(
+        f"{access}; {count_text(len(files))} files, {size_text(total)}"
+        + (f" in {count_text(len(folders))} folders" if len(folders) > 1 else "")
+        + (" (stopped counting: too many files to list in time)" if cut else "")
+    )
+    kinds = {}
+    for _, name, size in files:
+        count, kind_size = kinds.get(kind_of(name), (0, 0))
+        kinds[kind_of(name)] = (count + 1, kind_size + size)
+    if len(kinds) > 1:
+        top = sorted(kinds.items(), key=lambda item: -item[1][1])[:10]
+        lines.append("")
+        lines.append("By kind: " + ", ".join(f"{kind} {count_text(count)} ({size_text(size)})" for kind, (count, size) in top))
+    lines.append("")
+
+    def describe(path, size):
+        if state["described"] >= MAX_DESCRIBED or out_of_time():
+            state["skipped"] += 1
+            return ""
+        state["described"] += 1
+        return describe_file(path, size)
+
+    for folder in folders:
+        if not folder.files and not folder.datasets:
+            continue
+        relative = os.path.relpath(folder.path, root)
+        prefix = "" if relative == "." else relative + "/"
+        for name, description in folder.datasets:
+            if description is None:
+                try:
+                    description = describe_zarr(os.path.join(folder.path, name)) if not out_of_time() else ""
+                except Exception as error:
+                    description = f"Zarr, could not read it ({type(error).__name__})"
+            target = prefix if name == "." else prefix + name
+            lines.append(f"- `{target or './'}`" + (f": {description}" if description else ""))
+        if len(folder.files) <= LIST_LIMIT:
+            for name, size in folder.files:
+                description = describe(os.path.join(folder.path, name), size)
+                lines.append(f"- `{prefix}{name}` {size_text(size)}" + (f": {description}" if description else ""))
+            continue
+        groups = {}
+        for name, size in folder.files:
+            groups.setdefault(kind_of(name), []).append((name, size))
+        summary = ", ".join(
+            f"{count_text(len(group))} {kind} ({size_text(sum(size for _, size in group))})"
+            for kind, group in sorted(groups.items(), key=lambda item: -len(item[1]))
+        )
+        lines.append(f"- `{prefix or './'}`: {count_text(len(folder.files))} files: {summary}")
+        for kind, group in sorted(groups.items(), key=lambda item: -len(item[1])):
+            examples = group[:EXAMPLES_PER_KIND]
+            for name, size in examples:
+                description = describe(os.path.join(folder.path, name), size)
+                lines.append(f"  - e.g. `{prefix}{name}` {size_text(size)}" + (f": {description}" if description else ""))
+    if not files and not any(folder.datasets for folder in folders):
+        lines.append("(empty)")
+    lines.append("")
+
+
+def main():
+    global budget_end
+    parser = argparse.ArgumentParser(description="Describe the data in the mounted folders (default: /data/input/*).")
+    parser.add_argument("paths", nargs="*", help="folders to describe")
+    parser.add_argument("--write", metavar="FILE", help="write the Markdown to FILE instead of printing it")
+    parser.add_argument("--time-limit", type=float, default=60, metavar="SECONDS", help="stop describing after this long (default 60)")
+    parser.add_argument("--max-entries", type=int, default=200_000, help="stop walking a folder after this many entries")
+    args = parser.parse_args()
+    budget_end = time.monotonic() + args.time_limit
+    paths = args.paths
+    if not paths:
+        try:
+            paths = sorted(os.path.join("/data/input", name) for name in os.listdir("/data/input") if not name.startswith("."))
+        except OSError:
+            paths = []
+
+    lines = [
+        "# Data inventory",
+        "",
+        f"Written by `codeflower-inventory` at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}. "
+        "It read only the start or the footer of each file: shapes and row counts marked as estimated are approximate. "
+        + USAGE_NOTE,
+        "",
+    ]
+    if not paths:
+        lines += ["No data is mounted (`/data/input` is empty).", ""]
+    state = {"described": 0, "skipped": 0, "max_entries": args.max_entries}
+    for path in paths:
+        if os.path.isdir(path):
+            inventory(os.path.abspath(path), lines, state)
+        elif os.path.isfile(path):
+            size = os.path.getsize(path)
+            description = describe_file(path, size)
+            lines += [f"- `{path}` {size_text(size)}" + (f": {description}" if description else ""), ""]
+        else:
+            lines += [f"`{path}` does not exist.", ""]
+    if state["skipped"]:
+        lines += [f"{count_text(state['skipped'])} files were listed but not described (time or count limit).", ""]
+    text = "\n".join(lines).rstrip() + "\n"
+    if args.write:
+        temporary = f"{args.write}.{os.getpid()}.tmp"
+        os.makedirs(os.path.dirname(os.path.abspath(args.write)), exist_ok=True)
+        with open(temporary, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(temporary, args.write)
+    else:
+        sys.stdout.write(text)
+
+
+if __name__ == "__main__":
+    main()
