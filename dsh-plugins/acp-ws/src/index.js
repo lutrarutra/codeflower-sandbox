@@ -120,6 +120,9 @@ const bridge = await startBridge({
   agentName,
   agent: agents[agentName],
   initialPrompt,
+  // The batch job's end, from the launcher (Slurm, PBS, HTCondor or --time-limit).
+  allocationEnd: Date.parse(process.env.CODEFLOWER_ALLOCATION_END ?? '') || undefined,
+  wrapUpTemplate: await readFile(`${TEMPLATES}/wrap-up.md`, 'utf8'),
   ptyHelper: ['/opt/conda/bin/python3', '/opt/codeflower/bin/codeflower-pty'],
   describe
 });

@@ -39,6 +39,12 @@ const SHELL_TIMEOUT_MS = 15 * 60 * 1000;
 const USAGE_NOTIFY_MS = 1000;
 // How often a separate app-server may read Codex's rate limits.
 const LIMITS_INTERVAL_MS = 60_000;
+// Chats are asked to wrap up this long before the batch job ends.
+const WRAP_UP_LEAD_MS = 15 * 60_000;
+// How long a cancelled turn may take to end before the wrap-up gives up on it.
+const WRAP_UP_CANCEL_MS = 30_000;
+// setTimeout waits at most about 24 days; longer waits are made of several.
+const MAX_TIMER_MS = 2 ** 31 - 1;
 const SESSION_STARTS = ['session/new', 'session/resume', 'session/load'];
 
 /** The line users paste into VS Code; the token travels in it like Jupyter's. */
@@ -354,6 +360,11 @@ export async function startBridge(options) {
     agent,
     initialPrompt,
     sessionsDirectory,
+    // When the batch job ends (ms since the epoch), and what chats with a turn
+    // running are told some minutes before ({{end}}, {{minutes}}).
+    allocationEnd,
+    wrapUpTemplate,
+    wrapUpLeadMs = WRAP_UP_LEAD_MS,
     describe = async () => ({}),
     ptyHelper,
     environment: workerEnvironment = process.env,
@@ -581,6 +592,9 @@ export async function startBridge(options) {
       waiting: new Map(),
       // Each loaded session's modes and settings, for windows that reattach.
       sessions: new Map(),
+      // Requests the bridge answered itself (the wrap-up cancels them); the
+      // window's late answers are dropped.
+      answered: new Set(),
       retiring: false
     };
     let stdoutBuffer = '';
@@ -721,6 +735,67 @@ export async function startBridge(options) {
       sessionId: session.sessionId,
       prompt: [{ type: 'text', text: initialPrompt.trim() }]
     });
+  };
+
+  // ---- the job's end ----
+
+  // The sandbox stops when the batch job does, and work not saved by then is
+  // lost. Some minutes before, chats with a turn running are stopped and asked
+  // to write up what they have, whether or not a window is connected.
+  let wrapUpTimer;
+  const scheduleWrapUp = () => {
+    if (!Number.isFinite(allocationEnd) || !wrapUpTemplate) return;
+    const wait = allocationEnd - wrapUpLeadMs - Date.now();
+    wrapUpTimer = setTimeout(
+      () => (wait > MAX_TIMER_MS ? scheduleWrapUp() : void wrapUpChats().catch((error) => log(`Could not wrap up: ${error.message}`))),
+      Math.min(Math.max(0, wait), MAX_TIMER_MS)
+    );
+    wrapUpTimer.unref();
+  };
+
+  const wrapUpNotice = () => {
+    const minutes = Math.max(0, Math.round((allocationEnd - Date.now()) / 60_000));
+    return { end: new Date(allocationEnd).toISOString(), minutes };
+  };
+
+  const wrapUpChats = async () => {
+    const host = agentHost;
+    const sessionIds = host && !closing ? [...new Set(activity.snapshot().chats.map((chat) => chat.sessionId))] : [];
+    const notice = wrapUpNotice();
+    log(`The job ends at ${notice.end}; asking ${sessionIds.length} working chat(s) to wrap up`);
+    sendToClient({ jsonrpc: '2.0', method: '_codeflower/wrapUp', params: { ...notice, chats: sessionIds.length } });
+    await Promise.all(sessionIds.map((sessionId) => wrapUpChat(host, sessionId)));
+  };
+
+  const wrapUpChat = async (host, sessionId) => {
+    // As a client cancels: the turn, then the requests it waits on.
+    writeToAgent(host, { jsonrpc: '2.0', method: 'session/cancel', params: { sessionId } });
+    for (const [key, { message, sessionId: owner }] of host.waiting) {
+      if (owner !== sessionId) continue;
+      host.waiting.delete(key);
+      host.answered.add(key);
+      activity.answered(key);
+      const result = message.method === 'session/request_permission' ? { outcome: { outcome: 'cancelled' } } : { action: 'cancel' };
+      writeToAgent(host, { jsonrpc: '2.0', id: message.id, result });
+    }
+    const deadline = Date.now() + WRAP_UP_CANCEL_MS;
+    while (activity.busy(sessionId) && Date.now() < deadline && !closing) await new Promise((resolve) => setTimeout(resolve, 200));
+    if (closing || agentHost !== host) return;
+    if (activity.busy(sessionId)) {
+      log(`A chat did not stop within ${WRAP_UP_CANCEL_MS / 1000} s; it was not asked to wrap up`);
+      return;
+    }
+    const notice = wrapUpNotice();
+    const text = wrapUpTemplate.replace(/\{\{(\w+)\}\}/g, (placeholder, name) => String(notice[name] ?? placeholder)).trim();
+    // The window shows the prompt, as it did not send it.
+    sendToClient({
+      jsonrpc: '2.0',
+      method: '_codeflower/wrapUp',
+      params: { ...notice, key: sessionKey(agentName, sessionId), prompt: text }
+    });
+    await requestAgent(host, 'session/prompt', { sessionId, prompt: [{ type: 'text', text }] }).catch((error) =>
+      log(`A chat could not wrap up: ${error.message}`)
+    );
   };
 
   // A permission request or question goes to the window once, after it has
@@ -987,6 +1062,7 @@ export async function startBridge(options) {
       if (message.method === undefined) {
         if (message.id === undefined) return;
         const key = requestKey(message.id);
+        if (host.answered.delete(key)) return;
         if (host.waiting.delete(key)) activity.answered(key);
         writeToAgent(host, message, webSocket);
         return;
@@ -1161,6 +1237,7 @@ export async function startBridge(options) {
           case '_codeflower/status':
             respond({
               ...(await describe()),
+              ...(Number.isFinite(allocationEnd) ? { allocationEnd: new Date(allocationEnd).toISOString() } : {}),
               instanceId,
               agent: agentName,
               agentLabel: agent.label ?? agentName,
@@ -1420,6 +1497,8 @@ export async function startBridge(options) {
     throw error;
   }
 
+  scheduleWrapUp();
+
   if (initialPrompt !== undefined) {
     void startInitialSession().catch((error) => {
       if (!closing) log(`Could not start the initial task session: ${error.message}`);
@@ -1432,6 +1511,7 @@ export async function startBridge(options) {
       if (closing) return;
       closing = true;
       clearInterval(pings);
+      clearTimeout(wrapUpTimer);
       clearTimeout(usageTimer);
       clearTimeout(limitsTimer);
       if (saveTimer) {

@@ -296,6 +296,65 @@ test('relays chat, permissions, cancellation, and several sessions, and records 
   await closeSocket(again);
 });
 
+test('asks chats with a turn running to wrap up before the job ends', async (t) => {
+  const lead = 60_000;
+  const allocationEnd = Date.now() + lead + 1500;
+  const { bridge, sessionsDirectory } = await startTestBridge(t, {
+    allocationEnd,
+    wrapUpLeadMs: lead,
+    wrapUpTemplate: 'wrap up: the job ends at {{end}}, in {{minutes}} minutes\n'
+  });
+  const socket = await openSocket(bridge.address);
+  await initialize(socket);
+  assert.equal((await call(socket, '_codeflower/status')).result.allocationEnd, new Date(allocationEnd).toISOString());
+
+  const newSession = async () => (await call(socket, 'session/new', { cwd: '/workspace', mcpServers: [] })).result.sessionId;
+  const working = await newSession();
+  const waiting = await newSession();
+  const idle = await newSession();
+  const cancelled = call(socket, 'session/prompt', { sessionId: working, prompt: [{ type: 'text', text: 'cancel me' }] });
+  const permitted = call(socket, 'session/prompt', { sessionId: waiting, prompt: [{ type: 'text', text: 'ask permission' }] });
+  const permission = await receive(socket, (message) => message.method === 'session/request_permission');
+
+  const notice = await receive(socket, (message) => message.method === '_codeflower/wrapUp' && !message.params.key);
+  assert.equal(notice.params.chats, 2);
+  assert.equal(notice.params.minutes, 1);
+  assert.equal((await cancelled).result.stopReason, 'cancelled');
+  assert.equal((await permitted).result.stopReason, 'end_turn');
+  // The bridge answered the permission request; the window's late answer is dropped.
+  send(socket, { jsonrpc: '2.0', id: permission.id, result: { outcome: { outcome: 'selected', optionId: 'allow' } } });
+
+  const expected = `wrap up: the job ends at ${new Date(allocationEnd).toISOString()}, in 1 minutes`;
+  for (const sessionId of [working, waiting]) {
+    const prompt = await receive(
+      socket,
+      (message) => message.method === '_codeflower/wrapUp' && message.params.key === sessionKey('claude', sessionId)
+    );
+    assert.equal(prompt.params.prompt, expected);
+    const reply = await receive(
+      socket,
+      (message) => message.method === 'session/update' && message.params.sessionId === sessionId &&
+        message.params.update.content?.text?.startsWith('reply to wrap up')
+    );
+    assert.equal(reply.params.update.content.text, `reply to ${expected} in ${sessionId}`);
+  }
+
+  const waitingKey = sessionKey('claude', waiting);
+  await waitFor(async () =>
+    (await call(socket, '_codeflower/sessions/transcript', { key: waitingKey })).result.entries.length >= 8
+  );
+  const entries = (await call(socket, '_codeflower/sessions/transcript', { key: waitingKey })).result.entries;
+  assert.deepEqual(
+    entries.map((entry) => entry.kind),
+    ['prompt', 'permission', 'permission_outcome', 'update', 'turn_end', 'prompt', 'update', 'turn_end']
+  );
+  assert.deepEqual(entries[2].outcome, { outcome: 'cancelled' });
+  assert.equal(entries[5].prompt[0].text, expected);
+  // A chat with no turn running is left alone.
+  assert.deepEqual(await readTranscript(sessionsDirectory, sessionKey('claude', idle)), []);
+  await closeSocket(socket);
+});
+
 test('refuses to resume a session leased by another worker', async (t) => {
   const { bridge, sessionsDirectory } = await startTestBridge(t, { agentName: 'codex' });
   const directory = join(sessionsDirectory, sessionKey('codex', 'busy'));
