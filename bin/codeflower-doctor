@@ -1,10 +1,101 @@
 #!/usr/local/bin/node --no-warnings
 import { execFileSync } from 'node:child_process';
-import { readFileSync, statfsSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, statfsSync, writeFileSync } from 'node:fs';
 import { availableParallelism, freemem, totalmem } from 'node:os';
+import { dirname, join } from 'node:path';
 
 const state = '/codeflower-state';
+// Tests point this at a fake /proc and /sys.
+const root = process.env.CODEFLOWER_DOCTOR_ROOT || '/';
 const gib = (bytes) => `${(bytes / 1024 ** 3).toFixed(2)} GiB`;
+
+// The tightest limit on the way from the process's cgroup up to the root:
+// Apptainer has no cgroup namespace, so the root's files are not the job's.
+function cgroupLimits() {
+  const lines = readFileSync(join(root, 'proc/self/cgroup'), 'utf8').trim().split('\n');
+  const read = (file) => {
+    try {
+      return readFileSync(file, 'utf8').trim();
+    } catch {
+      return null;
+    }
+  };
+  const walk = (base, path, visit) => {
+    let found = null;
+    for (let dir = join(base, path); dir.startsWith(base); dir = dirname(dir)) {
+      if (existsSync(dir)) {
+        const value = visit(dir);
+        if (value !== null && (found === null || value.limit < found.limit)) found = { ...value, cgroup: dir.slice(base.length) || '/' };
+      }
+      if (dir === base) break;
+    }
+    return found;
+  };
+  const unified = lines.find((line) => line.startsWith('0::'));
+  if (unified) {
+    const base = join(root, 'sys/fs/cgroup');
+    const path = unified.slice(3);
+    const leaf = join(base, path);
+    const used = Number(read(join(existsSync(leaf) ? leaf : base, 'memory.current')));
+    return {
+      cpu: walk(base, path, (dir) => {
+        const [quota, period] = (read(join(dir, 'cpu.max')) ?? 'max').split(/\s+/);
+        return quota === 'max' || !(Number(period) > 0) ? null : { limit: Number(quota) / Number(period) };
+      }),
+      memory: walk(base, path, (dir) => {
+        const limit = read(join(dir, 'memory.max'));
+        return limit === null || limit === 'max' ? null : { limit: Number(limit) };
+      }),
+      used: Number.isFinite(used) && used > 0 ? used : null
+    };
+  }
+  // cgroup v1: one hierarchy per controller; huge or negative values mean no limit.
+  const v1 = (controller) => {
+    const line = lines.find((entry) => entry.split(':')[1]?.split(',').includes(controller));
+    if (!line) return null;
+    const [, controllers, path] = line.split(':');
+    const base = [controllers, controller].map((name) => join(root, 'sys/fs/cgroup', name)).find(existsSync);
+    return base ? { base, path } : null;
+  };
+  const memory = v1('memory');
+  const cpu = v1('cpu');
+  return {
+    cpu: cpu && walk(cpu.base, cpu.path, (dir) => {
+      const quota = Number(read(join(dir, 'cpu.cfs_quota_us')));
+      const period = Number(read(join(dir, 'cpu.cfs_period_us')));
+      return quota > 0 && period > 0 ? { limit: quota / period } : null;
+    }),
+    memory: memory && walk(memory.base, memory.path, (dir) => {
+      const limit = Number(read(join(dir, 'memory.limit_in_bytes')));
+      return limit > 0 && limit < 2 ** 60 ? { limit } : null;
+    }),
+    used: null
+  };
+}
+
+function remaining(end) {
+  const minutes = Math.round((end - Date.now()) / 60000);
+  if (minutes <= 0) return 'already passed';
+  return `${Math.floor(minutes / 60)} h ${minutes % 60} min left`;
+}
+
+// What the launcher read from the batch job or the user's flags, on the host.
+function allocation() {
+  const env = process.env;
+  if (!env.CODEFLOWER_ALLOCATION_SOURCE) {
+    return ['- None reported: the launcher found no batch job (Slurm, PBS, LSF, Grid Engine, HTCondor) and no --cpus, --memory or --time-limit.'];
+  }
+  const lines = [`- Source: ${env.CODEFLOWER_ALLOCATION_SOURCE}`];
+  if (env.CODEFLOWER_ALLOCATION_CPUS) lines.push(`- CPUs: ${env.CODEFLOWER_ALLOCATION_CPUS}`);
+  const memory = Number(env.CODEFLOWER_ALLOCATION_MEMORY);
+  if (memory > 0) lines.push(`- Memory: ${gib(memory)}`);
+  if (env.CODEFLOWER_ALLOCATION_GPUS) lines.push(`- GPUs: ${env.CODEFLOWER_ALLOCATION_GPUS}`);
+  const end = Date.parse(env.CODEFLOWER_ALLOCATION_END ?? '');
+  if (Number.isFinite(end)) {
+    lines.push(`- Job ends: ${new Date(end).toISOString()} (${remaining(end)}); the worker is stopped then`);
+  }
+  return lines;
+}
 
 function resources() {
   const lines = [
@@ -12,22 +103,16 @@ function resources() {
     `- Host memory: ${gib(totalmem())} total, ${gib(freemem())} currently free (not container limits)`
   ];
   try {
-    const [quota, period] = readFileSync('/sys/fs/cgroup/cpu.max', 'utf8').trim().split(/\s+/);
-    if (!/^\d+$/.test(period) || Number(period) === 0 || (quota !== 'max' && !/^\d+$/.test(quota))) {
-      throw new Error('invalid CPU quota');
-    }
-    lines.push(`- Current cgroup CPU quota: ${quota === 'max' ? 'unlimited at this level' : `${(Number(quota) / Number(period)).toFixed(2)} CPUs`} (parent limits may also apply)`);
+    const limits = cgroupLimits();
+    lines.push(limits.cpu
+      ? `- Effective cgroup CPU limit: ${limits.cpu.limit.toFixed(2)} CPUs (set on ${limits.cpu.cgroup})`
+      : '- Effective cgroup CPU limit: none found');
+    const used = limits.used === null ? '' : `, ${gib(limits.used)} in use`;
+    lines.push(limits.memory
+      ? `- Effective cgroup memory limit: ${gib(limits.memory.limit)} (set on ${limits.memory.cgroup})${used}`
+      : `- Effective cgroup memory limit: none found${used}`);
   } catch (error) {
-    lines.push(`- Current cgroup CPU quota: unavailable (${error.message})`);
-  }
-  try {
-    const limit = readFileSync('/sys/fs/cgroup/memory.max', 'utf8').trim();
-    if (limit !== 'max' && (!/^\d+$/.test(limit) || !Number.isSafeInteger(Number(limit)))) {
-      throw new Error('invalid memory limit');
-    }
-    lines.push(`- Current cgroup memory limit: ${limit === 'max' ? 'unlimited at this level' : gib(Number(limit))} (parent limits may also apply)`);
-  } catch (error) {
-    lines.push(`- Current cgroup memory limit: unavailable (${error.message})`);
+    lines.push(`- Effective cgroup limits: unavailable (${error.message})`);
   }
   try {
     const disk = statfsSync(state);
@@ -71,7 +156,7 @@ function launchFacts() {
   } catch (error) {
     lines.push(`- Mount metadata unavailable: ${error.message}`);
   }
-  lines.push('', '## Resources at startup', ...resources(), '');
+  lines.push('', '## Allocation', ...allocation(), '', '## Resources at startup', ...resources(), '');
   return lines.join('\n');
 }
 
@@ -92,6 +177,7 @@ try {
       console.log('Startup facts are unavailable: CODEFLOWER_ENVIRONMENT_FILE is not set.');
       process.exitCode = 1;
     }
+    console.log('\n## Current allocation\n' + allocation().join('\n'));
     console.log('\n## Current resources\n' + resources().join('\n'));
     if (process.env.CODEFLOWER_NETWORK === 'isolated') {
       console.log('\n## Current network allowlist');

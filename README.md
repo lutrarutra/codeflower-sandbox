@@ -31,7 +31,9 @@ The launcher ([codeflower-launcher](https://github.com/lutrarutra/codeflower-lau
 the image. The `CODEFLOWER_*` environment and `/opt/codeflower` paths it relies on are described
 in the [architecture document](https://github.com/lutrarutra/codeflower-workspace/blob/main/docs/architecture.md).
 At startup each worker writes its own snapshot under `run/`; `codeflower-doctor` reads that
-snapshot and checks current resources and, when isolated, the current network allowlist. CPU
-affinity and host memory are not necessarily the resource limits imposed by a scheduler.
+snapshot and checks current resources and, when isolated, the current network allowlist. It
+reports the allocation the launcher found (`CODEFLOWER_ALLOCATION_*`: the batch job's CPUs, memory,
+GPUs and end, or `--cpus`, `--memory`, `--time-limit`) and the tightest cgroup limit above the
+process, found through `/proc/self/cgroup` because Apptainer shows the host's cgroup tree.
 For development, clone [codeflower-workspace](https://github.com/lutrarutra/codeflower-workspace),
 which has this repo as the `sandbox/` submodule.

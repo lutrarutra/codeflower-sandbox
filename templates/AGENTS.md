@@ -40,8 +40,11 @@ packages. R, OpenCV, ffmpeg, extra native libraries and GPU tooling are not guar
 relying on them, and install what you need in a project environment.
 
 At the start of a task, run `codeflower-doctor` for this worker's startup facts and current CPU,
-memory, disk, GPU and network information. Resource figures can change, and the reported host memory
-or CPU affinity may exceed container or scheduler limits. The startup snapshot is also at
+memory, disk, GPU and network information. Its allocation section is what the batch job (or the
+user) granted, including when the job ends and the worker is stopped: size threads, worker pools,
+in-memory data and long computations to fit it, and save intermediate results before the end. Where
+no allocation is reported, go by the effective cgroup limits; host memory and CPU affinity may
+exceed what the job may use. The startup snapshot is also at
 `$CODEFLOWER_ENVIRONMENT_FILE`; the doctor reports the current allowlist when networking is isolated.
 `codeflower-show` displays results, `codeflower-env-export` records installed environments, and
 `codeflower-network` checks the isolated network's allowlist and hosts.

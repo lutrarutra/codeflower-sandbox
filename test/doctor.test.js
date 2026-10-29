@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -61,4 +61,69 @@ test('missing metadata and failed live checks are surfaced', (t) => {
   });
   assert.equal(missing.status, 1);
   assert.match(missing.stderr, /cannot read startup facts/);
+});
+
+// A fake /proc and /sys with files at paths relative to the root.
+function fakeRoot(t, files) {
+  const dir = mkdtempSync(join(tmpdir(), 'codeflower-doctor-root-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  for (const [path, content] of Object.entries(files)) {
+    mkdirSync(join(dir, path, '..'), { recursive: true });
+    writeFileSync(join(dir, path), content);
+  }
+  return dir;
+}
+
+function startup(env) {
+  const snapshot = join(env.CODEFLOWER_DOCTOR_ROOT, 'environment.md');
+  execFileSync(process.execPath, [doctor, '--write-startup', snapshot], { env: { ...process.env, ...env } });
+  return readFileSync(snapshot, 'utf8');
+}
+
+test('the tightest cgroup limit above the process is reported, as under Apptainer', (t) => {
+  const job = 'sys/fs/cgroup/system.slice/slurmstepd.scope/job_7';
+  const root = fakeRoot(t, {
+    'proc/self/cgroup': '0::/system.slice/slurmstepd.scope/job_7/step_0/user/task_0\n',
+    'sys/fs/cgroup/cpu.max': 'max 100000\n',
+    [`${job}/memory.max`]: `${8 * 1024 ** 3}\n`,
+    [`${job}/cpu.max`]: '400000 100000\n',
+    [`${job}/step_0/memory.max`]: 'max\n',
+    [`${job}/step_0/user/task_0/memory.max`]: 'max\n',
+    [`${job}/step_0/user/task_0/memory.current`]: `${1024 ** 3}\n`
+  });
+  const facts = startup({ CODEFLOWER_DOCTOR_ROOT: root });
+  assert.match(facts, /cgroup CPU limit: 4\.00 CPUs \(set on \/system\.slice\/slurmstepd\.scope\/job_7\)/);
+  assert.match(facts, /cgroup memory limit: 8\.00 GiB \(set on \/system\.slice\/slurmstepd\.scope\/job_7\), 1\.00 GiB in use/);
+});
+
+test('cgroup v1 limits are read per controller', (t) => {
+  const root = fakeRoot(t, {
+    'proc/self/cgroup': '4:memory:/slurm/uid_1/job_9\n3:cpu,cpuacct:/slurm/uid_1/job_9\n',
+    'sys/fs/cgroup/memory/memory.limit_in_bytes': '9223372036854771712\n',
+    'sys/fs/cgroup/memory/slurm/uid_1/job_9/memory.limit_in_bytes': `${2 * 1024 ** 3}\n`,
+    'sys/fs/cgroup/cpu,cpuacct/slurm/uid_1/cpu.cfs_quota_us': '200000\n',
+    'sys/fs/cgroup/cpu,cpuacct/slurm/uid_1/cpu.cfs_period_us': '100000\n',
+    'sys/fs/cgroup/cpu,cpuacct/slurm/uid_1/job_9/cpu.cfs_quota_us': '-1\n'
+  });
+  const facts = startup({ CODEFLOWER_DOCTOR_ROOT: root });
+  assert.match(facts, /cgroup CPU limit: 2\.00 CPUs \(set on \/slurm\/uid_1\)/);
+  assert.match(facts, /cgroup memory limit: 2\.00 GiB \(set on \/slurm\/uid_1\/job_9\)/);
+});
+
+test('the allocation the launcher found is reported with the time left', (t) => {
+  const root = fakeRoot(t, { 'proc/self/cgroup': '0::/\n' });
+  const end = new Date(Date.now() + (2 * 60 + 30.5) * 60000).toISOString();
+  const facts = startup({
+    CODEFLOWER_DOCTOR_ROOT: root,
+    CODEFLOWER_ALLOCATION_SOURCE: 'Slurm job 7, --memory',
+    CODEFLOWER_ALLOCATION_CPUS: '8',
+    CODEFLOWER_ALLOCATION_MEMORY: String(16 * 1024 ** 3),
+    CODEFLOWER_ALLOCATION_GPUS: '2',
+    CODEFLOWER_ALLOCATION_END: end
+  });
+  assert.match(facts, /Source: Slurm job 7, --memory/);
+  assert.match(facts, /CPUs: 8\n- Memory: 16\.00 GiB\n- GPUs: 2/);
+  assert.match(facts, /Job ends: .*\(2 h 30 min left\)/);
+  assert.match(facts, /cgroup CPU limit: none found/);
+  assert.match(startup({ CODEFLOWER_DOCTOR_ROOT: root }), /Allocation\n- None reported/);
 });
