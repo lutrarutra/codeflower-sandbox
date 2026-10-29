@@ -95,9 +95,15 @@ export function continuationPrompt(template, { kind, task, followUp, message, in
   });
 }
 
-/** What the agent is told when the time or the rounds run out. */
+/** What the agent is told when the run wraps up (time, rounds, or interrupted). */
 export function wrapUpPrompt(template, task, reason) {
-  return renderTemplate(template, { time: reason === 'time', rounds: reason === 'rounds', output: task.output, report: task.report });
+  return renderTemplate(template, {
+    time: reason === 'time',
+    rounds: reason === 'rounds',
+    interrupt: reason === 'interrupt',
+    output: task.output,
+    report: task.report
+  });
 }
 
 /** The last TASK_STATUS line of an answer, or `unknown`. */
@@ -388,6 +394,8 @@ export async function runTask({
   templates,
   environment = process.env,
   signal,
+  wrapUpSignal,
+  onWrapUp,
   out = process.stdout,
   authOut = process.stderr,
   input = process.stdin,
@@ -427,6 +435,9 @@ export async function runTask({
     return result;
   };
 
+  let cancelledByFile = false;
+  const isCancelled = () => Boolean(signal?.aborted || cancelledByFile);
+
   if (!(await agent.signedIn())) {
     if (!interactive || !ptyHelper?.length) {
       return finish({
@@ -457,7 +468,7 @@ export async function runTask({
         out: authOut,
         signal
       });
-      if (signal?.aborted) {
+      if (isCancelled()) {
         return finish({ status: 'cancelled', message: 'Sign-in was interrupted.' });
       }
       if (finished.code !== 0) {
@@ -475,7 +486,7 @@ export async function runTask({
       progressEvent('auth-end');
       authOut.write('Signed in. Starting the task…\n');
     } catch (error) {
-      if (signal?.aborted) {
+      if (isCancelled()) {
         return finish({ status: 'cancelled', message: 'Sign-in was interrupted.' });
       }
       return finish({ status: 'failed', message: `Could not sign in to ${agent.label}: ${error.message}` });
@@ -647,7 +658,7 @@ export async function runTask({
   let interruptTurn;
   const prompt = async (text, phase) => {
     turnText = '';
-    if (signal?.aborted) return { stopReason: 'cancelled', text: '' };
+    if (isCancelled()) return { stopReason: 'cancelled', text: '' };
     if (attached) {
       progressEvent('phase', { phase });
     } else {
@@ -680,12 +691,47 @@ export async function runTask({
     }
   };
 
-  // Set when the run is wrapping up: its time is almost up, or its rounds are.
+  // Set when the run is wrapping up: its time is almost up, its rounds are, or interrupted.
   let wrapUp;
   let wrapUpTimer;
   let settled;
+
+  const triggerWrapUp = (reason = 'interrupt') => {
+    if (wrapUp) return;
+    wrapUp = { reason, at: new Date().toISOString() };
+    onWrapUp?.(reason);
+    interruptTurn?.();
+  };
+
+  if (wrapUpSignal) {
+    if (wrapUpSignal.aborted) triggerWrapUp('interrupt');
+    else wrapUpSignal.addEventListener('abort', () => triggerWrapUp('interrupt'), { once: true });
+  }
+
+  const attemptDir = dirname(attemptFile);
+  const wrapUpTriggerFile = join(attemptDir, 'wrap-up');
+  const cancelTriggerFile = join(attemptDir, 'cancel');
+
+  const checkTriggers = async () => {
+    if (await exists(cancelTriggerFile)) {
+      cancelledByFile = true;
+      interruptTurn?.();
+      return;
+    }
+    if (!wrapUp && (await exists(wrapUpTriggerFile))) {
+      let reason = 'interrupt';
+      try {
+        const content = (await readFile(wrapUpTriggerFile, 'utf8')).trim();
+        if (content) reason = content;
+      } catch {}
+      triggerWrapUp(reason);
+    }
+  };
+  const triggerInterval = setInterval(checkTriggers, 200);
+
   const settle = (fields) => (settled ??= close(fields));
   const close = async (fields) => {
+    clearInterval(triggerInterval);
     clearTimeout(wrapUpTimer);
     await limitsReading;
     await recorder.flush().catch(() => {});
@@ -702,7 +748,7 @@ export async function runTask({
   // is also checked on the last turn, to say how far it got.
   const evaluate = async (last) => {
     const check = await prompt(STATUS_PROMPT, 'Checking completion');
-    if (signal?.aborted || check.stopReason === 'cancelled') return { cancelled: true, stopReason: check.stopReason };
+    if (isCancelled() || check.stopReason === 'cancelled') return { cancelled: true, stopReason: check.stopReason };
     let { status, reason } = parseStatus(check.text);
     const report = task.report ? { path: reportPath(task), exists: await exists(reportPath(task)) } : undefined;
     if (status === 'complete' && report && !report.exists) {
@@ -722,17 +768,18 @@ export async function runTask({
 
   // The last turn of a run that has to stop: the agent writes up what there is.
   const wrapUpAndSettle = async (reason) => {
-    wrapUp ??= { reason, at: new Date().toISOString() };
+    wrapUp ??= { reason: reason ?? 'interrupt', at: new Date().toISOString() };
+    onWrapUp?.(wrapUp.reason);
     if (attached) progressEvent('wrap-up', { reason: wrapUp.reason });
-    else out.write(`\n━━ wrapping up: ${wrapUp.reason === 'time' ? 'the time is almost up' : 'out of rounds'}\n`);
+    else out.write(`\n━━ wrapping up: ${wrapUp.reason === 'time' ? 'the time is almost up' : wrapUp.reason === 'interrupt' ? 'interrupted' : 'out of rounds'}\n`);
     const work = await prompt(wrapUpPrompt(templates.wrapUp, task, wrapUp.reason), 'Wrapping up');
-    if (signal?.aborted || work.stopReason === 'cancelled') return await cancelled(work.stopReason);
+    if (isCancelled() || work.stopReason === 'cancelled') return await cancelled(work.stopReason);
     if (work.stopReason !== 'end_turn') {
       return await settle({ status: 'failed', stopReason: work.stopReason, message: `The agent stopped: ${work.stopReason}` });
     }
     const outcome = await evaluate(true);
     if (outcome.cancelled) return await cancelled(outcome.stopReason);
-    const limit = wrapUp.reason === 'time' ? 'The time limit was near' : `Still not done after ${result.rounds} rounds`;
+    const limit = wrapUp.reason === 'time' ? 'The time limit was near' : wrapUp.reason === 'interrupt' ? 'Interrupted' : `Still not done after ${result.rounds} rounds`;
     return await settle({
       status: outcome.status === 'complete' ? 'completed' : 'unmet',
       stopReason: work.stopReason,
@@ -865,37 +912,35 @@ export async function runTask({
     const wrapUpAt = Date.parse(attempt.wrapUpAt ?? '');
     if (Number.isFinite(wrapUpAt)) {
       wrapUpTimer = setTimeout(() => {
-        if (wrapUp) return;
-        wrapUp = { reason: 'time', at: new Date().toISOString() };
-        interruptTurn?.();
+        triggerWrapUp('time');
       }, Math.max(0, wrapUpAt - Date.now()));
     }
 
     const rounds = Number.isInteger(task.maxRounds) && task.maxRounds > 0 ? task.maxRounds : DEFAULT_ROUNDS;
     for (let round = 1; ; round += 1) {
-      if (wrapUp) return await wrapUpAndSettle();
+      if (wrapUp) return await wrapUpAndSettle(wrapUp.reason);
       result.rounds = round;
       const work = await prompt(next, `Round ${round}/${rounds} · working`);
-      if (signal?.aborted) return await cancelled(work.stopReason);
-      if (work.stopReason === 'cancelled') return await (wrapUp ? wrapUpAndSettle() : cancelled(work.stopReason));
+      if (isCancelled()) return await cancelled(work.stopReason);
+      if (work.stopReason === 'cancelled') return await (wrapUp ? wrapUpAndSettle(wrapUp.reason) : cancelled(work.stopReason));
       if (work.stopReason !== 'end_turn') {
         return await settle({ status: 'failed', stopReason: work.stopReason, message: `The agent stopped: ${work.stopReason}` });
       }
 
       const outcome = await evaluate(round >= rounds);
-      if (signal?.aborted) return await cancelled(outcome.stopReason);
-      if (outcome.cancelled) return await (wrapUp ? wrapUpAndSettle() : cancelled(outcome.stopReason));
+      if (isCancelled()) return await cancelled(outcome.stopReason);
+      if (outcome.cancelled) return await (wrapUp ? wrapUpAndSettle(wrapUp.reason) : cancelled(outcome.stopReason));
       const { status, reason, report } = outcome;
       if (status === 'complete' || status === 'impossible') {
         return await settle({ status: status === 'complete' ? 'completed' : 'unmet', stopReason: work.stopReason, message: reason, ...(report ? { report } : {}) });
       }
       if (round >= rounds) return await wrapUpAndSettle('rounds');
-      if (wrapUp) return await wrapUpAndSettle();
+      if (wrapUp) return await wrapUpAndSettle(wrapUp.reason);
       if (attached) progressEvent('round', { round: round + 1, maxRounds: rounds, reason });
       else out.write(`\n━━ not done yet (${reason}); round ${round + 1} of ${rounds}\n`);
       next = continuePrompt(first, reason);
     }
   } catch (error) {
-    return await settle({ status: signal?.aborted ? 'cancelled' : 'failed', message: error.message });
+    return await settle({ status: isCancelled() ? 'cancelled' : 'failed', message: error.message });
   }
 }

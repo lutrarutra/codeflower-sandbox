@@ -231,6 +231,58 @@ test('a task whose time is almost up is cut short and wraps up', async (t) => {
   assert.match(prompts[1], /README\.md/);
 });
 
+test('a task that is interrupted during execution wraps up graciously', async (t) => {
+  const wrapUpController = new AbortController();
+  setTimeout(() => wrapUpController.abort('interrupt'), 300);
+  const { root, result, printed } = await run(
+    t,
+    { task: 'task: hang, never done', report: false },
+    undefined,
+    { wrapUpSignal: wrapUpController.signal }
+  );
+  assert.equal(result.status, 'unmet');
+  assert.equal(result.rounds, 1);
+  assert.equal(result.wrapUp.reason, 'interrupt');
+  assert.match(result.message, /^Interrupted; wrapped up: more to do/);
+  assert.match(printed, /wrapping up: interrupted/);
+  const entries = await transcript(root, result.sessionKey);
+  assert.equal(entries.find((entry) => entry.kind === 'turn_end').stopReason, 'cancelled');
+  const prompts = entries.filter((entry) => entry.kind === 'prompt').map((entry) => entry.prompt[0].text);
+  assert.match(prompts[1], /^This run was interrupted\./);
+  assert.match(prompts[1], /README\.md/);
+});
+
+test('a task that receives a wrap-up file trigger wraps up graciously', async (t) => {
+  const context = await setup(t, { task: 'task: hang, never done', report: false });
+  const attemptDir = join(context.taskDirectory, 'attempts', '1');
+  setTimeout(async () => {
+    await writeFile(join(attemptDir, 'wrap-up'), 'interrupt\n');
+  }, 300);
+  const { root, result, printed } = await attempt(context);
+  assert.equal(result.status, 'unmet');
+  assert.equal(result.rounds, 1);
+  assert.equal(result.wrapUp.reason, 'interrupt');
+  assert.match(result.message, /^Interrupted; wrapped up: more to do/);
+  assert.match(printed, /wrapping up: interrupted/);
+  const prompts = (await transcript(root, result.sessionKey))
+    .filter((entry) => entry.kind === 'prompt')
+    .map((entry) => entry.prompt[0].text);
+  assert.match(prompts[1], /^This run was interrupted\./);
+});
+
+test('cancelling with a cancel file trigger during wrap up ends the task as cancelled', async (t) => {
+  const context = await setup(t, { task: 'task: hang, never done', report: false });
+  const attemptDir = join(context.taskDirectory, 'attempts', '1');
+  setTimeout(async () => {
+    await writeFile(join(attemptDir, 'wrap-up'), 'interrupt\n');
+    setTimeout(async () => {
+      await writeFile(join(attemptDir, 'cancel'), 'cancel\n');
+    }, 100);
+  }, 300);
+  const { result } = await attempt(context);
+  assert.equal(result.status, 'cancelled');
+});
+
 test('a missing report keeps the task going', async (t) => {
   const { result } = await run(t, { task: 'task: but write no report file' });
   assert.equal(result.status, 'unmet');

@@ -76,8 +76,28 @@ if (process.env.CODEFLOWER_TASK_ATTEMPT_FILE) {
     throw new Error('CODEFLOWER_TASK_ATTEMPT_FILE and CODEFLOWER_INITIAL_PROMPT_FILE cannot be used together');
   }
   const aborting = new AbortController();
-  process.once('SIGINT', () => aborting.abort());
-  process.once('SIGTERM', () => aborting.abort());
+  const wrapUpController = new AbortController();
+  let wrappingUp = false;
+  let lastCancelPress = 0;
+
+  process.on('SIGTERM', () => aborting.abort());
+  process.on('SIGINT', () => {
+    if (!wrappingUp) {
+      wrappingUp = true;
+      wrapUpController.abort('interrupt');
+      process.stderr.write('\nInterrupt received; wrapping up... (press Ctrl+C twice to cancel immediately)\n');
+      return;
+    }
+    const now = Date.now();
+    if (lastCancelPress && now - lastCancelPress <= 3000) {
+      process.stderr.write('Cancelling...\n');
+      aborting.abort();
+    } else {
+      lastCancelPress = now;
+      process.stderr.write('Press Ctrl+C again within 3s to cancel wrap-up\n');
+    }
+  });
+
   const result = await runTask({
     agentName,
     agent: agents[agentName],
@@ -91,6 +111,10 @@ if (process.env.CODEFLOWER_TASK_ATTEMPT_FILE) {
       wrapUp: await readFile(`${TEMPLATES}/task/wrap-up.md`, 'utf8')
     },
     signal: aborting.signal,
+    wrapUpSignal: wrapUpController.signal,
+    onWrapUp: () => {
+      wrappingUp = true;
+    },
     interactive: process.env.CODEFLOWER_TASK_INTERACTIVE === '1',
     ptyHelper: ['/opt/conda/bin/python3', '/opt/codeflower/bin/codeflower-pty'],
     input: process.stdin,

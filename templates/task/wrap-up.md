@@ -1,4 +1,4 @@
-{{#time}}This run's time is almost up.{{/time}}{{#rounds}}This run is out of rounds.{{/rounds}} Do not start new work: leave the
+{{#time}}This run's time is almost up.{{/time}}{{#rounds}}This run is out of rounds.{{/rounds}}{{#interrupt}}This run was interrupted.{{/interrupt}} Do not start new work: leave the
 analysis as it stands and write up what there is, within a few minutes.
 {{#report}}
 
