@@ -1,13 +1,17 @@
 // Files the agent shows the user (`codeflower-show`) and the client reads to
 // display them: figures, reports and tables from the workspace or the inputs.
 import { createServer } from 'node:net';
-import { readdir, readFile, realpath, stat, unlink } from 'node:fs/promises';
-import { extname, isAbsolute, join, relative, resolve } from 'node:path';
+import { randomBytes } from 'node:crypto';
+import { readdir, readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { InvalidRequest } from './agents.js';
 
 export const MAX_FILE_BYTES = 10 * 1024 * 1024;
 const MAX_SHOW_REQUEST = 64 * 1024;
 const MAX_LIST_ENTRIES = 500;
+const MAX_COMMENTS_BYTES = 2 * 1024 * 1024;
+const COMMENT_SAVE_ATTEMPTS = 3;
+const COMMENTS_SLOT = /(<script type="application\/json" id="cf-comments">)[\s\S]*?(<\/script>)/;
 
 const MIME_TYPES = {
   '.png': 'image/png',
@@ -98,6 +102,77 @@ export async function readClientFile(path, options) {
     throw new InvalidRequest(`${path} is too large to show (${Math.round(file.size / 1024 / 1024)} MB)`);
   }
   return { ...file, data: (await readFile(file.path)).toString('base64') };
+}
+
+async function writeAtomic(path, text) {
+  const temporary = join(dirname(path), `.${basename(path)}.${randomBytes(6).toString('hex')}.tmp`);
+  try {
+    await writeFile(temporary, text, { mode: 0o644 });
+    await rename(temporary, path);
+  } catch (error) {
+    await unlink(temporary).catch(() => {});
+    throw error;
+  }
+}
+
+export async function writeCommentsSlot(path, slot, initialStat, initialHtml, fileOps = {}) {
+  const statFile = fileOps.stat ?? stat;
+  const readFileAt = fileOps.readFile ?? readFile;
+  const writeFileAtomically = fileOps.writeAtomic ?? writeAtomic;
+  let read = initialStat;
+  let html = initialHtml;
+  for (let attempt = 0; attempt < COMMENT_SAVE_ATTEMPTS; attempt++) {
+    if (!COMMENTS_SLOT.test(html)) throw new InvalidRequest('This page does not take comments (made before storyteller 0.2?)');
+    const updated = html.replace(COMMENTS_SLOT, (_, open, close) => open + slot + close);
+    const now = await statFile(path);
+    if (now.mtimeMs === read.mtimeMs && now.size === read.size) {
+      await writeFileAtomically(path, updated);
+      return;
+    }
+    if (attempt + 1 < COMMENT_SAVE_ATTEMPTS) {
+      read = now;
+      html = await readFileAt(path, 'utf8');
+    }
+  }
+  throw new InvalidRequest('The report kept changing while comments were saved; try again');
+}
+
+/**
+ * Saves the comments the user left on a storyteller report in VS Code (an array
+ * as JSON): into the report's store, `<name>.report/comments.json`, when it has
+ * one, and into the page's comment slot, so the file the user shares has them
+ * too. Only HTML reports in the workspace, and only those two files.
+ */
+export async function saveReportComments(path, json, options) {
+  if (!options.workspace) throw new InvalidRequest('There is no workspace to save comments in');
+  if (typeof json !== 'string' || Buffer.byteLength(json) > MAX_COMMENTS_BYTES) {
+    throw new InvalidRequest('Comments must be JSON text of at most 2 MB');
+  }
+  let comments;
+  try {
+    comments = JSON.parse(json);
+  } catch {
+    throw new InvalidRequest('Comments must be JSON');
+  }
+  if (!Array.isArray(comments)) throw new InvalidRequest('Comments must be a list');
+  const workspace = await realpath(options.workspace);
+  const file = await resolveFile(path, options);
+  if (!inside(file.path, workspace) || file.mimeType !== 'text/html') {
+    throw new InvalidRequest('Comments can only be saved on HTML reports in the workspace');
+  }
+  // In a script element: no "<" can end it early.
+  const slot = JSON.stringify(comments).replace(/</g, '\\u003c');
+  const store = await realpath(file.path.replace(/\.html?$/i, '.report')).catch(() => null);
+  const stored = store && inside(store, workspace) && (await stat(join(store, 'report.json')).catch(() => null))?.isFile();
+  // Checked before anything is written: a page without the slot does not take comments.
+  const read = await stat(file.path);
+  const html = await readFile(file.path, 'utf8');
+  if (!COMMENTS_SLOT.test(html)) throw new InvalidRequest('This page does not take comments (made before storyteller 0.2?)');
+  if (stored) await writeAtomic(join(store, 'comments.json'), `${JSON.stringify(comments, null, 1)}\n`);
+  // A script may have rebuilt the page since it was read (with the comments from the store):
+  // then put them into that version instead.
+  await writeCommentsSlot(file.path, slot, read, html);
+  return { path: file.path, stored: !!stored };
 }
 
 /**

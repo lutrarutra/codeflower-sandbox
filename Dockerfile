@@ -54,6 +54,8 @@ COPY entrypoint.sh /opt/codeflower/entrypoint.sh
 COPY bin /opt/codeflower/bin
 COPY templates /opt/codeflower/templates
 COPY skills /opt/codeflower/skills
+# Reports dsh's token counts to the bridge (agents.js adds it with --patch).
+COPY dsh-plugins/usage /opt/codeflower/dsh-usage
 
 # Bind targets must exist in the image on Apptainer installs without underlay.
 # The user's folders are mounted one level below /data/{input,output,code,skills},

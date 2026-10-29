@@ -1,13 +1,15 @@
 import { createServer } from 'node:http';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
-import { mkdir, rename, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { spawn } from 'node:child_process';
+import { createInterface } from 'node:readline';
 import { WebSocket, WebSocketServer } from 'ws';
 import { createActivity } from './activity.js';
 import { CREDENTIAL_VARIABLES, InvalidRequest } from './agents.js';
-import { listDirectory, readClientFile, resolveFile, startShowServer } from './files.js';
+import { readCodexLimits } from './codex-limits.js';
+import { listDirectory, readClientFile, resolveFile, saveReportComments, startShowServer } from './files.js';
 import {
   LeaseError,
   createSessionStore,
@@ -15,8 +17,10 @@ import {
   listSessions,
   readTranscript,
   renameSession,
-  sessionKey
+  sessionKey,
+  writeJsonAtomically
 } from './sessions.js';
+import { createUsage, dshTokens } from './usage.js';
 
 const CONNECTION_PATH = '/acp';
 const STATUS_PATH = '/status';
@@ -31,6 +35,11 @@ const MAX_TERMINAL_INPUT = 64 * 1024;
 const MAX_SHELL_COMMAND = 16 * 1024;
 const MAX_SHELL_RECORD = 64 * 1024;
 const SHELL_TIMEOUT_MS = 15 * 60 * 1000;
+// Usage notifications to the window, at most this often.
+const USAGE_NOTIFY_MS = 1000;
+// How often a separate app-server may read Codex's rate limits.
+const LIMITS_INTERVAL_MS = 60_000;
+const SESSION_STARTS = ['session/new', 'session/resume', 'session/load'];
 
 /** The line users paste into VS Code; the token travels in it like Jupyter's. */
 export function connectionUrl(host, port, token) {
@@ -105,13 +114,14 @@ export function agentEnvironment(environment, harnessEnvironment = {}) {
   delete result.CODEFLOWER_HOST_IMAGE;
   delete result.CODEFLOWER_ENGINE;
   delete result.CODEFLOWER_MOUNTS;
+  delete result.CODEFLOWER_TASK_FILE;
   for (const name of CREDENTIAL_VARIABLES) {
     delete result[name];
   }
   return { ...result, ...harnessEnvironment };
 }
 
-function endChild(child) {
+export function endChild(child) {
   if (child.exitCode !== null || child.signalCode !== null) {
     return;
   }
@@ -138,7 +148,7 @@ function endChild(child) {
 // Records the ACP traffic of one connection into the project's session store
 // and enforces session leases. All store operations run in one queue so the
 // transcript keeps protocol order.
-function createRecorder(store, log) {
+export function createRecorder(store, log) {
   const clientRequests = new Map();
   const permissionRequests = new Map();
   const questionRequests = new Map();
@@ -220,7 +230,8 @@ function createRecorder(store, log) {
       }
     },
 
-    fromAgent(message) {
+    // `turn`: what a finished prompt added to the session's usage.
+    fromAgent(message, turn) {
       if (message.method === undefined && message.id !== undefined) {
         const request = clientRequests.get(requestKey(message.id));
         clientRequests.delete(requestKey(message.id));
@@ -240,7 +251,8 @@ function createRecorder(store, log) {
           run(() =>
             store.record(sessionId, {
               kind: 'turn_end',
-              stopReason: message.result?.stopReason ?? null
+              stopReason: message.result?.stopReason ?? null,
+              ...turn
             })
           );
         }
@@ -396,8 +408,73 @@ export async function startBridge(options) {
     };
   }
 
+  // ---- usage: token counts, cost, and the login's quota ----
+
+  // The quota outlives the worker in the project, so the next worker of the
+  // same login shows it before its first turn.
+  const usageFile = privateDirectory ? join(privateDirectory, 'usage', `${agentName}.json`) : undefined;
+  let savedUsage;
+  try {
+    if (usageFile) savedUsage = JSON.parse(await readFile(usageFile, 'utf8'));
+  } catch {}
+  let usageTimer;
+  let saveTimer;
+  let saving = Promise.resolve();
+  const saveUsage = () => {
+    if (!usageFile) return saving;
+    saving = saving
+      .then(() => writeJsonAtomically(usageFile, usage.saved()))
+      .catch((error) => log(`Could not save the usage: ${error.message}`));
+    return saving;
+  };
+  const usage = createUsage({
+    costEstimate: agent.costEstimate === true,
+    saved: savedUsage,
+    onChange() {
+      usageTimer ??= setTimeout(() => {
+        usageTimer = undefined;
+        sendToClient({ jsonrpc: '2.0', method: '_codeflower/usage', params: usageSnapshot() });
+      }, USAGE_NOTIFY_MS);
+    },
+    onAccountChange() {
+      saveTimer ??= setTimeout(() => {
+        saveTimer = undefined;
+        void saveUsage();
+      }, USAGE_NOTIFY_MS);
+    }
+  });
+  void agent.authKind?.().then((kind) => usage.guessAuth(kind), () => {});
+
+  const usageSnapshot = () => usage.snapshot((sessionId) => sessionKey(agentName, sessionId));
+
+  // Codex's limits, from a separate app-server: after turns, at most once a
+  // minute, with the last turn's read made when the minute is over.
+  let limitsReading;
+  let limitsReadAt = 0;
+  let limitsTimer;
+  const refreshLimits = () => {
+    if (!agent.limitsCommand || usage.authKind === 'api_key' || limitsReading || closing) return;
+    const wait = limitsReadAt + LIMITS_INTERVAL_MS - Date.now();
+    if (wait > 0) {
+      limitsTimer ??= setTimeout(() => {
+        limitsTimer = undefined;
+        refreshLimits();
+      }, wait);
+      return;
+    }
+    limitsReadAt = Date.now();
+    limitsReading = readCodexLimits(agent.limitsCommand(), agentEnvironment(environment, agent.env))
+      .then((response) => usage.codexRateLimits(response))
+      .catch((error) => log(`Could not read Codex's rate limits: ${error.message}`))
+      .finally(() => {
+        limitsReading = undefined;
+      });
+  };
+
   async function statusSnapshot() {
     const snapshot = activitySnapshot();
+    // The worker's account and totals; per chat only in the window.
+    const { sessions: _, ...account } = usageSnapshot();
     const titles = new Map();
     if (snapshot.chats.length && sessionsDirectory) {
       await recorder?.flush();
@@ -410,7 +487,8 @@ export async function startBridge(options) {
       running: Boolean(agentHost),
       working: snapshot.working,
       waiting: snapshot.waiting,
-      chats: snapshot.chats.map((chat) => ({ ...chat, title: titles.get(chat.key) ?? 'Untitled session' }))
+      chats: snapshot.chats.map((chat) => ({ ...chat, title: titles.get(chat.key) ?? 'Untitled session' })),
+      usage: account
     };
   }
 
@@ -477,9 +555,11 @@ export async function startBridge(options) {
 
   const startAgent = async () => {
     const command = await agent.command();
+    // dsh's usage plugin reports token counts on a pipe of their own.
+    const usageFd = agent.usageFd;
     const child = spawn(command[0], command.slice(1), {
-      env: agentEnvironment(environment, agent.env),
-      stdio: ['pipe', 'pipe', 'inherit']
+      env: agentEnvironment(environment, { ...agent.env, ...(usageFd ? { CODEFLOWER_USAGE_FD: String(usageFd) } : {}) }),
+      stdio: usageFd ? ['pipe', 'pipe', 'inherit', ...Array(usageFd - 3).fill('ignore'), 'pipe'] : ['pipe', 'pipe', 'inherit']
     });
     const started = {
       child,
@@ -525,6 +605,24 @@ export async function startBridge(options) {
         fromAgent(started, frame, message);
       }
     });
+    if (usageFd) {
+      child.stdio[usageFd].on('error', () => {});
+      createInterface({ input: child.stdio[usageFd] }).on('line', (line) => {
+        let report;
+        try {
+          report = JSON.parse(line);
+        } catch {
+          return;
+        }
+        if (typeof report?.sessionId !== 'string') return;
+        // A subagent's calls count for the chat that started it.
+        const owner =
+          !started.sessions.has(report.sessionId) && typeof report.parentSessionId === 'string'
+            ? report.parentSessionId
+            : report.sessionId;
+        usage.reported(owner, dshTokens(report.usage));
+      });
+    }
     child.once('error', (error) => {
       log(`Could not start ${agentName}: ${error.message}`);
       if (client?.agent === started) client.close(1011, 'Could not start agent');
@@ -648,6 +746,10 @@ export async function startBridge(options) {
       case 'session/resume':
       case 'session/load':
         rememberSession(host, sessionId, result);
+        // The session's totals start from those its transcript recorded.
+        void (recorder?.isOpen(sessionId) ?? Promise.resolve()).then(() =>
+          usage.opened(sessionId, store?.storedUsage(sessionId))
+        );
         if (request.client === client) void attachSession(host, request.client, request.id, sessionId, result);
         return true;
       case 'session/set_config_option':
@@ -673,7 +775,8 @@ export async function startBridge(options) {
         return;
       }
       host.requests.delete(requestKey(message.id));
-      recorder?.fromAgent(message);
+      const turn = request.method === 'session/prompt' ? endTurn(request, message) : undefined;
+      recorder?.fromAgent(message, turn);
       // Attaches answer once the recorder caught up.
       if (settleRequest(host, request, message)) return;
       if (request.client === client) client.send({ ...message, id: request.id });
@@ -686,6 +789,7 @@ export async function startBridge(options) {
       const update = message.params?.update;
       trackSettings(host, sessionId, update);
       if (update?.sessionUpdate === 'tool_call') activity.toolCall(sessionId, update);
+      if (update?.sessionUpdate === 'usage_update' && sessionId !== undefined) usage.update(sessionId, update);
       if (sessionId !== undefined && client?.sessions.has(sessionId)) client.sendFrame(frame);
       return;
     }
@@ -715,7 +819,37 @@ export async function startBridge(options) {
       return;
     }
 
+    // The login behind the agent (Claude Code, Codex).
+    if (message.method === '_auth/status_update') usage.auth(message.params?.authStatus);
+    // Claude Code's rate limit events, which the bridge asked for (sessionMeta).
+    if (message.method === '_claude/sdkMessage' && message.params?.message?.type === 'rate_limit_event') {
+      usage.claudeRateLimit(message.params.message.rate_limit_info);
+      return;
+    }
     client?.sendFrame(frame);
+  };
+
+  // A prompt's answer: what the turn added to the session's usage, which a
+  // prompt result without counts (dsh) gets from the bridge.
+  const endTurn = (request, message) => {
+    const sessionId = request.params?.sessionId;
+    if (message.error || typeof sessionId !== 'string' || !protocolObject(message.result)) return undefined;
+    const turn = usage.turnEnded(sessionId, message.result);
+    if (turn?.usage && !protocolObject(message.result.usage)) message.result.usage = turn.usage;
+    refreshLimits();
+    return turn;
+  };
+
+  // What the bridge asks of every session the agent starts, e.g. Claude Code's
+  // rate limit events, next to what the window asked.
+  const withSessionMeta = (message) => {
+    if (!agent.sessionMeta || !SESSION_STARTS.includes(message.method) || !protocolObject(message.params)) return message;
+    const meta = protocolObject(message.params._meta) ? message.params._meta : {};
+    const merged = { ...meta };
+    for (const [name, value] of Object.entries(agent.sessionMeta)) {
+      merged[name] = { ...(protocolObject(meta[name]) ? meta[name] : {}), ...value };
+    }
+    return { ...message, params: { ...message.params, _meta: merged } };
   };
 
   // ---- windows ----
@@ -835,7 +969,7 @@ export async function startBridge(options) {
       }
       host.requests.set(key, request);
       if (message.method === 'session/prompt' && typeof sessionId === 'string') activity.turnStarted(key, sessionId);
-      writeToAgent(host, { ...message, id: bridgeId }, webSocket);
+      writeToAgent(host, { ...withSessionMeta(message), id: bridgeId }, webSocket);
     };
 
     // ---- sign-in terminals ----
@@ -984,6 +1118,11 @@ export async function startBridge(options) {
           case '_codeflower/activity':
             respond(activitySnapshot());
             break;
+          case '_codeflower/usage':
+            respond(usageSnapshot());
+            // Codex's limits, if the last read is old; the notification brings them.
+            refreshLimits();
+            break;
           case '_codeflower/sessions/list': {
             const sessions = sessionsDirectory ? await listSessions(sessionsDirectory) : [];
             respond({ sessions: sessions.filter((session) => session.harness === agentName) });
@@ -1011,6 +1150,7 @@ export async function startBridge(options) {
               if (activity.busy(loaded)) throw new InvalidRequest('The chat is still working; stop it first');
               host.sessions.delete(loaded);
               client?.sessions.delete(loaded);
+              usage.forget(loaded);
               await recorder?.close(loaded);
             }
             await deleteSession(directory, key);
@@ -1068,6 +1208,9 @@ export async function startBridge(options) {
             break;
           case '_codeflower/files/list':
             respond(await listDirectory(params.path, fileOptions));
+            break;
+          case '_codeflower/reports/comments':
+            respond(await saveReportComments(params.path, params.comments, fileOptions));
             break;
           case '_codeflower/credentials/set':
             if (!agent.setCredentials) {
@@ -1228,6 +1371,13 @@ export async function startBridge(options) {
       if (closing) return;
       closing = true;
       clearInterval(pings);
+      clearTimeout(usageTimer);
+      clearTimeout(limitsTimer);
+      if (saveTimer) {
+        clearTimeout(saveTimer);
+        await saveUsage();
+      }
+      await limitsReading;
       client?.close(1001, 'Server shutting down');
       for (const shell of shells.values()) shell.stop();
       const host = agentHost ?? (await agentStarting?.catch(() => undefined));

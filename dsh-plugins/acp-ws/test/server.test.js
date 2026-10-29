@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import WebSocket from 'ws';
 import { createAgents } from '../src/agents.js';
+import { writeCommentsSlot } from '../src/files.js';
 import { startBridge } from '../src/server.js';
 import { sessionKey } from '../src/sessions.js';
 
@@ -407,6 +408,69 @@ test('shows the files the agent asks for and lets the client read them', async (
   await closeSocket(socket);
 });
 
+test("saves the user's comments on a report into its store and its page, and nowhere else", async (t) => {
+  const workspaceDirectory = await mkdtemp(join(tmpdir(), 'codeflower-workspace-'));
+  t.after(() => rm(workspaceDirectory, { recursive: true, force: true }));
+  const { bridge, sessionsDirectory } = await startTestBridge(t, { workspace: workspaceDirectory });
+  const reports = join(workspaceDirectory, 'reports');
+  await mkdir(join(reports, 'pbmc.report'), { recursive: true });
+  await writeFile(join(reports, 'pbmc.report', 'report.json'), '{}');
+  const page = (slot) => `<html><body><p>6,000 cells</p><script type="application/json" id="cf-comments">${slot}</script></body></html>`;
+  await writeFile(join(reports, 'pbmc.html'), page('[]'));
+  await writeFile(join(reports, 'loose.html'), page('[]'));
+  await writeFile(join(reports, 'other.html'), '<html><body>no slot</body></html>');
+
+  const socket = await openSocket(bridge.address);
+  await initialize(socket);
+  const save = (path, comments) => call(socket, '_codeflower/reports/comments', { path, comments });
+  const comments = JSON.stringify([{ id: 'c-1', kind: 'request', body: 'Say </script> kept', anchor: { exact: '6,000 cells' } }]);
+
+  assert.equal((await save(join(reports, 'pbmc.html'), comments)).result.stored, true);
+  assert.equal(JSON.parse(await readFile(join(reports, 'pbmc.report', 'comments.json'), 'utf8'))[0].body, 'Say </script> kept');
+  assert.equal(
+    await readFile(join(reports, 'pbmc.html'), 'utf8'),
+    page('[{"id":"c-1","kind":"request","body":"Say \\u003c/script> kept","anchor":{"exact":"6,000 cells"}}]')
+  );
+  // A page without a store keeps them in the page only.
+  assert.equal((await save(join(reports, 'loose.html'), '[]')).result.stored, false);
+
+  assert.match((await save(join(reports, 'other.html'), '[]')).error.message, /does not take comments/);
+  assert.match((await save(join(reports, 'pbmc.report', 'report.json'), '[]')).error.message, /only be saved on HTML reports/);
+  assert.match((await save(join(reports, 'pbmc.html'), '{"not": "a list"}')).error.message, /must be a list/);
+  await mkdir(sessionsDirectory, { recursive: true });
+  await writeFile(join(sessionsDirectory, 'page.html'), page('[]'));
+  assert.match((await save(join(sessionsDirectory, 'page.html'), '[]')).error.message, /cannot be shown|in the workspace/);
+  await closeSocket(socket);
+});
+
+test('does not report success when the report changes during every comment save attempt', async () => {
+  const html = '<html><script type="application/json" id="cf-comments">[]</script></html>';
+  let version = 0;
+  let reads = 0;
+  let writes = 0;
+  await assert.rejects(
+    writeCommentsSlot(
+      '/report.html',
+      '[]',
+      { mtimeMs: 0, size: html.length },
+      html,
+      {
+        stat: async () => ({ mtimeMs: ++version, size: html.length }),
+        readFile: async () => {
+          reads++;
+          return html;
+        },
+        writeAtomic: async () => {
+          writes++;
+        }
+      }
+    ),
+    /report kept changing while comments were saved/
+  );
+  assert.equal(reads, 2);
+  assert.equal(writes, 0);
+});
+
 async function status(address, headers = { authorization: `Bearer ${token}` }) {
   const response = await fetch(`http://127.0.0.1:${address.port}/status`, { headers });
   return { code: response.status, body: response.ok ? await response.json() : undefined };
@@ -430,7 +494,8 @@ test('keeps the agent and its chats working while no window is connected', async
   assert.match((await call(first, '_codeflower/sessions/delete', { key: sessionKey('claude', sessionId) })).error.message, /still working/);
   await closeSocket(first);
 
-  assert.deepEqual((await status(bridge.address)).body, {
+  const { usage: _, ...unattended } = (await status(bridge.address)).body;
+  assert.deepEqual(unattended, {
     agent: 'claude',
     agentLabel: 'Claude Code',
     connected: false,
@@ -516,5 +581,92 @@ test('reports its activity only to holders of the token', async (t) => {
   assert.equal((await status(bridge.address, { authorization: `Bearer ${'x'.repeat(43)}` })).code, 401);
   assert.equal((await fetch(`http://127.0.0.1:${bridge.address.port}/other`)).status, 404);
   const { body } = await status(bridge.address);
-  assert.deepEqual(body, { agent: 'claude', agentLabel: 'Claude Code', connected: false, running: false, working: 0, waiting: 0, chats: [] });
+  const { usage, ...activity } = body;
+  assert.deepEqual(activity, { agent: 'claude', agentLabel: 'Claude Code', connected: false, running: false, working: 0, waiting: 0, chats: [] });
+  // Numbers only: the account and the worker's totals, never a chat's.
+  assert.deepEqual(Object.keys(usage).sort(), ['auth', 'costEstimate', 'limits', 'limitsUpdatedAt', 'totals']);
+});
+
+test('tracks token counts, cost, and quota, and records them with the session', async (t) => {
+  const { bridge, directory } = await startTestBridge(t);
+  const socket = await openSocket(bridge.address);
+  await initialize(socket);
+  const sessionId = (await call(socket, 'session/new', { cwd: '/workspace', mcpServers: [], _meta: { mine: true } })).result.sessionId;
+  const key = sessionKey('claude', sessionId);
+
+  // The bridge asks Claude Code for its rate limit events, next to the window's own _meta.
+  const metaReply = call(socket, 'session/prompt', { sessionId, prompt: [{ type: 'text', text: 'what meta' }] });
+  const meta = JSON.parse(text(await receive(socket, (message) => message.method === 'session/update')));
+  assert.deepEqual(meta, { mine: true, claudeCode: { emitRawSDKMessages: [{ type: 'rate_limit_event' }] } });
+  await metaReply;
+
+  const answer = (await call(socket, 'session/prompt', { sessionId, prompt: [{ type: 'text', text: 'use tokens' }] })).result;
+  assert.equal(answer.usage.totalTokens, 170);
+  const notified = await receive(socket, (message) => message.method === '_codeflower/usage');
+  assert.equal(notified.params.sessions.find((session) => session.key === key)?.tokens.totalTokens, 170);
+
+  const usage = (await call(socket, '_codeflower/usage')).result;
+  assert.deepEqual(usage.auth, { kind: 'subscription', plan: 'max', label: 'Claude Max' });
+  assert.equal(usage.costEstimate, true);
+  assert.deepEqual(
+    usage.limits.map((limit) => [limit.id, Math.round(limit.usedPercent), limit.status]),
+    [['five_hour', 25, 'allowed'], ['seven_day', 80, 'allowed_warning']]
+  );
+  assert.deepEqual(usage.sessions, [
+    {
+      key,
+      tokens: { inputTokens: 100, outputTokens: 20, cachedReadTokens: 50, cachedWriteTokens: 0, thoughtTokens: 0, totalTokens: 170 },
+      cost: { amount: 0.25, currency: 'USD' },
+      context: { used: 1000, size: 200000 }
+    }
+  ]);
+  assert.equal(usage.totals.tokens.outputTokens, 20);
+  // The raw SDK messages were for the bridge.
+  assert.equal(inboxes.get(socket).messages.some((message) => message.method === '_claude/sdkMessage'), false);
+
+  // The transcript and the session list keep the counts, for later workers.
+  await waitFor(async () =>
+    (await call(socket, '_codeflower/sessions/transcript', { key })).result.entries.some((entry) => entry.usage)
+  );
+  const turnEnd = (await call(socket, '_codeflower/sessions/transcript', { key })).result.entries.find((entry) => entry.usage);
+  assert.deepEqual(turnEnd.cost, { amount: 0.25, currency: 'USD' });
+  const listed = (await call(socket, '_codeflower/sessions/list')).result.sessions.find((session) => session.key === key);
+  assert.equal(listed.usage.tokens.totalTokens, 170);
+  assert.deepEqual(listed.usage.cost, { amount: 0.25, currency: 'USD' });
+
+  // The quota outlives the worker in the project.
+  await waitFor(async () => {
+    try {
+      return JSON.parse(await readFile(join(directory, 'usage', 'claude.json'), 'utf8')).limits.length === 2;
+    } catch {
+      return false;
+    }
+  });
+  const { body } = await status(bridge.address);
+  assert.equal(body.usage.auth.kind, 'subscription');
+  assert.equal(body.usage.limits.length, 2);
+  assert.equal(body.usage.sessions, undefined);
+  await closeSocket(socket);
+});
+
+test("gives dsh's turns the token counts its usage plugin reports", async (t) => {
+  const { bridge } = await startTestBridge(t, { agentName: 'dsh' });
+  const socket = await openSocket(bridge.address);
+  await initialize(socket);
+  const sessionId = (await call(socket, 'session/new', { cwd: '/workspace', mcpServers: [] })).result.sessionId;
+  const answer = (await call(socket, 'session/prompt', { sessionId, prompt: [{ type: 'text', text: 'use tokens' }] })).result;
+  // Its own call and its subagent's.
+  assert.deepEqual(answer.usage, {
+    inputTokens: 11,
+    outputTokens: 6,
+    cachedReadTokens: 2,
+    cachedWriteTokens: 0,
+    thoughtTokens: 0,
+    totalTokens: 19
+  });
+  const usage = (await call(socket, '_codeflower/usage')).result;
+  assert.deepEqual(usage.auth, { kind: 'api_key' });
+  assert.equal(usage.costEstimate, false);
+  assert.equal(usage.totals.tokens.totalTokens, 19);
+  await closeSocket(socket);
 });

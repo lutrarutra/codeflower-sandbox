@@ -1,0 +1,7 @@
+{
+  "name": "@codeflower/dsh-usage",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "license": "MIT"
+}

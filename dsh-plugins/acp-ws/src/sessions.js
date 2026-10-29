@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { appendFile, mkdir, readdir, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
+import { addCost, addTokens } from './usage.js';
 
 // Session directories live in the project state, so the VS Code extension can
 // list, rename, and delete them without a running worker. Each file has one
@@ -25,7 +26,7 @@ export function sessionKey(harness, nativeSessionId) {
   return `${harness}-${suffix}`;
 }
 
-async function writeJsonAtomically(file, value) {
+export async function writeJsonAtomically(file, value) {
   await mkdir(dirname(file), { recursive: true, mode: 0o700 });
   const temporary = join(dirname(file), `.${basename(file)}.${process.pid}.${randomUUID()}.tmp`);
   try {
@@ -160,6 +161,8 @@ export function createSessionStore({
         nativeSessionId,
         paths: sessionPaths,
         meta,
+        // The totals of earlier turns, which the worker's usage starts from.
+        storedUsage: meta.usage ? structuredClone(meta.usage) : undefined,
         // Entries recorded so far, counted when recorded, not when written.
         count: recorded.split('\n').filter((line) => line.trim()).length,
         queue: Promise.resolve()
@@ -197,10 +200,19 @@ export function createSessionStore({
           if (title) {
             state.meta.autoTitle = title;
           }
+          if (entry.kind === 'turn_end' && (entry.usage || entry.cost)) {
+            const cost = addCost(state.meta.usage?.cost, entry.cost);
+            state.meta.usage = { tokens: addTokens(state.meta.usage?.tokens, entry.usage), ...(cost ? { cost } : {}) };
+          }
           state.meta.updatedAt = timestamp;
           await writeJsonAtomically(state.paths.meta, state.meta);
         }
       });
+    },
+
+    /** The token counts and cost of the session's turns before it was opened here. */
+    storedUsage(nativeSessionId) {
+      return open.get(nativeSessionId)?.storedUsage;
     },
 
     /** How many entries the session's transcript has, including those still being written. */
@@ -269,6 +281,7 @@ export async function listSessions(directory, now = Date.now()) {
       title: (typeof title?.title === 'string' && title.title) || meta.autoTitle || 'Untitled session',
       createdAt: meta.createdAt ?? '',
       updatedAt: meta.updatedAt ?? meta.createdAt ?? '',
+      usage: meta.usage ?? null,
       ...(leaseIsFresh(lease, now) ? { openOn: lease.instanceId } : {})
     });
   }

@@ -1,8 +1,12 @@
+import { readFile } from 'node:fs/promises';
 import { AGENT_NAMES, createAgents } from './agents.js';
 import { startEgressForwarder } from './egress.js';
 import { connectionUrl, startBridge } from './server.js';
+import { EXIT_CODES, runTask } from './task.js';
 
 const RUNTIME_MODULES = '/opt/codeflower/runtime/node_modules';
+const TASK_TEMPLATE = '/opt/codeflower/templates/TASK.md';
+const DSH_USAGE_PATCH = '/opt/codeflower/dsh-usage/cordis.patch.yml';
 
 function requiredEnvironment(name) {
   const value = process.env[name];
@@ -20,7 +24,9 @@ const agents = createAgents({
   nodePath: process.execPath,
   dshBin: `${RUNTIME_MODULES}/@deepseek-ai/dsh/lib/bin.js`,
   claudeAcpBin: `${RUNTIME_MODULES}/@agentclientprotocol/claude-agent-acp/dist/index.js`,
-  codexAcpBin: `${RUNTIME_MODULES}/@agentclientprotocol/codex-acp/dist/index.js`
+  codexAcpBin: `${RUNTIME_MODULES}/@agentclientprotocol/codex-acp/dist/index.js`,
+  codexBin: `${RUNTIME_MODULES}/@openai/codex/bin/codex.js`,
+  dshUsagePatch: DSH_USAGE_PATCH
 });
 
 // What the extension shows about this worker.
@@ -48,6 +54,26 @@ const egress = process.env.CODEFLOWER_EGRESS_SOCKET
       process.stderr.write(`The sandbox has no network: ${error.message}\n`);
     })
   : undefined;
+
+// `codeflower task`: the agent works on its task by itself, without VS Code.
+if (process.env.CODEFLOWER_TASK_FILE) {
+  const aborting = new AbortController();
+  process.once('SIGINT', () => aborting.abort());
+  process.once('SIGTERM', () => aborting.abort());
+  const result = await runTask({
+    agentName,
+    agent: agents[agentName],
+    taskFile: process.env.CODEFLOWER_TASK_FILE,
+    sessionsDirectory: requiredEnvironment('CODEFLOWER_SESSIONS_DIR'),
+    instanceId: requiredEnvironment('CODEFLOWER_INSTANCE_ID'),
+    workspace: requiredEnvironment('CODEFLOWER_WORKSPACE'),
+    instructionsTemplate: await readFile(TASK_TEMPLATE, 'utf8'),
+    signal: aborting.signal
+  });
+  egress?.close();
+  if (result.message) process.stderr.write(`${result.message}\n`);
+  process.exit(EXIT_CODES[result.status] ?? 1);
+}
 
 const bridge = await startBridge({
   host: process.env.CODEFLOWER_LISTEN_HOST ?? '0.0.0.0',

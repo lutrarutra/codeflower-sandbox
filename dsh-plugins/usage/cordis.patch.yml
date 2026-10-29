@@ -1,0 +1,5 @@
+# Adds the token count reporter to dsh; the bridge passes this file with --patch.
+
+- insert:
+    - id: codeflower-usage
+      name: /opt/codeflower/dsh-usage/index.js

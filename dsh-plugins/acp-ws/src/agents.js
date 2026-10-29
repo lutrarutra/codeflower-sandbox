@@ -105,7 +105,17 @@ function setEnvLine(text, name, value) {
  * The agents a worker can run. Each knows its command, its extra environment,
  * and whether its project already holds a login or key.
  */
-export function createAgents({ nodePath, dshBin, claudeAcpBin, codexAcpBin, environment = process.env }) {
+export function createAgents({
+  nodePath,
+  dshBin,
+  claudeAcpBin,
+  codexAcpBin,
+  // `codex` itself, for the rate limits its adapter does not pass on.
+  codexBin,
+  // Adds the plugin that reports dsh's token counts to the bridge.
+  dshUsagePatch,
+  environment = process.env
+}) {
   const dshHome = environment.DSH_HOME;
   const claudeHome = environment.CLAUDE_CONFIG_DIR;
   const codexHome = environment.CODEX_HOME;
@@ -118,9 +128,18 @@ export function createAgents({ nodePath, dshBin, claudeAcpBin, codexAcpBin, envi
         if (dshHome && (await exists(join(dshHome, ENDPOINT_PATCH)))) {
           command.push('--patch', join(dshHome, ENDPOINT_PATCH));
         }
+        if (dshUsagePatch && (await exists(dshUsagePatch))) command.push('--patch', dshUsagePatch);
         return command;
       },
       env: {},
+      // Its usage plugin writes token counts to this extra pipe.
+      usageFd: 3,
+      // dsh runs on keys only.
+      async authKind() {
+        return 'api_key';
+      },
+      // dsh's /goal is a command of its own UIs, not of its ACP app.
+      goal: undefined,
       async signedIn() {
         const env = dshHome ? await readText(join(dshHome, '.env')) : '';
         return /^(DEEPSEEK_API_KEY|CODEFLOWER_OPENAI_COMPAT_API_KEY)=./m.test(env);
@@ -153,11 +172,23 @@ export function createAgents({ nodePath, dshBin, claudeAcpBin, codexAcpBin, envi
       // No NO_BROWSER: with it the adapter offers only Claude's full-screen
       // /login instead of the `auth login` commands.
       env: {},
+      // `/goal CONDITION` as a prompt: Claude keeps working until a separate
+      // check finds the condition met.
+      goal: { maxLength: 4000 },
       async signedIn() {
-        if (!claudeHome) return false;
-        if (await exists(join(claudeHome, '.credentials.json'))) return true;
-        return /"primaryApiKey"\s*:\s*"[^"]+"/.test(await readText(join(claudeHome, '.claude.json')));
-      }
+        return Boolean(await this.authKind());
+      },
+      // Until the agent reports its login (`_auth/status_update`).
+      async authKind() {
+        if (!claudeHome) return undefined;
+        if (await exists(join(claudeHome, '.credentials.json'))) return 'subscription';
+        return /"primaryApiKey"\s*:\s*"[^"]+"/.test(await readText(join(claudeHome, '.claude.json'))) ? 'api_key' : undefined;
+      },
+      // Asks for the rate limit events, which the adapter otherwise passes on
+      // only once a turn's first answer has started.
+      sessionMeta: { claudeCode: { emitRawSDKMessages: [{ type: 'rate_limit_event' }] } },
+      // Claude Code's cost is its own estimate at API prices, also for subscriptions.
+      costEstimate: true
     },
     codex: {
       label: 'Codex',
@@ -167,9 +198,25 @@ export function createAgents({ nodePath, dshBin, claudeAcpBin, codexAcpBin, envi
       // Hides the browser-redirect login, which cannot work inside a sandbox;
       // the device-code login works through the client instead.
       env: { NO_BROWSER: '1' },
+      // `/goal OBJECTIVE` as a prompt, Codex's goals feature.
+      goal: { maxLength: 4000 },
       async signedIn() {
         return Boolean(codexHome) && (await exists(join(codexHome, 'auth.json')));
-      }
+      },
+      // Until the agent reports its login (`_auth/status_update`).
+      async authKind() {
+        if (!codexHome) return undefined;
+        let auth;
+        try {
+          auth = JSON.parse(await readText(join(codexHome, 'auth.json')));
+        } catch {
+          return undefined;
+        }
+        if (auth?.auth_mode === 'apikey' || (auth?.OPENAI_API_KEY && !auth?.tokens)) return 'api_key';
+        return auth?.tokens ? 'subscription' : undefined;
+      },
+      // A separate app-server reads the account's rate limits.
+      limitsCommand: codexBin ? () => [nodePath, codexBin, 'app-server'] : undefined
     }
   };
 }
