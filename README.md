@@ -1,0 +1,22 @@
+# code flower sandbox
+
+The isolated runtime image of a code flower worker, with all three agents (Claude Code, Codex,
+and DeepSeek Harness), and the bridge that connects it to VS Code.
+
+- `Dockerfile`, `entrypoint.sh`: the image (`codeflower-sandbox`) and its start script
+- `package.json`: the agent runtimes, pinned exactly
+- `bin/`: `codeflower-show`, `codeflower-pty`, `codeflower-env-export`
+- `templates/`: the agent instructions copied into a new workspace
+- `dsh-plugins/acp-ws/`: the authenticated ACP WebSocket bridge, session recorder, and sign-in relay
+
+```sh
+make sandbox-build          # the image codeflower-sandbox (Docker)
+make sandbox-build-linux    # build/codeflower-sandbox-amd64.tar for an x86_64 cluster (Apptainer)
+make bridge-install bridge-test
+```
+
+The launcher ([codeflower-launcher](https://github.com/lutrarutra/codeflower-launcher)) starts
+the image. The `CODEFLOWER_*` environment and `/opt/codeflower` paths it relies on are described
+in the [architecture document](https://github.com/lutrarutra/codeflower-workspace/blob/main/docs/architecture.md).
+For development, clone [codeflower-workspace](https://github.com/lutrarutra/codeflower-workspace),
+which has this repo as the `sandbox/` submodule.

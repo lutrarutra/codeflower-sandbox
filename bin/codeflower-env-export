@@ -1,0 +1,20 @@
+#!/bin/sh
+# Writes a readable recipe of everything installed in the project
+# environment, so it can be recreated or turned into a new image.
+set -eu
+
+state=/codeflower-state
+venv="${VIRTUAL_ENV:-$state/env/venv}"
+out="$state/env/exports"
+mkdir -p "$out"
+
+uv pip freeze --python "$venv/bin/python" > "$out/venv-requirements.txt"
+
+for prefix in "${CONDA_ENVS_DIRS:-$state/env/conda}"/*/; do
+  if [ -d "$prefix/conda-meta" ]; then
+    conda env export --no-builds -p "$prefix" > "$out/conda-$(basename "$prefix").yml"
+  fi
+done
+
+date -u +%Y-%m-%dT%H:%M:%SZ > "$out/exported-at"
+echo "Environment recipe written to $out"

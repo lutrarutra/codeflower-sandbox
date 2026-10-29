@@ -1,0 +1,14 @@
+{
+  "name": "@codeflower/acp-ws",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test --test-timeout=15000"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
+  }
+}

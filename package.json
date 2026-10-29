@@ -1,0 +1,16 @@
+{
+  "name": "codeflower-sandbox-runtime",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.1.6-alpha.2",
+    "@agentclientprotocol/claude-agent-acp": "0.98.0",
+    "@agentclientprotocol/codex-acp": "2.3.0",
+    "@anthropic-ai/claude-code": "2.1.312",
+    "@openai/codex": "0.164.0"
+  },
+  "overrides": {
+    "@modelcontextprotocol/client": "2.2.0",
+    "fflate": "0.8.3"
+  }
+}

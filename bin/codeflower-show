@@ -1,0 +1,76 @@
+#!/usr/local/bin/node
+// Opens files for the user in VS Code: figures, reports, tables. The bridge
+// relays the request to the connected extension, which shows each file in a
+// tab beside the chat and keeps it up to date when the file changes.
+import { createConnection } from 'node:net';
+
+const usage = `Usage: codeflower-show [--title TEXT] [--message TEXT] FILE...
+
+Opens FILE in a tab in the user's VS Code, next to the chat: images (png, jpg,
+svg, gif, webp), Markdown and HTML reports, CSV/TSV tables, PDF, JSON and text.
+The tab reloads by itself when the file changes, so regenerate a figure under
+the same name to update what the user sees. The user can reply from the tab.
+
+  --title TEXT     tab title (default: the file name)
+  --message TEXT   a short note shown above the file, e.g. what to look at`;
+
+const args = process.argv.slice(2);
+const paths = [];
+let title;
+let message;
+for (let index = 0; index < args.length; index++) {
+  const arg = args[index];
+  if (arg === '-h' || arg === '--help') {
+    console.log(usage);
+    process.exit(0);
+  } else if (arg === '--title' || arg === '--message') {
+    const value = args[++index];
+    if (value === undefined) {
+      console.error(`${arg} needs a value\n\n${usage}`);
+      process.exit(2);
+    }
+    if (arg === '--title') title = value;
+    else message = value;
+  } else if (arg === '--') {
+    paths.push(...args.slice(index + 1));
+    break;
+  } else {
+    paths.push(arg);
+  }
+}
+if (!paths.length) {
+  console.error(usage);
+  process.exit(2);
+}
+
+const socketPath = process.env.CODEFLOWER_SHOW_SOCKET;
+if (!socketPath) {
+  console.error('codeflower-show only works inside a code flower worker.');
+  process.exit(1);
+}
+
+const socket = createConnection(socketPath);
+let reply = '';
+socket.setEncoding('utf8');
+socket.on('connect', () => {
+  socket.write(`${JSON.stringify({ paths, cwd: process.cwd(), title, message })}\n`);
+});
+socket.on('data', (chunk) => (reply += chunk));
+socket.on('error', (error) => {
+  console.error(`Could not reach the code flower worker: ${error.message}`);
+  process.exit(1);
+});
+socket.on('end', () => {
+  let result;
+  try {
+    result = JSON.parse(reply);
+  } catch {
+    console.error('The code flower worker sent no answer.');
+    process.exit(1);
+  }
+  if (result.error) {
+    console.error(result.error);
+    process.exit(1);
+  }
+  for (const path of result.shown) console.log(`Opened ${path} for the user in VS Code.`);
+});
