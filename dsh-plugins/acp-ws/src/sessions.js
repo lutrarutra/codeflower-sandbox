@@ -105,6 +105,13 @@ export function createSessionStore({
       heartbeatAt: now().toISOString()
     });
 
+  const releaseLease = async (state) => {
+    const lease = await readJson(state.paths.lease);
+    if (lease?.instanceId === instanceId) {
+      await unlink(state.paths.lease).catch(() => {});
+    }
+  };
+
   const startHeartbeat = () => {
     if (heartbeat) {
       return;
@@ -148,10 +155,13 @@ export function createSessionStore({
         autoTitle: null
       };
       meta.updatedAt = timestamp;
+      const recorded = await readFile(sessionPaths.transcript, 'utf8').catch(() => '');
       const state = {
         nativeSessionId,
         paths: sessionPaths,
         meta,
+        // Entries recorded so far, counted when recorded, not when written.
+        count: recorded.split('\n').filter((line) => line.trim()).length,
         queue: Promise.resolve()
       };
       open.set(nativeSessionId, state);
@@ -173,6 +183,7 @@ export function createSessionStore({
       }
       const timestamp = now().toISOString();
       const line = `${JSON.stringify({ t: timestamp, ...entry })}\n`;
+      state.count += 1;
       return enqueue(state, async () => {
         await appendFile(state.paths.transcript, line, { mode: 0o600 });
         // The first prompt names the session until the agent names it; a
@@ -192,6 +203,24 @@ export function createSessionStore({
       });
     },
 
+    /** How many entries the session's transcript has, including those still being written. */
+    entryCount(nativeSessionId) {
+      return open.get(nativeSessionId)?.count ?? 0;
+    },
+
+    /** Waits until everything recorded so far is written. */
+    async flush() {
+      await Promise.all([...open.values()].map((state) => state.queue));
+    },
+
+    /** Releases one session, e.g. to delete it. */
+    async close(nativeSessionId) {
+      const state = open.get(nativeSessionId);
+      if (!state) return;
+      open.delete(nativeSessionId);
+      await enqueue(state, () => releaseLease(state));
+    },
+
     async closeAll() {
       if (heartbeat) {
         clearInterval(heartbeat);
@@ -199,16 +228,7 @@ export function createSessionStore({
       }
       const states = [...open.values()];
       open.clear();
-      await Promise.all(
-        states.map((state) =>
-          enqueue(state, async () => {
-            const lease = await readJson(state.paths.lease);
-            if (lease?.instanceId === instanceId) {
-              await unlink(state.paths.lease).catch(() => {});
-            }
-          })
-        )
-      );
+      await Promise.all(states.map((state) => enqueue(state, () => releaseLease(state))));
     }
   };
 }

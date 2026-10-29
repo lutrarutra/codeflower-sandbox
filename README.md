@@ -9,6 +9,17 @@ and DeepSeek Harness), and the bridge that connects it to VS Code.
 - `templates/`: the agent instructions copied into a new workspace
 - `dsh-plugins/acp-ws/`: the authenticated ACP WebSocket bridge, session recorder, and sign-in relay
 
+Releases are published as `ghcr.io/lutrarutra/codeflower-sandbox` for linux/amd64 and linux/arm64,
+tagged `X.Y.Z`, `X.Y`, `latest` and `sha-<commit>`. The launcher downloads the `X.Y` it was tested
+with (`codeflower pull`); to get it yourself:
+
+```sh
+docker pull ghcr.io/lutrarutra/codeflower-sandbox:0.1
+apptainer pull codeflower-sandbox.sif docker://ghcr.io/lutrarutra/codeflower-sandbox:0.1
+```
+
+To build it locally:
+
 ```sh
 make sandbox-build          # the image codeflower-sandbox (Docker)
 make sandbox-build-linux    # build/codeflower-sandbox-amd64.tar for an x86_64 cluster (Apptainer)

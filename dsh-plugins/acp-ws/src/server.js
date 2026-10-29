@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { WebSocket, WebSocketServer } from 'ws';
+import { createActivity } from './activity.js';
 import { CREDENTIAL_VARIABLES, InvalidRequest } from './agents.js';
 import { listDirectory, readClientFile, resolveFile, startShowServer } from './files.js';
 import {
@@ -13,10 +14,15 @@ import {
   deleteSession,
   listSessions,
   readTranscript,
-  renameSession
+  renameSession,
+  sessionKey
 } from './sessions.js';
 
 const CONNECTION_PATH = '/acp';
+const STATUS_PATH = '/status';
+// A window that misses two pings in a row is gone, e.g. a laptop that went to sleep.
+const PING_MS = 30_000;
+const TAKEN_OVER = 4001;
 const MAX_PAYLOAD = 16 * 1024 * 1024;
 const CONTROL_PREFIX = '_codeflower/';
 const LEASE_CONFLICT = -32010;
@@ -135,14 +141,18 @@ function createRecorder(store, log) {
   const permissionRequests = new Map();
   const questionRequests = new Map();
   let queue = Promise.resolve();
+  let pending = 0;
 
   const run = (task) => {
+    pending += 1;
     queue = queue.then(task).catch((error) => {
       if (error instanceof LeaseError) {
         log(`Session lease conflict: ${error.message}`);
       } else {
         log(`Could not record session: ${error.message}`);
       }
+    }).finally(() => {
+      pending -= 1;
     });
     return queue;
   };
@@ -282,9 +292,31 @@ function createRecorder(store, log) {
       return run(() => store.record(sessionId, entry));
     },
 
-    async close() {
-      await queue;
-      await store.closeAll();
+    /** Whether recorded messages are still on their way into the store. */
+    get busy() {
+      return pending > 0;
+    },
+
+    idle() {
+      return queue;
+    },
+
+    entryCount(sessionId) {
+      return store.entryCount(sessionId);
+    },
+
+    /** Waits until the transcripts hold everything relayed so far. */
+    async flush() {
+      while (pending > 0) await queue;
+      await store.flush();
+    },
+
+    close(sessionId) {
+      return run(() => store.close(sessionId));
+    },
+
+    closeAll() {
+      return run(() => store.closeAll());
     }
   };
 }
@@ -329,18 +361,83 @@ export async function startBridge(options) {
 
   const environment = { ...workerEnvironment, CODEFLOWER_SHOW_SOCKET: showSocket };
   const fileOptions = { workspace, privateDirectory };
-  // Sends to the connected client, if any.
-  let notifyClient;
+
+  // One store and recorder for the worker: sessions stay open, and their
+  // leases fresh, while no window is connected.
+  const store = sessionsDirectory
+    ? createSessionStore({ directory: sessionsDirectory, instanceId, harness: agentName, log })
+    : undefined;
+  const recorder = store ? createRecorder(store, log) : undefined;
+
+  // The agent runs from the first connection until the worker stops; VS Code
+  // windows attach to it one at a time and may come and go.
+  let agentHost;
+  let agentStarting;
+  let client;
+  let closing = false;
+  const shells = new Map();
+
+  const sendToClient = (message) => client?.send(message);
+  const activity = createActivity(() =>
+    sendToClient({ jsonrpc: '2.0', method: '_codeflower/activity', params: activitySnapshot() })
+  );
+
+  function activitySnapshot() {
+    const { chats, working, waiting } = activity.snapshot();
+    return {
+      chats: chats.map(({ sessionId, ...chat }) => ({ key: sessionKey(agentName, sessionId), ...chat })),
+      working,
+      waiting
+    };
+  }
+
+  async function statusSnapshot() {
+    const snapshot = activitySnapshot();
+    const titles = new Map();
+    if (snapshot.chats.length && sessionsDirectory) {
+      await recorder?.flush();
+      for (const session of await listSessions(sessionsDirectory).catch(() => [])) titles.set(session.key, session.title);
+    }
+    return {
+      agent: agentName,
+      agentLabel: agent.label ?? agentName,
+      connected: Boolean(client),
+      running: Boolean(agentHost),
+      working: snapshot.working,
+      waiting: snapshot.waiting,
+      chats: snapshot.chats.map((chat) => ({ ...chat, title: titles.get(chat.key) ?? 'Untitled session' }))
+    };
+  }
+
+  const bearer = (request) => {
+    const authorization = request.headers.authorization;
+    return typeof authorization === 'string' && authorization.startsWith('Bearer ')
+      ? authorization.slice('Bearer '.length)
+      : undefined;
+  };
 
   const sockets = new WebSocketServer({ noServer: true, maxPayload: MAX_PAYLOAD });
-  const server = createServer((_, response) => {
+  const server = createServer((request, response) => {
+    let pathname;
+    try {
+      pathname = new URL(request.url, 'http://localhost').pathname;
+    } catch {}
+    // What the launcher shows about the worker: counts and chat titles only.
+    if (request.method === 'GET' && pathname === STATUS_PATH) {
+      if (!constantTimeTokenMatch(bearer(request), token)) {
+        response.writeHead(401, { connection: 'close' });
+        response.end();
+        return;
+      }
+      void statusSnapshot().then((status) => {
+        response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        response.end(JSON.stringify(status));
+      });
+      return;
+    }
     response.writeHead(404, { connection: 'close' });
     response.end();
   });
-  let activeChild;
-  let activeSocket;
-  let activeConnectionDone;
-  let closing = false;
 
   server.on('upgrade', (request, socket, head) => {
     let pathname;
@@ -355,17 +452,11 @@ export async function startBridge(options) {
       rejectUpgrade(socket, 404, 'Not Found');
       return;
     }
-
-    const authorization = request.headers.authorization;
-    const suppliedToken =
-      typeof authorization === 'string' && authorization.startsWith('Bearer ')
-        ? authorization.slice('Bearer '.length)
-        : undefined;
-    if (!constantTimeTokenMatch(suppliedToken, token)) {
+    if (!constantTimeTokenMatch(bearer(request), token)) {
       rejectUpgrade(socket, 401, 'Unauthorized');
       return;
     }
-    if (closing || activeSocket) {
+    if (closing) {
       rejectUpgrade(socket, 503, 'Service Unavailable');
       return;
     }
@@ -375,162 +466,377 @@ export async function startBridge(options) {
     });
   });
 
-  sockets.on('connection', (webSocket) => {
-    activeSocket = webSocket;
-    let child;
-    let shuttingDown = false;
-    let stdoutBuffer = '';
-    let clientQueue = Promise.resolve();
-    let authMethods = [];
-    const initializeRequests = new Set();
-    const terminals = new Map();
-    const shells = new Map();
-    let finishConnection;
-    activeConnectionDone = new Promise((resolve) => {
-      finishConnection = resolve;
+  // ---- the agent ----
+
+  const childRunning = (child) => child.exitCode === null && child.signalCode === null;
+
+  const startAgent = async () => {
+    const command = await agent.command();
+    const child = spawn(command[0], command.slice(1), {
+      env: agentEnvironment(environment, agent.env),
+      stdio: ['pipe', 'pipe', 'inherit']
     });
-    const recorder = sessionsDirectory
-      ? createRecorder(createSessionStore({ directory: sessionsDirectory, instanceId, harness: agentName, log }), log)
-      : undefined;
-
-    const closeSocket = (code, reason) => {
-      if (webSocket.readyState === WebSocket.OPEN) {
-        webSocket.close(code, reason);
-      }
+    const started = {
+      child,
+      done: new Promise((resolve) => child.once('close', resolve)),
+      authMethods: [],
+      // The first initialize's result; later windows get it from here.
+      initialized: undefined,
+      // Client requests on their way, by the bridge's own id: windows come and
+      // go, so their ids could collide.
+      requests: new Map(),
+      nextRequest: 1,
+      // Permission requests and questions nobody answered yet.
+      waiting: new Map(),
+      // Each loaded session's modes and settings, for windows that reattach.
+      sessions: new Map(),
+      retiring: false
     };
-    const sendToClient = (message) => {
-      if (webSocket.readyState === WebSocket.OPEN) {
-        webSocket.send(JSON.stringify(message));
+    let stdoutBuffer = '';
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      stdoutBuffer += chunk;
+      if (Buffer.byteLength(stdoutBuffer) > MAX_PAYLOAD && !stdoutBuffer.includes('\n')) {
+        log('ACP child wrote an oversized stdio frame');
+        client?.close(1009, 'ACP frame from agent is too large');
+        endChild(child);
+        return;
       }
-    };
-    notifyClient = sendToClient;
-
-    let released = false;
-    const releaseConnection = async () => {
-      if (released) return;
-      released = true;
-      for (const terminal of terminals.values()) terminal.kill('SIGTERM');
-      terminals.clear();
-      for (const shell of shells.values()) shell.stop();
-      shells.clear();
-      if (recorder) await recorder.close();
-      if (activeSocket === webSocket) {
-        activeSocket = undefined;
-        activeChild = undefined;
-        notifyClient = undefined;
+      let newline;
+      while ((newline = stdoutBuffer.indexOf('\n')) !== -1) {
+        const frame = stdoutBuffer.slice(0, newline).replace(/\r$/, '');
+        stdoutBuffer = stdoutBuffer.slice(newline + 1);
+        if (!frame) continue;
+        let message;
+        try {
+          message = JSON.parse(frame);
+          if (!protocolObject(message)) throw new Error('ACP frame must be a JSON object');
+        } catch (error) {
+          log(`ACP child wrote an invalid stdio frame: ${error.message}`);
+          client?.close(1011, 'Invalid ACP frame from agent');
+          endChild(child);
+          return;
+        }
+        fromAgent(started, frame, message);
       }
-      finishConnection();
-    };
+    });
+    child.once('error', (error) => {
+      log(`Could not start ${agentName}: ${error.message}`);
+      if (client?.agent === started) client.close(1011, 'Could not start agent');
+    });
+    child.stdin.on('error', (error) => {
+      log(`Could not write to ${agentName}: ${error.message}`);
+      if (client?.agent === started) client.close(1011, 'Could not write to agent');
+    });
+    child.once('close', (code, signal) => {
+      if (stdoutBuffer.trim()) log('ACP child exited with an incomplete stdio frame');
+      if (code !== 0 && code !== null) log(`${agentName} exited with status ${code}`);
+      else if (signal) log(`${agentName} exited on signal ${signal}`);
+      if (agentHost === started) {
+        agentHost = undefined;
+        activity.clear();
+        void recorder?.closeAll();
+      }
+      if (client?.agent === started) client.close(1011, 'Agent process ended');
+    });
+    return started;
+  };
 
-    const forwardAgentFrame = (frame, message) => {
+  const ensureAgent = async () => {
+    if (agentHost?.retiring) await agentHost.done;
+    if (agentHost) return agentHost;
+    agentStarting ??= startAgent()
+      .then((started) => (agentHost = started))
+      .finally(() => {
+        agentStarting = undefined;
+      });
+    return agentStarting;
+  };
+
+  const writeToAgent = (host, message, webSocket) => {
+    if (!childRunning(host.child)) return;
+    recorder?.fromClient(message);
+    if (!host.child.stdin.write(`${JSON.stringify(message)}\n`) && webSocket) {
+      webSocket.pause();
+      host.child.stdin.once('drain', () => webSocket.resume());
+    }
+  };
+
+  // A permission request or question goes to the window once, after it has
+  // opened that chat.
+  const deliver = (target, key, message) => {
+    if (target.delivered.has(key)) return;
+    target.delivered.add(key);
+    target.send(message);
+  };
+
+  // On attach: the requests are in the transcript the window loads, so they
+  // are marked to be asked, not added to the chat again.
+  const deliverWaiting = (host, target, sessionId) => {
+    for (const [key, { message, sessionId: owner }] of host.waiting) {
+      if (owner !== sessionId) continue;
+      const params = protocolObject(message.params) ? message.params : {};
+      const meta = protocolObject(params._meta) ? params._meta : {};
+      deliver(target, key, { ...message, params: { ...params, _meta: { ...meta, 'codeflower/replayed': true } } });
+    }
+  };
+
+  // Answers an attach (session/new, resume or load) once the transcript holds
+  // everything relayed so far, so the window's transcript and its live updates
+  // neither overlap nor leave a gap.
+  const attachSession = async (host, target, id, sessionId, result) => {
+    while (recorder?.busy) await recorder.idle();
+    if (target !== client || !host.sessions.has(sessionId)) {
+      target.send({ jsonrpc: '2.0', id, result });
+      return;
+    }
+    target.sessions.add(sessionId);
+    target.send({
+      jsonrpc: '2.0',
+      id,
+      result: {
+        ...result,
+        _meta: {
+          ...(protocolObject(result._meta) ? result._meta : {}),
+          'codeflower/transcriptEntries': recorder?.entryCount(sessionId) ?? 0,
+          'codeflower/busy': activity.busy(sessionId)
+        }
+      }
+    });
+    deliverWaiting(host, target, sessionId);
+  };
+
+  const rememberSession = (host, sessionId, result) => {
+    const { sessionId: _, _meta, ...state } = result;
+    host.sessions.set(sessionId, structuredClone(state));
+  };
+
+  // Keeps a loaded session's settings current, so a reattach reports them.
+  const trackSettings = (host, sessionId, update) => {
+    const state = host.sessions.get(sessionId);
+    if (!state || !protocolObject(update)) return;
+    if (update.sessionUpdate === 'config_option_update' && Array.isArray(update.configOptions)) {
+      state.configOptions = update.configOptions;
+    } else if (update.sessionUpdate === 'current_mode_update' && state.modes) {
+      state.modes.currentModeId = update.currentModeId;
+    }
+  };
+
+  // The agent answered a client request.
+  const settleRequest = (host, request, message) => {
+    const { method, params, key } = request;
+    if (method === 'session/prompt') activity.turnEnded(key);
+    const result = message.result;
+    if (method === 'initialize') {
       // Remember the sign-in methods the agent offers, so terminal sign-ins
       // can only run commands the agent itself announced.
-      if (message.id !== undefined && message.method === undefined && initializeRequests.has(requestKey(message.id))) {
-        initializeRequests.delete(requestKey(message.id));
-        authMethods = Array.isArray(message.result?.authMethods) ? message.result.authMethods : [];
+      if (!message.error) host.authMethods = Array.isArray(result?.authMethods) ? result.authMethods : [];
+      request.initialized(message.error ? undefined : result);
+      if (message.error) host.initialized = undefined;
+    }
+    if (message.error || !protocolObject(result)) return false;
+    const sessionId = method === 'session/new' ? result.sessionId : params?.sessionId;
+    if (typeof sessionId !== 'string') return false;
+    const state = host.sessions.get(sessionId);
+    switch (method) {
+      case 'session/new':
+      case 'session/resume':
+      case 'session/load':
+        rememberSession(host, sessionId, result);
+        if (request.client === client) void attachSession(host, request.client, request.id, sessionId, result);
+        return true;
+      case 'session/set_config_option':
+        if (state && Array.isArray(result.configOptions)) state.configOptions = result.configOptions;
+        break;
+      case 'session/set_mode':
+        if (state?.modes) state.modes.currentModeId = params.modeId;
+        break;
+      case 'session/set_model':
+      case 'session/unstable_setSessionModel':
+        if (state?.models) state.models.currentModelId = params.modelId;
+        break;
+    }
+    return false;
+  };
+
+  const fromAgent = (host, frame, message) => {
+    // An answer to a client request: back to the window that asked, with its own id.
+    if (message.method === undefined && message.id !== undefined) {
+      const request = host.requests.get(requestKey(message.id));
+      if (!request) {
+        log('The agent answered a request nobody sent');
+        return;
       }
+      host.requests.delete(requestKey(message.id));
       recorder?.fromAgent(message);
-      if (webSocket.readyState === WebSocket.OPEN) {
+      // Attaches answer once the recorder caught up.
+      if (settleRequest(host, request, message)) return;
+      if (request.client === client) client.send({ ...message, id: request.id });
+      return;
+    }
+    recorder?.fromAgent(message);
+    const sessionId = typeof message.params?.sessionId === 'string' ? message.params.sessionId : undefined;
+
+    if (message.method === 'session/update') {
+      const update = message.params?.update;
+      trackSettings(host, sessionId, update);
+      if (update?.sessionUpdate === 'tool_call') activity.toolCall(sessionId, update);
+      if (sessionId !== undefined && client?.sessions.has(sessionId)) client.sendFrame(frame);
+      return;
+    }
+
+    if (message.id !== undefined) {
+      const key = requestKey(message.id);
+      if (message.method === 'session/request_permission' || message.method === 'elicitation/create') {
+        // It waits for the user, however long they are away.
+        host.waiting.set(key, { message, sessionId });
+        if (sessionId !== undefined && message.method === 'session/request_permission') {
+          activity.permission(key, sessionId, message.params?.toolCall);
+        } else if (sessionId !== undefined && message.params?.mode !== 'url') {
+          activity.question(key, sessionId);
+        }
+        if (client && (sessionId === undefined || client.sessions.has(sessionId))) deliver(client, key, message);
+        return;
+      }
+      if (client) {
+        client.sendFrame(frame);
+      } else {
+        writeToAgent(host, {
+          jsonrpc: '2.0',
+          id: message.id,
+          error: { code: -32601, message: `No client is connected for ${message.method}` }
+        });
+      }
+      return;
+    }
+
+    client?.sendFrame(frame);
+  };
+
+  // ---- windows ----
+
+  const attachClient = (webSocket) => {
+    const target = {
+      webSocket,
+      agent: undefined,
+      // The chats this window opened; it gets their updates and requests.
+      sessions: new Set(),
+      // Permission requests and questions already sent to it.
+      delivered: new Set(),
+      terminals: new Map(),
+      queue: Promise.resolve(),
+      alive: true,
+      send(message) {
+        if (webSocket.readyState === WebSocket.OPEN) webSocket.send(JSON.stringify(message));
+      },
+      sendFrame(frame) {
+        if (webSocket.readyState !== WebSocket.OPEN) return;
         if (webSocket.bufferedAmount + Buffer.byteLength(frame) > MAX_PAYLOAD) {
           log('ACP WebSocket client is not keeping up with the agent');
-          closeSocket(1009, 'ACP client is not keeping up');
-          endChild(child);
+          target.close(1009, 'ACP client is not keeping up');
           return;
         }
         webSocket.send(frame);
+      },
+      close(code, reason) {
+        if (webSocket.readyState === WebSocket.OPEN || webSocket.readyState === WebSocket.CONNECTING) {
+          webSocket.close(code, reason);
+        }
       }
     };
+    return target;
+  };
 
-    const startAgent = async () => {
-      let command;
+  sockets.on('connection', (webSocket) => {
+    // The newest window wins, e.g. the same chats opened from another computer.
+    client?.close(TAKEN_OVER, 'Another VS Code window took over');
+    const self = attachClient(webSocket);
+    client = self;
+
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      for (const terminal of self.terminals.values()) terminal.kill('SIGTERM');
+      self.terminals.clear();
+      if (client === self) client = undefined;
+    };
+
+    const start = async () => {
+      let host;
       try {
-        command = await agent.command();
+        host = await ensureAgent();
       } catch (error) {
         log(`Could not prepare ${agentName}: ${error.message}`);
-        closeSocket(1011, 'Could not start agent');
-        await releaseConnection();
+        self.close(1011, 'Could not start agent');
         return;
       }
-      if (webSocket.readyState !== WebSocket.OPEN) {
-        await releaseConnection();
-        return;
-      }
-      child = spawn(command[0], command.slice(1), {
-        env: agentEnvironment(environment, agent.env),
-        stdio: ['pipe', 'pipe', 'inherit']
-      });
-      activeChild = child;
-      child.stdout.setEncoding('utf8');
-      child.stdout.on('data', (chunk) => {
-        stdoutBuffer += chunk;
-        if (Buffer.byteLength(stdoutBuffer) > MAX_PAYLOAD && !stdoutBuffer.includes('\n')) {
-          log('ACP child wrote an oversized stdio frame');
-          closeSocket(1009, 'ACP frame from agent is too large');
-          endChild(child);
-          return;
-        }
-        let newline;
-        while ((newline = stdoutBuffer.indexOf('\n')) !== -1) {
-          const frame = stdoutBuffer.slice(0, newline).replace(/\r$/, '');
-          stdoutBuffer = stdoutBuffer.slice(newline + 1);
-          if (!frame) continue;
-          let message;
-          try {
-            message = JSON.parse(frame);
-            if (!protocolObject(message)) throw new Error('ACP frame must be a JSON object');
-          } catch (error) {
-            log(`ACP child wrote an invalid stdio frame: ${error.message}`);
-            closeSocket(1011, 'Invalid ACP frame from agent');
-            endChild(child);
-            return;
-          }
-          forwardAgentFrame(frame, message);
-        }
-      });
-      child.once('error', (error) => {
-        log(`Could not start ${agentName}: ${error.message}`);
-        closeSocket(1011, 'Could not start agent');
-      });
-      child.stdin.on('error', (error) => {
-        log(`Could not write to ${agentName}: ${error.message}`);
-        closeSocket(1011, 'Could not write to agent');
-      });
-      child.once('close', (code, signal) => {
-        if (stdoutBuffer.trim()) log('ACP child exited with an incomplete stdio frame');
-        if (code !== 0 && code !== null) log(`${agentName} exited with status ${code}`);
-        else if (signal) log(`${agentName} exited on signal ${signal}`);
-        closeSocket(1011, 'Agent process ended');
-        void releaseConnection();
-      });
-    };
-
-    const writeToChild = (message) => {
-      if (!child || child.exitCode !== null || child.signalCode !== null) return;
-      if (message.method === 'initialize' && message.id !== undefined) {
-        initializeRequests.add(requestKey(message.id));
-      }
-      recorder?.fromClient(message);
-      if (!child.stdin.write(`${JSON.stringify(message)}\n`)) {
-        webSocket.pause();
-        child.stdin.once('drain', () => webSocket.resume());
+      self.agent = host;
+      // Sign-in links the agent sent while no window was connected.
+      for (const [key, { message, sessionId }] of host.waiting) {
+        if (sessionId === undefined) deliver(self, key, message);
       }
     };
+    self.queue = self.queue.then(start);
 
     const handleClientMessage = async (message) => {
+      const host = self.agent;
+      if (!host || !childRunning(host.child) || client !== self) return;
+
+      // An answer to the agent's request: forwarded once, then it stops waiting.
+      if (message.method === undefined) {
+        if (message.id === undefined) return;
+        const key = requestKey(message.id);
+        if (host.waiting.delete(key)) activity.answered(key);
+        writeToAgent(host, message, webSocket);
+        return;
+      }
+      if (message.id === undefined) {
+        writeToAgent(host, message, webSocket);
+        return;
+      }
+
+      const respond = (result) => self.send({ jsonrpc: '2.0', id: message.id, result });
+      if (message.method === 'initialize' && host.initialized) {
+        const result = await host.initialized;
+        if (result) {
+          respond(result);
+          return;
+        }
+      }
+      const sessionId = message.params?.sessionId;
+      if (
+        (message.method === 'session/resume' || message.method === 'session/load') &&
+        typeof sessionId === 'string' &&
+        host.sessions.has(sessionId)
+      ) {
+        // Still loaded in this agent: reattach instead of loading it again.
+        await attachSession(host, self, message.id, sessionId, host.sessions.get(sessionId));
+        return;
+      }
       if (recorder) {
         const refusal = await recorder.admitClientMessage(message);
         if (refusal) {
-          sendToClient(refusal);
+          self.send(refusal);
           return;
         }
       }
-      writeToChild(message);
+
+      const bridgeId = `cf-${host.nextRequest++}`;
+      const key = requestKey(bridgeId);
+      const request = { client: self, id: message.id, key, method: message.method, params: message.params };
+      if (message.method === 'initialize') {
+        host.initialized = new Promise((resolve) => (request.initialized = resolve));
+      }
+      host.requests.set(key, request);
+      if (message.method === 'session/prompt' && typeof sessionId === 'string') activity.turnStarted(key, sessionId);
+      writeToAgent(host, { ...message, id: bridgeId }, webSocket);
     };
 
     // ---- sign-in terminals ----
 
     const terminalCommand = async (methodId) => {
-      const method = authMethods.find((candidate) => candidate?.id === methodId);
+      const method = (self.agent?.authMethods ?? []).find((candidate) => candidate?.id === methodId);
       if (!method) throw new InvalidRequest(`The agent offers no sign-in method ${String(methodId)}`);
       const meta = method._meta?.['terminal-auth'];
       if (meta && typeof meta.command === 'string') {
@@ -554,9 +860,9 @@ export async function startBridge(options) {
         env: { ...agentEnvironment(environment, agent.env), COLUMNS: String(columns), LINES: String(rows) },
         stdio: ['pipe', 'pipe', 'pipe']
       });
-      terminals.set(terminalId, terminal);
+      self.terminals.set(terminalId, terminal);
       const output = (data) =>
-        sendToClient({ jsonrpc: '2.0', method: '_codeflower/terminal/output', params: { terminalId, data } });
+        self.send({ jsonrpc: '2.0', method: '_codeflower/terminal/output', params: { terminalId, data } });
       terminal.stdout.setEncoding('utf8');
       terminal.stderr.setEncoding('utf8');
       terminal.stdout.on('data', output);
@@ -564,8 +870,8 @@ export async function startBridge(options) {
       terminal.stdin.on('error', () => {});
       terminal.once('error', (error) => output(`\r\nCould not start the sign-in: ${error.message}\r\n`));
       terminal.once('close', (code, signal) => {
-        terminals.delete(terminalId);
-        sendToClient({
+        self.terminals.delete(terminalId);
+        self.send({
           jsonrpc: '2.0',
           method: '_codeflower/terminal/exit',
           params: { terminalId, exitCode: code ?? (signal ? 128 : 1) }
@@ -578,7 +884,8 @@ export async function startBridge(options) {
 
     // Runs like the agent's own commands: in the workspace, with the project's
     // environment and without the worker's token. Output streams to the
-    // client; the command and its (capped) output go into the session record.
+    // connected window; the command and its (capped) output go into the
+    // session record, and it keeps running if the window goes away.
     const runShell = async (params) => {
       const { sessionId, runId, command } = params;
       if (typeof command !== 'string' || !command.trim() || command.length > MAX_SHELL_COMMAND) {
@@ -647,7 +954,7 @@ export async function startBridge(options) {
 
     const handleControl = async (message) => {
       const params = protocolObject(message.params) ? message.params : {};
-      const respond = (result) => sendToClient({ jsonrpc: '2.0', id: message.id, result });
+      const respond = (result) => self.send({ jsonrpc: '2.0', id: message.id, result });
       const requireSessions = () => {
         if (!sessionsDirectory) throw new InvalidRequest('This worker does not record sessions');
         return sessionsDirectory;
@@ -669,27 +976,47 @@ export async function startBridge(options) {
               ...(slurmJobId ? { slurmJobId } : {})
             });
             break;
+          case '_codeflower/activity':
+            respond(activitySnapshot());
+            break;
           case '_codeflower/sessions/list': {
             const sessions = sessionsDirectory ? await listSessions(sessionsDirectory) : [];
             respond({ sessions: sessions.filter((session) => session.harness === agentName) });
             break;
           }
-          case '_codeflower/sessions/transcript':
-            respond({ entries: await readTranscript(requireSessions(), requireOwnSession()) });
+          case '_codeflower/sessions/transcript': {
+            const directory = requireSessions();
+            const key = requireOwnSession();
+            // A chat still running here: everything relayed so far is in the file.
+            await recorder?.flush();
+            respond({ entries: await readTranscript(directory, key) });
             break;
+          }
           case '_codeflower/sessions/rename':
             await renameSession(requireSessions(), requireOwnSession(), params.title);
             respond({});
             break;
-          case '_codeflower/sessions/delete':
-            await deleteSession(requireSessions(), requireOwnSession());
+          case '_codeflower/sessions/delete': {
+            const directory = requireSessions();
+            const key = requireOwnSession();
+            // A chat loaded here is released first, unless it is working.
+            const host = agentHost;
+            const loaded = [...(host?.sessions.keys() ?? [])].find((sessionId) => sessionKey(agentName, sessionId) === key);
+            if (loaded !== undefined) {
+              if (activity.busy(loaded)) throw new InvalidRequest('The chat is still working; stop it first');
+              host.sessions.delete(loaded);
+              client?.sessions.delete(loaded);
+              await recorder?.close(loaded);
+            }
+            await deleteSession(directory, key);
             respond({});
             break;
+          }
           case '_codeflower/terminal/start':
             respond(await startTerminal(params));
             break;
           case '_codeflower/terminal/input': {
-            const terminal = terminals.get(params.terminalId);
+            const terminal = self.terminals.get(params.terminalId);
             if (!terminal) throw new InvalidRequest('Unknown terminal');
             if (typeof params.data !== 'string' || params.data.length > MAX_TERMINAL_INPUT) {
               throw new InvalidRequest('Terminal input must be a string');
@@ -699,13 +1026,13 @@ export async function startBridge(options) {
             break;
           }
           case '_codeflower/terminal/close':
-            terminals.get(params.terminalId)?.kill('SIGTERM');
+            self.terminals.get(params.terminalId)?.kill('SIGTERM');
             respond({});
             break;
           case '_codeflower/shell/run':
             // Answered when the command ends; other requests keep flowing meanwhile.
             void runShell(params).then(respond, (error) =>
-              sendToClient({ jsonrpc: '2.0', id: message.id, error: { code: -32602, message: error.message } })
+              self.send({ jsonrpc: '2.0', id: message.id, error: { code: -32602, message: error.message } })
             );
             break;
           case '_codeflower/shell/cancel':
@@ -742,18 +1069,29 @@ export async function startBridge(options) {
               throw new InvalidRequest(`${agent.label ?? agentName} signs in through the agent`);
             }
             await agent.setCredentials(params);
-            // The agent reads its keys at start: reconnect to apply them.
+            // The agent reads its keys at start: restart it to apply them.
             respond({ restartRequired: true });
             break;
+          case '_codeflower/agent/restart': {
+            // Ends the agent; the window's next connection starts a fresh one.
+            const host = agentHost;
+            if (host && activity.running) throw new InvalidRequest('Chats are still working; stop them before restarting the agent');
+            respond({});
+            if (host) {
+              host.retiring = true;
+              endChild(host.child);
+            }
+            break;
+          }
           default:
-            sendToClient({
+            self.send({
               jsonrpc: '2.0',
               id: message.id,
               error: { code: -32601, message: `Method not found: ${message.method}` }
             });
         }
       } catch (error) {
-        sendToClient({
+        self.send({
           jsonrpc: '2.0',
           id: message.id,
           error: { code: -32602, message: error instanceof InvalidRequest ? error.message : error.message }
@@ -761,17 +1099,19 @@ export async function startBridge(options) {
       }
     };
 
-    clientQueue = clientQueue.then(startAgent);
+    webSocket.on('pong', () => {
+      self.alive = true;
+    });
 
     webSocket.on('message', (data, isBinary) => {
       if (isBinary) {
-        closeSocket(1003, 'ACP messages must be text');
+        self.close(1003, 'ACP messages must be text');
         return;
       }
 
       const frame = data.toString();
       if (frame.includes('\n') || frame.includes('\r')) {
-        closeSocket(1007, 'Each WebSocket frame must contain one compact JSON object');
+        self.close(1007, 'Each WebSocket frame must contain one compact JSON object');
         return;
       }
 
@@ -780,7 +1120,7 @@ export async function startBridge(options) {
         message = JSON.parse(frame);
         if (!protocolObject(message)) throw new Error('ACP frame must be a JSON object');
       } catch {
-        closeSocket(1007, 'Invalid ACP JSON object');
+        self.close(1007, 'Invalid ACP JSON object');
         return;
       }
 
@@ -791,26 +1131,27 @@ export async function startBridge(options) {
         void handleControl(message);
         return;
       }
-      clientQueue = clientQueue.then(() => handleClientMessage(message));
+      self.queue = self.queue.then(() => handleClientMessage(message));
     });
 
-    const onSocketEnd = () => {
-      if (shuttingDown) return;
-      shuttingDown = true;
-      void clientQueue.then(() => {
-        if (child && child.exitCode === null && child.signalCode === null) {
-          endChild(child);
-        } else {
-          void releaseConnection();
-        }
-      });
-    };
-    webSocket.once('close', onSocketEnd);
+    // The agent keeps working when the window goes.
+    webSocket.once('close', release);
     webSocket.once('error', (error) => {
       log(`WebSocket transport error: ${error.message}`);
-      onSocketEnd();
+      release();
     });
   });
+
+  const pings = setInterval(() => {
+    if (!client) return;
+    if (!client.alive) {
+      client.webSocket.terminate();
+      return;
+    }
+    client.alive = false;
+    client.webSocket.ping();
+  }, PING_MS);
+  pings.unref();
 
   await new Promise((resolve, reject) => {
     server.once('error', reject);
@@ -829,8 +1170,8 @@ export async function startBridge(options) {
       const cwd = typeof request.cwd === 'string' ? request.cwd : workspace;
       const files = [];
       for (const path of paths.slice(0, 20)) files.push(await resolveFile(path, { ...fileOptions, cwd }));
-      if (!notifyClient) return { error: 'No VS Code window is connected to this worker, so nobody can see the files now' };
-      notifyClient({
+      if (!client) return { error: 'No VS Code window is connected to this worker, so nobody can see the files now' };
+      sendToClient({
         jsonrpc: '2.0',
         method: '_codeflower/show',
         params: {
@@ -847,6 +1188,7 @@ export async function startBridge(options) {
 
   const address = server.address();
   if (!address || typeof address === 'string') {
+    clearInterval(pings);
     await new Promise((resolve) => server.close(resolve));
     throw new Error('WebSocket server did not bind to a TCP port');
   }
@@ -868,6 +1210,7 @@ export async function startBridge(options) {
   try {
     await writeConnectionFile(connectionFile, metadata);
   } catch (error) {
+    clearInterval(pings);
     await new Promise((resolve) => server.close(resolve));
     throw error;
   }
@@ -877,11 +1220,15 @@ export async function startBridge(options) {
     async close() {
       if (closing) return;
       closing = true;
-      if (activeSocket?.readyState === WebSocket.OPEN) {
-        activeSocket.close(1001, 'Server shutting down');
+      clearInterval(pings);
+      client?.close(1001, 'Server shutting down');
+      for (const shell of shells.values()) shell.stop();
+      const host = agentHost ?? (await agentStarting?.catch(() => undefined));
+      if (host) {
+        endChild(host.child);
+        await host.done;
       }
-      if (activeChild) endChild(activeChild);
-      if (activeConnectionDone) await activeConnectionDone;
+      await recorder?.closeAll();
       await new Promise((resolve) => server.close(resolve));
       sockets.close();
       await showServer?.close();

@@ -39,25 +39,6 @@ async function openSocket(address) {
   return trackSocket(socket);
 }
 
-async function openSocketAfterReconnect(address) {
-  const deadline = Date.now() + 3000;
-  while (Date.now() < deadline) {
-    const socket = new WebSocket(`ws://127.0.0.1:${address.port}/acp`, {
-      headers: { authorization: `Bearer ${token}` }
-    });
-    try {
-      await once(socket, 'open');
-      return trackSocket(socket);
-    } catch (error) {
-      if (!error.message.includes('503') && !error.message.includes('ECONNREFUSED')) {
-        throw error;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-  }
-  throw new Error('ACP bridge did not become available for reconnect');
-}
-
 function send(socket, message) {
   socket.send(JSON.stringify(message));
 }
@@ -203,11 +184,11 @@ test('starts the worker agent on connect without passing it any credentials', as
   assert.equal(connection.agent, 'codex');
   assert.equal(connection.url, `codeflower://localhost:${bridge.address.port}?token=${token}`);
 
+  // The newest window takes the worker over.
+  const replaced = await openSocket(bridge.address);
+  const replacedClosed = once(replaced, 'close');
   const socket = await openSocket(bridge.address);
-  const competing = new WebSocket(`ws://127.0.0.1:${bridge.address.port}/acp`, {
-    headers: { authorization: `Bearer ${token}` }
-  });
-  assert.match((await once(competing, 'error'))[0].message, /503/);
+  assert.equal((await replacedClosed)[0], 4001);
 
   const initialized = await initialize(socket);
   assert.deepEqual(initialized.credentialVariables, []);
@@ -262,20 +243,20 @@ test('relays chat, permissions, cancellation, and several sessions, and records 
     ['prompt', 'update', 'turn_end', 'prompt', 'turn_end']
   );
   assert.deepEqual((await call(socket, '_codeflower/sessions/rename', { key: firstKey, title: 'Greeting' })).result, {});
-  assert.match((await call(socket, '_codeflower/sessions/delete', { key: firstKey })).error.message, /open on a worker/);
   assert.match((await call(socket, '_codeflower/sessions/rename', { key: 'codex-x', title: 'y' })).error.message, /Invalid/);
   await closeSocket(socket);
 
-  // A later connection resumes the session; once released it can be deleted.
-  const again = await openSocketAfterReconnect(bridge.address);
+  // A later connection reattaches to the session the agent still has loaded.
+  const again = await openSocket(bridge.address);
   await initialize(again);
-  assert.deepEqual((await call(again, 'session/resume', { sessionId: first, cwd: '/workspace', mcpServers: [] })).result, {});
+  const resumed = (await call(again, 'session/resume', { sessionId: first, cwd: '/workspace', mcpServers: [] })).result;
+  assert.equal(resumed._meta['codeflower/transcriptEntries'], 5);
+  assert.equal(resumed._meta['codeflower/busy'], false);
+  // An idle chat is released for deleting; the worker keeps its lease meanwhile.
+  assert.ok(await readFile(join(sessionsDirectory, firstKey, 'lease.json')));
+  assert.deepEqual((await call(again, '_codeflower/sessions/delete', { key: firstKey })).result, {});
+  assert.equal((await call(again, '_codeflower/sessions/list')).result.sessions.length, 1);
   await closeSocket(again);
-  await waitFor(async () => !(await readFile(join(sessionsDirectory, firstKey, 'lease.json')).catch(() => null)));
-  const third = await openSocketAfterReconnect(bridge.address);
-  assert.deepEqual((await call(third, '_codeflower/sessions/delete', { key: firstKey })).result, {});
-  assert.equal((await call(third, '_codeflower/sessions/list')).result.sessions.length, 1);
-  await closeSocket(third);
 });
 
 test('refuses to resume a session leased by another worker', async (t) => {
@@ -291,7 +272,8 @@ test('refuses to resume a session leased by another worker', async (t) => {
   assert.equal(refused.error.data.instanceId, 'other');
 
   await writeFile(join(directory, 'lease.json'), JSON.stringify({ instanceId: 'other', heartbeatAt: new Date(0).toISOString() }));
-  assert.deepEqual((await call(socket, 'session/resume', { sessionId: 'busy', cwd: '/w', mcpServers: [] })).result, {});
+  const resumed = (await call(socket, 'session/resume', { sessionId: 'busy', cwd: '/w', mcpServers: [] })).result;
+  assert.equal(resumed._meta['codeflower/transcriptEntries'], 0);
   await closeSocket(socket);
 });
 
@@ -361,9 +343,11 @@ test('stores dsh keys in its own files and adds the endpoint on the next start',
   assert.match(patch, /llm\.example\.org/);
   assert.doesNotMatch(patch, /sk-compat-secret/);
   assert.equal((await call(socket, '_codeflower/status')).result.signedIn, true);
-  await closeSocket(socket);
+  const ended = once(socket, 'close');
+  assert.deepEqual((await call(socket, '_codeflower/agent/restart')).result, {});
+  await ended;
 
-  const again = await openSocketAfterReconnect(bridge.address);
+  const again = await openSocket(bridge.address);
   const initialized = await initialize(again);
   assert.ok(initialized.argv.includes('--patch'));
   assert.deepEqual(initialized.credentialVariables, []);
@@ -421,4 +405,116 @@ test('shows the files the agent asks for and lets the client read them', async (
   assert.match(denied.error.message, /cannot be shown/);
   assert.match((await show('missing.png')).stderr, /No such file: missing.png/);
   await closeSocket(socket);
+});
+
+async function status(address, headers = { authorization: `Bearer ${token}` }) {
+  const response = await fetch(`http://127.0.0.1:${address.port}/status`, { headers });
+  return { code: response.status, body: response.ok ? await response.json() : undefined };
+}
+
+function text(message) {
+  return message.params?.update?.content?.text;
+}
+
+test('keeps the agent and its chats working while no window is connected', async (t) => {
+  const { bridge } = await startTestBridge(t);
+  const first = await openSocket(bridge.address);
+  const { pid } = await initialize(first);
+  const sessionId = (await call(first, 'session/new', { cwd: '/workspace', mcpServers: [] })).result.sessionId;
+  const promptId = nextId++;
+  send(first, { jsonrpc: '2.0', id: promptId, method: 'session/prompt', params: { sessionId, prompt: [{ type: 'text', text: 'long task' }] } });
+  assert.equal(text(await receive(first, (message) => message.method === 'session/update')), 'started');
+  const working = await receive(first, (message) => message.method === '_codeflower/activity' && message.params.working === 1);
+  assert.deepEqual(working.params.chats, [{ key: sessionKey('claude', sessionId), state: 'working' }]);
+  assert.match((await call(first, '_codeflower/agent/restart')).error.message, /still working/);
+  assert.match((await call(first, '_codeflower/sessions/delete', { key: sessionKey('claude', sessionId) })).error.message, /still working/);
+  await closeSocket(first);
+
+  assert.deepEqual((await status(bridge.address)).body, {
+    agent: 'claude',
+    agentLabel: 'Claude Code',
+    connected: false,
+    running: true,
+    working: 1,
+    waiting: 0,
+    chats: [{ key: sessionKey('claude', sessionId), state: 'working', title: 'long task' }]
+  });
+
+  // The next window gets the same agent and reattaches to the running turn.
+  const second = await openSocket(bridge.address);
+  assert.equal((await initialize(second)).pid, pid);
+  const resumed = (await call(second, 'session/resume', { sessionId, cwd: '/workspace', mcpServers: [] })).result;
+  assert.equal(resumed._meta['codeflower/busy'], true);
+  assert.equal(resumed.configOptions[0].currentValue, 'default');
+  const recorded = resumed._meta['codeflower/transcriptEntries'];
+  assert.equal(recorded, 2);
+
+  // Its own request with the id of the first window's prompt gets its own answer only.
+  send(second, {
+    jsonrpc: '2.0',
+    id: promptId,
+    method: 'session/set_config_option',
+    params: { sessionId, configId: 'mode', value: 'plan' }
+  });
+  assert.equal((await receive(second, (message) => message.id === promptId)).result.configOptions[0].currentValue, 'plan');
+  send(second, { jsonrpc: '2.0', method: 'fake/finish', params: { sessionId } });
+  assert.equal(text(await receive(second, (message) => message.method === 'session/update')), 'done');
+  await receive(second, (message) => message.method === '_codeflower/activity' && message.params.working === 0);
+  assert.equal(inboxes.get(second).messages.filter((message) => message.id === promptId).length, 0);
+
+  // The transcript up to the reattach plus what came live is the whole chat.
+  const entries = (await call(second, '_codeflower/sessions/transcript', { key: sessionKey('claude', sessionId) })).result.entries;
+  assert.deepEqual(entries.slice(0, recorded).map((entry) => entry.kind), ['prompt', 'update']);
+  assert.deepEqual(entries.slice(recorded).map((entry) => entry.kind), ['update', 'turn_end']);
+  assert.equal(entries[recorded].update.content.text, 'done');
+
+  // A reattach later reports the settings changed meanwhile.
+  await closeSocket(second);
+  const third = await openSocket(bridge.address);
+  await initialize(third);
+  const later = (await call(third, 'session/resume', { sessionId, cwd: '/workspace', mcpServers: [] })).result;
+  assert.equal(later.configOptions[0].currentValue, 'plan');
+  assert.equal(later._meta['codeflower/busy'], false);
+  await closeSocket(third);
+});
+
+test('keeps questions for the user until a window opens their chat', async (t) => {
+  const { bridge } = await startTestBridge(t);
+  const first = await openSocket(bridge.address);
+  await initialize(first);
+  const sessionId = (await call(first, 'session/new', { cwd: '/workspace', mcpServers: [] })).result.sessionId;
+  send(first, { jsonrpc: '2.0', id: nextId++, method: 'session/prompt', params: { sessionId, prompt: [{ type: 'text', text: 'approve plan' }] } });
+  const asked = await receive(first, (message) => message.method === 'session/request_permission');
+  await closeSocket(first);
+
+  assert.deepEqual((await status(bridge.address)).body.chats, [
+    { key: sessionKey('claude', sessionId), state: 'waiting', waitingFor: 'plan', title: 'approve plan' }
+  ]);
+
+  const second = await openSocket(bridge.address);
+  await initialize(second);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(inboxes.get(second).messages.some((message) => message.method === 'session/request_permission'), false);
+  await call(second, 'session/resume', { sessionId, cwd: '/workspace', mcpServers: [] });
+  const again = await receive(second, (message) => message.method === 'session/request_permission');
+  assert.equal(again.id, asked.id);
+  assert.equal(again.params._meta['codeflower/replayed'], true);
+  send(second, { jsonrpc: '2.0', id: again.id, result: { outcome: { outcome: 'selected', optionId: 'allow' } } });
+  assert.equal(text(await receive(second, (message) => message.method === 'session/update' && text(message))), 'outcome allow');
+  await waitFor(async () => (await status(bridge.address)).body.chats.length === 0);
+  const entries = (await call(second, '_codeflower/sessions/transcript', { key: sessionKey('claude', sessionId) })).result.entries;
+  assert.deepEqual(
+    entries.filter((entry) => entry.kind.startsWith('permission')).map((entry) => entry.kind),
+    ['permission', 'permission_outcome']
+  );
+  await closeSocket(second);
+});
+
+test('reports its activity only to holders of the token', async (t) => {
+  const { bridge } = await startTestBridge(t);
+  assert.equal((await status(bridge.address, {})).code, 401);
+  assert.equal((await status(bridge.address, { authorization: `Bearer ${'x'.repeat(43)}` })).code, 401);
+  assert.equal((await fetch(`http://127.0.0.1:${bridge.address.port}/other`)).status, 404);
+  const { body } = await status(bridge.address);
+  assert.deepEqual(body, { agent: 'claude', agentLabel: 'Claude Code', connected: false, running: false, working: 0, waiting: 0, chats: [] });
 });

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM node:22-bookworm-slim AS dsh-runtime
+FROM node:22-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS dsh-runtime
 
 # Harness runtimes: DeepSeek Harness, the Claude Code and Codex ACP adapters,
 # and the official claude and codex CLIs used for sign-in. Exact versions are
@@ -14,7 +14,7 @@ COPY dsh-plugins/acp-ws/package.json dsh-plugins/acp-ws/package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund
 COPY dsh-plugins/acp-ws/src ./src
 
-FROM continuumio/miniconda3:latest
+FROM continuumio/miniconda3:26.7.1-1@sha256:eca594d684f495c1a02beff33a9fab53aec8c5830eaf431bb149912dc6c9e4c1
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -23,7 +23,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /opt/codeflower
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+COPY --from=ghcr.io/astral-sh/uv:0.13.6@sha256:af22a52f5eafef3d78e551599d405c02df61919d18028f0cea8eda93bc9986d0 /uv /uvx /usr/local/bin/
 COPY --from=dsh-runtime /usr/local/bin/node /usr/local/bin/node
 COPY --from=dsh-runtime /opt/codeflower/runtime /opt/codeflower/runtime
 COPY --from=dsh-runtime /opt/codeflower/acp-ws /opt/codeflower/acp-ws

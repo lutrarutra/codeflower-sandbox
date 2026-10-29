@@ -10,5 +10,6 @@
   },
   "dependencies": {
     "ws": "^8.18.3"
-  }
+  },
+  "license": "MIT"
 }

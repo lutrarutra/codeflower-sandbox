@@ -16,6 +16,8 @@ const input = createInterface({ input: process.stdin });
 let nextSession = 1;
 let nextRequest = 1;
 let pendingPrompt;
+// Turns that run until the test lets them finish, by session.
+const longTasks = new Map();
 const waiting = new Map();
 
 function send(message) {
@@ -101,7 +103,8 @@ input.on('line', async (line) => {
           leakedLauncherToken: process.env.CODEFLOWER_TOKEN ?? null,
           credentialVariables: CREDENTIAL_VARIABLES.filter((name) => process.env[name] !== undefined),
           noBrowser: process.env.NO_BROWSER ?? null,
-          argv: process.argv.slice(2)
+          argv: process.argv.slice(2),
+          pid: process.pid
         }
       });
       break;
@@ -177,6 +180,32 @@ input.on('line', async (line) => {
         reply(message.params.sessionId, message.id, `answer ${result.action} ${JSON.stringify(result.content ?? {})}`);
         break;
       }
+      if (text === 'long task') {
+        const { sessionId } = message.params;
+        longTasks.set(sessionId, message.id);
+        send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: { sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'started' } } }
+        });
+        break;
+      }
+      if (text === 'approve plan') {
+        // Like Claude Code's ExitPlanMode: the kind comes with the tool call, not the request.
+        const { sessionId } = message.params;
+        send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: { sessionId, update: { sessionUpdate: 'tool_call', toolCallId: 'plan-1', title: 'Approve Plan', kind: 'switch_mode' } }
+        });
+        const result = await request('session/request_permission', {
+          sessionId,
+          toolCall: { toolCallId: 'plan-1' },
+          options: [{ optionId: 'allow', name: 'Yes', kind: 'allow_once' }]
+        });
+        reply(sessionId, message.id, `outcome ${result.outcome.optionId ?? result.outcome.outcome}`);
+        break;
+      }
       if (text === 'ask permission') {
         const result = await request('session/request_permission', {
           sessionId: message.params.sessionId,
@@ -195,6 +224,13 @@ input.on('line', async (line) => {
         pendingPrompt = undefined;
       }
       break;
+    case 'fake/finish': {
+      const { sessionId } = message.params;
+      const id = longTasks.get(sessionId);
+      longTasks.delete(sessionId);
+      if (id !== undefined) reply(sessionId, id, 'done');
+      break;
+    }
     case 'session/resume':
       send({ jsonrpc: '2.0', id: message.id, result: {} });
       break;

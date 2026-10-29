@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths: &paths
+      - Dockerfile
+      - entrypoint.sh
+      - bin/**
+      - templates/**
+      - dsh-plugins/**
+      - package.json
+      - package-lock.json
+      - Makefile
+      - .github/workflows/ci.yml
+  pull_request:
+    paths: *paths
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bridge-test:
+    name: Bridge tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dsh-plugins/acp-ws/package-lock.json
+
+      - name: Install bridge dependencies
+        run: make bridge-install
+
+      - name: Run bridge tests
+        run: make bridge-test
+
+  image:
+    name: Image build and smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The image takes minutes to build: only when something that goes into it changed
+      # (the bridge tests above cover dsh-plugins/ on their own).
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            image:
+              - Dockerfile
+              - entrypoint.sh
+              - bin/**
+              - templates/**
+              - package.json
+              - package-lock.json
+              - .github/workflows/ci.yml
+
+      - uses: docker/setup-buildx-action@v4
+        if: steps.filter.outputs.image == 'true' || github.event_name == 'workflow_dispatch'
+
+      - name: Build the image
+        if: steps.filter.outputs.image == 'true' || github.event_name == 'workflow_dispatch'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: codeflower-sandbox:ci
+          cache-from: type=gha,scope=linux-amd64
+          cache-to: type=gha,mode=max,scope=linux-amd64
+
+      - name: Check the agent runtimes in the image
+        if: steps.filter.outputs.image == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          docker run --rm --entrypoint sh codeflower-sandbox:ci -c '
+            set -e
+            node --version
+            python --version
+            uv --version
+            claude --version
+            codex --version
+            dsh --version
+            test -x /opt/codeflower/entrypoint.sh
+            test -f /opt/codeflower/acp-ws/src/server.js
+          '
