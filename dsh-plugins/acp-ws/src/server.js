@@ -114,7 +114,7 @@ export function agentEnvironment(environment, harnessEnvironment = {}) {
   delete result.CODEFLOWER_HOST_IMAGE;
   delete result.CODEFLOWER_ENGINE;
   delete result.CODEFLOWER_MOUNTS;
-  delete result.CODEFLOWER_TASK_FILE;
+  delete result.CODEFLOWER_TASK_ATTEMPT_FILE;
   delete result.CODEFLOWER_TASK_INTERACTIVE;
   delete result.CODEFLOWER_INITIAL_PROMPT_FILE;
   for (const name of CREDENTIAL_VARIABLES) {

@@ -1,11 +1,11 @@
 import { spawn } from 'node:child_process';
 import { access, readFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { terminalAuthCommand } from './agents.js';
 import { readCodexLimits } from './codex-limits.js';
 import { agentEnvironment, createRecorder, endChild } from './server.js';
-import { createSessionStore, sessionKey, writeJsonAtomically } from './sessions.js';
+import { createSessionStore, readJson, sessionKey, writeJsonAtomically } from './sessions.js';
 import { createUsage, dshTokens } from './usage.js';
 
 // A task runs the agent without VS Code: the runner is its ACP client. It
@@ -20,6 +20,14 @@ const DEFAULT_ROUNDS = 3;
 const CANCEL_GRACE_MS = 8_000;
 const STATUS_PATTERN = /TASK_STATUS:\s*(complete|incomplete|impossible)\b[\s:—–-]*(.*)/i;
 const AUTH_INITIALIZE_ID = 'task-auth-initialize';
+const METHOD_NOT_FOUND = -32601;
+const CONTINUATIONS = {
+  restart: 'Starting over: the earlier attempt stopped before it started a session',
+  interrupted: 'Continuing the session after an interruption',
+  error: 'Continuing the session after an error',
+  unmet: 'Continuing the session: the task was not done',
+  completed: 'Continuing the finished session'
+};
 
 export const STATUS_PROMPT = [
   'Before this run ends: is the task completely done?',
@@ -27,18 +35,69 @@ export const STATUS_PROMPT = [
   'TASK_STATUS: complete | incomplete | impossible — one sentence why'
 ].join('\n');
 
+const SECTION_PATTERN = /\{\{([#^])(\w+)\}\}([\s\S]*?)\{\{\/\2\}\}/g;
+
 /**
- * The task instructions for a run: {{output}} is replaced, and
- * {{#report}}…{{/report}} is kept only with a report, {{^report}}…{{/report}}
- * only without.
+ * Fills a template: {{#name}}…{{/name}} is kept only when the value is set,
+ * {{^name}}…{{/name}} only when it is not, and {{name}} is replaced by it.
+ * Values are inserted last, so their text is never read as a template.
  */
+export function renderTemplate(template, values) {
+  let text = template;
+  for (let previous; previous !== text; ) {
+    previous = text;
+    text = text.replace(SECTION_PATTERN, (_, kind, name, body) => ((kind === '#') === Boolean(values[name]) ? body : ''));
+  }
+  return text
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/\{\{(\w+)\}\}/g, (placeholder, name) => (name in values ? String(values[name] ?? '') : placeholder))
+    .trim();
+}
+
+/** The task instructions for a run, with or without the report part. */
 export function renderInstructions(template, { output, report }) {
-  return template
-    .replace(/\{\{([#^])report\}\}([\s\S]*?)\{\{\/report\}\}/g, (_, kind, body) =>
-      (kind === '#') === report ? body : ''
-    )
-    .replaceAll('{{output}}', output)
-    .replace(/\n{3,}/g, '\n\n');
+  return renderTemplate(template, { output, report });
+}
+
+/**
+ * Why a task's session is continued, from how the attempt before ended:
+ * restart when no session was ever started, interrupted when the attempt
+ * was stopped or killed before it recorded a result.
+ */
+export function continuationKind(session, previous) {
+  if (!session) return 'restart';
+  switch (previous?.status) {
+    case 'completed':
+      return 'completed';
+    case 'unmet':
+      return 'unmet';
+    case 'failed':
+    case 'not_signed_in':
+      return 'error';
+    default:
+      return 'interrupted';
+  }
+}
+
+/** The first prompt of a continued session: why it continues, the task, and the instructions again. */
+export function continuationPrompt(template, { kind, task, followUp, message, instructions }) {
+  return renderTemplate(template, {
+    interrupted: kind === 'interrupted',
+    error: kind === 'error',
+    unmet: kind === 'unmet',
+    completed: kind === 'completed',
+    followUp: followUp ?? '',
+    message: message || 'no reason was recorded.',
+    task: task.task.trim(),
+    output: task.output,
+    report: task.report,
+    instructions
+  });
+}
+
+/** What the agent is told when the time or the rounds run out. */
+export function wrapUpPrompt(template, task, reason) {
+  return renderTemplate(template, { time: reason === 'time', rounds: reason === 'rounds', output: task.output, report: task.report });
 }
 
 /** The last TASK_STATUS line of an answer, or `unknown`. */
@@ -281,18 +340,52 @@ function describeUpdate(update) {
   }
 }
 
+// The settings an attempt may change for itself.
+const ATTEMPT_SETTINGS = ['maxRounds', 'model', 'effort', 'options', 'progress'];
+
 /**
- * Runs one task to its end and returns its result; the result is also written
- * next to the task file as result.json.
+ * Reads what one attempt at a task needs from the task's folder:
+ *
+ *   tasks/<id>/task.json               the task, written once by the launcher
+ *   tasks/<id>/session.json            its session, once one was started
+ *   tasks/<id>/attempts/<n>/attempt.json   this attempt's follow-up and settings
+ *   tasks/<id>/attempts/<n>/result.json    how it ended
+ */
+export async function readAttempt(attemptFile) {
+  const directory = resolve(dirname(attemptFile), '..', '..');
+  const attempt = JSON.parse(await readFile(attemptFile, 'utf8'));
+  if (!Number.isInteger(attempt.attempt) || attempt.attempt < 1) {
+    throw new Error(`${attemptFile} has no attempt number`);
+  }
+  const task = JSON.parse(await readFile(join(directory, 'task.json'), 'utf8'));
+  for (const key of ATTEMPT_SETTINGS) {
+    if (attempt[key] !== undefined && attempt[key] !== '') task[key] = attempt[key];
+  }
+  const previous =
+    attempt.attempt > 1 ? await readJson(join(directory, 'attempts', String(attempt.attempt - 1), 'result.json')) : undefined;
+  return {
+    task,
+    attempt,
+    sessionFile: join(directory, 'session.json'),
+    session: await readJson(join(directory, 'session.json')),
+    previous,
+    resultFile: join(dirname(attemptFile), 'result.json')
+  };
+}
+
+/**
+ * Runs one attempt at a task to its end and returns its result; the result is
+ * also written next to the attempt file as result.json. The first attempt
+ * starts a session; later ones continue it, or start it when none was.
  */
 export async function runTask({
   agentName,
   agent,
-  taskFile,
+  attemptFile,
   sessionsDirectory,
   instanceId,
   workspace,
-  instructionsTemplate,
+  templates,
   environment = process.env,
   signal,
   out = process.stdout,
@@ -302,7 +395,9 @@ export async function runTask({
   ptyHelper,
   log = (message) => process.stderr.write(`${message}\n`)
 }) {
-  const task = JSON.parse(await readFile(taskFile, 'utf8'));
+  const { task, attempt, sessionFile, session: saved, previous, resultFile } = await readAttempt(attemptFile);
+  const followUp = typeof attempt.followUp === 'string' && attempt.followUp.trim() ? attempt.followUp.trim() : undefined;
+  const kind = attempt.attempt > 1 ? continuationKind(saved, previous) : undefined;
   const attached = task.progress === 'json';
   const progressEvent = (type, fields = {}) => {
     if (attached) out.write(`${JSON.stringify({ codeflowerTask: true, type, ...fields })}\n`);
@@ -317,9 +412,15 @@ export async function runTask({
     return account;
   };
   const reportUsage = () => progressEvent('stats', { usage: usageSnapshot() });
-  const resultFile = join(dirname(taskFile), 'result.json');
   const startedAt = new Date().toISOString();
-  const result = { status: 'failed', agent: agentName, startedAt, rounds: 0 };
+  const result = {
+    status: 'failed',
+    agent: agentName,
+    attempt: attempt.attempt,
+    ...(kind ? { continuation: { kind, followUp: Boolean(followUp) } } : {}),
+    startedAt,
+    rounds: 0
+  };
   const finish = async (fields) => {
     Object.assign(result, fields, { usage: usageSnapshot(), endedAt: new Date().toISOString() });
     await writeJsonAtomically(resultFile, result);
@@ -381,7 +482,7 @@ export async function runTask({
     }
   }
 
-  const instructions = renderInstructions(instructionsTemplate, task);
+  const instructions = renderInstructions(templates.instructions, task);
   const store = createSessionStore({ directory: sessionsDirectory, instanceId, harness: agentName, log });
   const recorder = createRecorder(store, log);
   const command = await agent.command();
@@ -472,13 +573,16 @@ export async function runTask({
     return undefined;
   };
 
+  // A loaded session's history comes back as updates: it is recorded already.
+  let replaying = false;
   const fromAgent = (message) => {
+    if (replaying && message.method === 'session/update') return;
     recorder.fromAgent(message);
     if (message.method === undefined) {
       const pending = calls.get(message.id);
       if (!pending) return;
       calls.delete(message.id);
-      if (message.error) pending.reject(new Error(message.error.message ?? 'ACP error'));
+      if (message.error) pending.reject(Object.assign(new Error(message.error.message ?? 'ACP error'), { code: message.error.code }));
       else pending.resolve(message.result);
       return;
     }
@@ -537,8 +641,10 @@ export async function runTask({
     }
   });
 
-  // Runs one turn. A cancel asks the agent to stop and waits a little for the
-  // turn's end, so the transcript records it.
+
+  // Runs one turn. A cancel, by the signal or for the wrap-up, asks the agent
+  // to stop and waits a little for the turn's end, so the transcript records it.
+  let interruptTurn;
   const prompt = async (text, phase) => {
     turnText = '';
     if (signal?.aborted) return { stopReason: 'cancelled', text: '' };
@@ -549,16 +655,17 @@ export async function runTask({
     }
     const turn = call('session/prompt', { sessionId, prompt: [{ type: 'text', text }] });
     let timer;
-    let onAbort;
-    const cancelled = new Promise((resolve) => {
-      onAbort = () => {
+    const stopped = new Promise((resolve) => {
+      interruptTurn = () => {
+        interruptTurn = undefined;
         write({ jsonrpc: '2.0', method: 'session/cancel', params: { sessionId } });
         timer = setTimeout(resolve, CANCEL_GRACE_MS, { stopReason: 'cancelled' });
       };
     });
+    const onAbort = () => interruptTurn?.();
     signal?.addEventListener('abort', onAbort, { once: true });
     try {
-      const done = await Promise.race([turn, cancelled]);
+      const done = await Promise.race([turn, stopped]);
       if (done && done.stopReason !== 'cancelled') {
         usage.turnEnded(sessionId, done);
         reportUsage();
@@ -566,22 +673,72 @@ export async function runTask({
       }
       return { stopReason: done?.stopReason ?? null, text: turnText };
     } finally {
+      interruptTurn = undefined;
       clearTimeout(timer);
       signal?.removeEventListener('abort', onAbort);
       writeProgress('\n');
     }
   };
 
+  // Set when the run is wrapping up: its time is almost up, or its rounds are.
+  let wrapUp;
+  let wrapUpTimer;
   let settled;
   const settle = (fields) => (settled ??= close(fields));
   const close = async (fields) => {
+    clearTimeout(wrapUpTimer);
     await limitsReading;
     await recorder.flush().catch(() => {});
     await recorder.closeAll();
     await recorder.flush().catch(() => {});
     endChild(child);
     if (sessionId) fields.sessionKey = sessionKey(agentName, sessionId);
+    if (wrapUp) fields.wrapUp = wrapUp;
     return finish(fields);
+  };
+  const cancelled = (stopReason) => settle({ status: 'cancelled', ...(stopReason ? { stopReason } : {}) });
+
+  // Asks the agent whether the task is done and checks its report. The report
+  // is also checked on the last turn, to say how far it got.
+  const evaluate = async (last) => {
+    const check = await prompt(STATUS_PROMPT, 'Checking completion');
+    if (signal?.aborted || check.stopReason === 'cancelled') return { cancelled: true, stopReason: check.stopReason };
+    let { status, reason } = parseStatus(check.text);
+    const report = task.report ? { path: reportPath(task), exists: await exists(reportPath(task)) } : undefined;
+    if (status === 'complete' && report && !report.exists) {
+      status = 'incomplete';
+      reason = `there is no report at ${report.path}`;
+    }
+    if (report?.exists && (status === 'complete' || status === 'impossible' || last)) {
+      const checked = await checkReport(report.path, environment);
+      Object.assign(report, { checked: checked.ok, check: checked.output });
+      if (status === 'complete' && !checked.ok) {
+        status = 'incomplete';
+        reason = `storyteller check failed${checked.output ? `: ${checked.output}` : ''}`;
+      }
+    }
+    return { status, reason, report };
+  };
+
+  // The last turn of a run that has to stop: the agent writes up what there is.
+  const wrapUpAndSettle = async (reason) => {
+    wrapUp ??= { reason, at: new Date().toISOString() };
+    if (attached) progressEvent('wrap-up', { reason: wrapUp.reason });
+    else out.write(`\n━━ wrapping up: ${wrapUp.reason === 'time' ? 'the time is almost up' : 'out of rounds'}\n`);
+    const work = await prompt(wrapUpPrompt(templates.wrapUp, task, wrapUp.reason), 'Wrapping up');
+    if (signal?.aborted || work.stopReason === 'cancelled') return await cancelled(work.stopReason);
+    if (work.stopReason !== 'end_turn') {
+      return await settle({ status: 'failed', stopReason: work.stopReason, message: `The agent stopped: ${work.stopReason}` });
+    }
+    const outcome = await evaluate(true);
+    if (outcome.cancelled) return await cancelled(outcome.stopReason);
+    const limit = wrapUp.reason === 'time' ? 'The time limit was near' : `Still not done after ${result.rounds} rounds`;
+    return await settle({
+      status: outcome.status === 'complete' ? 'completed' : 'unmet',
+      stopReason: work.stopReason,
+      message: outcome.status === 'complete' ? outcome.reason : `${limit}; wrapped up: ${outcome.reason}`,
+      ...(outcome.report ? { report: outcome.report } : {})
+    });
   };
 
   try {
@@ -593,13 +750,64 @@ export async function runTask({
     const systemPrompt = Boolean(initialized?.agentCapabilities?.sessionCapabilities?.systemPrompt);
     const authKind = await agent.authKind?.();
     usage.guessAuth(authKind);
-    const session = await call('session/new', {
-      cwd: workspace,
-      mcpServers: [],
-      ...(agent.sessionMeta ? { _meta: agent.sessionMeta } : {}),
-      ...(systemPrompt ? { systemPrompt: { mode: 'append', content: [{ type: 'text', text: instructions }] } } : {})
-    });
-    sessionId = session.sessionId;
+
+    let session;
+    if (saved) {
+      // A later attempt: the same session, never a new one in its place.
+      if (saved.agent !== agentName) {
+        return await settle({ status: 'failed', message: `The task's session belongs to ${saved.agent}, not ${agentName}.` });
+      }
+      const holder = await store.foreignLease(saved.nativeSessionId);
+      if (holder) {
+        return await settle({
+          status: 'failed',
+          message: `The task's session is open on another worker (${holder.instanceId}). Close its chat in VS Code, or wait for the other run to end, then continue the task again.`
+        });
+      }
+      sessionId = saved.nativeSessionId;
+      const params = {
+        sessionId,
+        cwd: saved.cwd ?? workspace,
+        mcpServers: [],
+        ...(agent.sessionMeta ? { _meta: agent.sessionMeta } : {})
+      };
+      replaying = true;
+      try {
+        try {
+          session = await call('session/resume', params);
+        } catch (error) {
+          if (error.code !== METHOD_NOT_FOUND) throw error;
+          session = await call('session/load', params);
+        }
+      } catch (error) {
+        return await settle({ status: 'failed', message: `${agent.label} could not continue the task's session: ${error.message}` });
+      } finally {
+        replaying = false;
+      }
+      session ??= {};
+    } else {
+      session = await call('session/new', {
+        cwd: workspace,
+        mcpServers: [],
+        ...(agent.sessionMeta ? { _meta: agent.sessionMeta } : {}),
+        ...(systemPrompt ? { systemPrompt: { mode: 'append', content: [{ type: 'text', text: instructions }] } } : {})
+      });
+      sessionId = session.sessionId;
+      // Before any work: a later attempt continues this session, and without
+      // this file knows that no work was asked for.
+      try {
+        await writeJsonAtomically(sessionFile, {
+          agent: agentName,
+          nativeSessionId: sessionId,
+          sessionKey: sessionKey(agentName, sessionId),
+          cwd: workspace,
+          attempt: attempt.attempt,
+          createdAt: new Date().toISOString()
+        });
+      } catch (error) {
+        return await settle({ status: 'failed', message: `Could not record the task's session: ${error.message}` });
+      }
+    }
     usage.opened(sessionId);
     applyPendingUsageReports();
     reportUsage();
@@ -636,42 +844,53 @@ export async function runTask({
     if (attached) progressEvent('settings', { settings: result.settings });
     else if (described) out.write(`${described}\n`);
 
-    const first = firstPrompt(task, { goal: agent.goal, instructions, systemPrompt });
-    if (agent.goal && !first.goal) log('The task is too long for a goal; it runs as a plain prompt.');
+    // A continued session is told why it continues; later rounds go back to the
+    // goal, which is the follow-up when there is one.
+    let first;
+    let next;
+    if (saved) {
+      first = firstPrompt(followUp ? { ...task, task: followUp } : task, { goal: agent.goal, instructions, systemPrompt: true });
+      next = continuationPrompt(templates.continue, { kind, task, followUp, message: previous?.message, instructions });
+    } else {
+      const asked = followUp ? { ...task, task: `${task.task.trim()}\n\n# Follow-up request from the user\n\n${followUp}` } : task;
+      first = firstPrompt(asked, { goal: agent.goal, instructions, systemPrompt });
+      next = first.text;
+      if (agent.goal && !first.goal) log('The task is too long for a goal; it runs as a plain prompt.');
+    }
+    if (kind) {
+      if (attached) progressEvent('continuation', { kind, followUp: Boolean(followUp) });
+      else out.write(`${CONTINUATIONS[kind]}${followUp ? ', with a follow-up' : ''}\n`);
+    }
+
+    const wrapUpAt = Date.parse(attempt.wrapUpAt ?? '');
+    if (Number.isFinite(wrapUpAt)) {
+      wrapUpTimer = setTimeout(() => {
+        if (wrapUp) return;
+        wrapUp = { reason: 'time', at: new Date().toISOString() };
+        interruptTurn?.();
+      }, Math.max(0, wrapUpAt - Date.now()));
+    }
+
     const rounds = Number.isInteger(task.maxRounds) && task.maxRounds > 0 ? task.maxRounds : DEFAULT_ROUNDS;
-    let next = first.text;
     for (let round = 1; ; round += 1) {
+      if (wrapUp) return await wrapUpAndSettle();
       result.rounds = round;
       const work = await prompt(next, `Round ${round}/${rounds} · working`);
-      if (signal?.aborted || work.stopReason === 'cancelled') return await settle({ status: 'cancelled', stopReason: work.stopReason });
+      if (signal?.aborted) return await cancelled(work.stopReason);
+      if (work.stopReason === 'cancelled') return await (wrapUp ? wrapUpAndSettle() : cancelled(work.stopReason));
       if (work.stopReason !== 'end_turn') {
         return await settle({ status: 'failed', stopReason: work.stopReason, message: `The agent stopped: ${work.stopReason}` });
       }
 
-      const check = await prompt(STATUS_PROMPT, 'Checking completion');
-      if (signal?.aborted || check.stopReason === 'cancelled') return await settle({ status: 'cancelled', stopReason: check.stopReason });
-      let { status, reason } = parseStatus(check.text);
-      const report = task.report ? { path: reportPath(task), exists: await exists(reportPath(task)) } : undefined;
-      if (status === 'complete' && report && !report.exists) {
-        status = 'incomplete';
-        reason = `there is no report at ${report.path}`;
+      const outcome = await evaluate(round >= rounds);
+      if (signal?.aborted) return await cancelled(outcome.stopReason);
+      if (outcome.cancelled) return await (wrapUp ? wrapUpAndSettle() : cancelled(outcome.stopReason));
+      const { status, reason, report } = outcome;
+      if (status === 'complete' || status === 'impossible') {
+        return await settle({ status: status === 'complete' ? 'completed' : 'unmet', stopReason: work.stopReason, message: reason, ...(report ? { report } : {}) });
       }
-      if (report?.exists && (status === 'complete' || status === 'impossible' || round >= rounds)) {
-        const checked = await checkReport(report.path, environment);
-        Object.assign(report, { checked: checked.ok, check: checked.output });
-        if (status === 'complete' && !checked.ok) {
-          status = 'incomplete';
-          reason = `storyteller check failed${checked.output ? `: ${checked.output}` : ''}`;
-        }
-      }
-      if (status === 'complete' || status === 'impossible' || round >= rounds) {
-        return await settle({
-          status: status === 'complete' ? 'completed' : 'unmet',
-          stopReason: work.stopReason,
-          message: status === 'complete' || status === 'impossible' ? reason : `Still not done after ${round} rounds: ${reason}`,
-          ...(report ? { report } : {})
-        });
-      }
+      if (round >= rounds) return await wrapUpAndSettle('rounds');
+      if (wrapUp) return await wrapUpAndSettle();
       if (attached) progressEvent('round', { round: round + 1, maxRounds: rounds, reason });
       else out.write(`\n━━ not done yet (${reason}); round ${round + 1} of ${rounds}\n`);
       next = continuePrompt(first, reason);

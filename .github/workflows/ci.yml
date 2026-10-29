@@ -98,6 +98,7 @@ jobs:
             CODEFLOWER_AGENT=codex CODEFLOWER_MOUNTS="[]" codeflower-doctor --write-startup /tmp/environment.md
             CODEFLOWER_ENVIRONMENT_FILE=/tmp/environment.md codeflower-doctor
             test -f /opt/codeflower/acp-ws/src/server.js
+            test -f /opt/codeflower/templates/TASK.md -a -f /opt/codeflower/templates/task/continue.md -a -f /opt/codeflower/templates/task/wrap-up.md
             test -f /opt/codeflower/src/storyteller/skill/SKILL.md
             export PYTHONPATH=/opt/codeflower/src/storyteller/src
             python -c "import storyteller as sty; r = sty.Report(\"Smoke\", \"/tmp/smoke.html\"); r.text(\"ok\", key=\"t\"); r.save()"

@@ -5,7 +5,7 @@ import { connectionUrl, startBridge } from './server.js';
 import { EXIT_CODES, runTask } from './task.js';
 
 const RUNTIME_MODULES = '/opt/codeflower/runtime/node_modules';
-const TASK_TEMPLATE = '/opt/codeflower/templates/TASK.md';
+const TEMPLATES = '/opt/codeflower/templates';
 const DSH_USAGE_PATCH = '/opt/codeflower/dsh-usage/cordis.patch.yml';
 const INITIAL_PROMPT_FILE = process.env.CODEFLOWER_INITIAL_PROMPT_FILE;
 
@@ -71,9 +71,9 @@ const egress = process.env.CODEFLOWER_EGRESS_SOCKET
   : undefined;
 
 // `codeflower task`: the agent works on its task by itself, without VS Code.
-if (process.env.CODEFLOWER_TASK_FILE) {
+if (process.env.CODEFLOWER_TASK_ATTEMPT_FILE) {
   if (INITIAL_PROMPT_FILE) {
-    throw new Error('CODEFLOWER_TASK_FILE and CODEFLOWER_INITIAL_PROMPT_FILE cannot be used together');
+    throw new Error('CODEFLOWER_TASK_ATTEMPT_FILE and CODEFLOWER_INITIAL_PROMPT_FILE cannot be used together');
   }
   const aborting = new AbortController();
   process.once('SIGINT', () => aborting.abort());
@@ -81,11 +81,15 @@ if (process.env.CODEFLOWER_TASK_FILE) {
   const result = await runTask({
     agentName,
     agent: agents[agentName],
-    taskFile: process.env.CODEFLOWER_TASK_FILE,
+    attemptFile: process.env.CODEFLOWER_TASK_ATTEMPT_FILE,
     sessionsDirectory: requiredEnvironment('CODEFLOWER_SESSIONS_DIR'),
     instanceId: requiredEnvironment('CODEFLOWER_INSTANCE_ID'),
     workspace: requiredEnvironment('CODEFLOWER_WORKSPACE'),
-    instructionsTemplate: await readFile(TASK_TEMPLATE, 'utf8'),
+    templates: {
+      instructions: await readFile(`${TEMPLATES}/TASK.md`, 'utf8'),
+      continue: await readFile(`${TEMPLATES}/task/continue.md`, 'utf8'),
+      wrapUp: await readFile(`${TEMPLATES}/task/wrap-up.md`, 'utf8')
+    },
     signal: aborting.signal,
     interactive: process.env.CODEFLOWER_TASK_INTERACTIVE === '1',
     ptyHelper: ['/opt/conda/bin/python3', '/opt/codeflower/bin/codeflower-pty'],

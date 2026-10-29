@@ -8,7 +8,9 @@ and DeepSeek Harness), and the bridge that connects it to VS Code.
 - `bin/`: `codeflower-show`, `codeflower-pty`, `codeflower-env-export`, `codeflower-network`,
   `codeflower-doctor` for per-worker environment facts and live diagnostics, and
   `codeflower-inventory`, which describes the mounted data (formats, shapes, columns)
-- `templates/`: the agent instructions copied into a new workspace
+- `templates/`: the agent instructions copied into a new workspace, and those of `codeflower task`:
+  `TASK.md` for every run, `task/continue.md` when a task is continued, `task/wrap-up.md` when its
+  time or rounds run out
 - `dsh-plugins/acp-ws/`: the authenticated ACP WebSocket bridge, session recorder, and sign-in relay
 
 Releases are published as `ghcr.io/lutrarutra/codeflower-sandbox` for linux/amd64 and linux/arm64,

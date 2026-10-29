@@ -408,10 +408,31 @@ input.on('line', async (line) => {
       break;
     }
     case 'session/resume':
+      if (process.argv.includes('--no-resume')) {
+        send({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'Method not found' } });
+        break;
+      }
+      if (process.argv.includes('--resume-fails')) {
+        send({ jsonrpc: '2.0', id: message.id, error: { code: -32002, message: 'Session not found' } });
+        break;
+      }
       costs.delete(message.params?.sessionId);
       sessionMeta.set(message.params?.sessionId, message.params?._meta ?? null);
+      if (!tasks.has(message.params?.sessionId)) tasks.set(message.params?.sessionId, { systemPrompt: null });
       send({ jsonrpc: '2.0', id: message.id, result: {} });
       break;
+    case 'session/load': {
+      // Like agents without session/resume: the history comes back first.
+      const { sessionId } = message.params;
+      if (!tasks.has(sessionId)) tasks.set(sessionId, { systemPrompt: null });
+      send({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: { sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'replayed history' } } }
+      });
+      send({ jsonrpc: '2.0', id: message.id, result: {} });
+      break;
+    }
     default:
       if (message.id !== undefined) {
         send({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'Method not found' } });

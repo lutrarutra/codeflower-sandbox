@@ -2,14 +2,29 @@ import assert from 'node:assert/strict';
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
-import { findChoice, firstPrompt, parseStatus, renderInstructions, requestedSettings, runTask } from '../src/task.js';
+import {
+  continuationKind,
+  continuationPrompt,
+  findChoice,
+  firstPrompt,
+  parseStatus,
+  renderInstructions,
+  requestedSettings,
+  runTask
+} from '../src/task.js';
 
 const fakeAgent = fileURLToPath(new URL('../fixtures/fake-acp.js', import.meta.url));
 const fakePty = fileURLToPath(new URL('../fixtures/fake-pty.js', import.meta.url));
 const template = 'Headless.{{#report}} Report to {{output}}/report.html.{{/report}}{{^report}} No report.{{/report}}';
+const templateDirectory = fileURLToPath(new URL('../../../templates/task/', import.meta.url));
+const templates = {
+  instructions: template,
+  continue: await readFile(join(templateDirectory, 'continue.md'), 'utf8'),
+  wrapUp: await readFile(join(templateDirectory, 'wrap-up.md'), 'utf8')
+};
 
 function fakeAgentDefinition(options = {}) {
   const { signedIn = true, args = [], usageFd } = options;
@@ -35,21 +50,23 @@ async function setup(t, task, checkExit = 0) {
   const taskDirectory = join(root, 'tasks', 'one');
   await mkdir(taskDirectory, { recursive: true });
   await mkdir(join(root, 'workspace'));
+  await mkdir(join(root, 'claude-home'));
   // A stand-in for the venv's storyteller command.
   const venv = join(root, 'venv');
   await mkdir(join(venv, 'bin'), { recursive: true });
   await writeFile(join(venv, 'bin', 'storyteller'), `#!/bin/sh\necho "checked $2"\nexit ${checkExit}\n`);
   await chmod(join(venv, 'bin', 'storyteller'), 0o755);
-  const taskFile = join(taskDirectory, 'task.json');
-  await writeFile(taskFile, JSON.stringify({ output, report: true, maxRounds: 2, ...task }));
-  return { root, output, taskFile, venv };
+  await writeFile(join(taskDirectory, 'task.json'), JSON.stringify({ output, report: true, maxRounds: 2, ...task }));
+  return { root, output, taskDirectory, venv };
 }
 
-async function run(t, task, agentOptions, extra = {}) {
-  const { checkExit = 0, ...runOptions } = extra;
-  const context = await setup(t, task, checkExit);
+// Runs attempt `number` (default 1) at the task of `context`.
+async function attempt(context, agentOptions, extra = {}) {
+  const { number = 1, attempt: fields = {}, ...runOptions } = extra;
+  const attemptFile = join(context.taskDirectory, 'attempts', String(number), 'attempt.json');
+  await mkdir(dirname(attemptFile), { recursive: true });
+  await writeFile(attemptFile, JSON.stringify({ attempt: number, ...fields }));
   const claudeHome = join(context.root, 'claude-home');
-  await mkdir(claudeHome);
   const signedIn =
     agentOptions?.signedIn === 'login-file'
       ? async () => {
@@ -66,20 +83,25 @@ async function run(t, task, agentOptions, extra = {}) {
   const result = await runTask({
     agentName: 'claude',
     agent: fakeAgentDefinition({ ...agentOptions, signedIn }),
-    taskFile: context.taskFile,
+    attemptFile,
     sessionsDirectory: join(context.root, 'sessions'),
     instanceId: 'instance-1',
     workspace: join(context.root, 'workspace'),
-    instructionsTemplate: template,
+    templates,
     environment: { ...process.env, CLAUDE_CONFIG_DIR: claudeHome, VIRTUAL_ENV: context.venv },
     out: { write: (text) => (printed += text) },
     authOut: { write: (text) => (authOutput += text) },
     log: () => {},
     ...runOptions
   });
-  const written = JSON.parse(await readFile(join(context.root, 'tasks', 'one', 'result.json'), 'utf8'));
+  const written = JSON.parse(await readFile(join(dirname(attemptFile), 'result.json'), 'utf8'));
   assert.deepEqual(written, result);
   return { ...context, result, printed, authOutput };
+}
+
+async function run(t, task, agentOptions, extra = {}) {
+  const { checkExit = 0, ...rest } = extra;
+  return attempt(await setup(t, task, checkExit), agentOptions, rest);
 }
 
 async function transcript(root, key) {
@@ -179,15 +201,34 @@ test('an agent without a system prompt gets the instructions in its first prompt
   assert.equal(entries[0].prompt[0].text, 'Headless. No report.\n\n# The task\n\ntask: cluster');
 });
 
-test('a task that stays unfinished ends unmet after its rounds', async (t) => {
+test('a task that stays unfinished wraps up and ends unmet after its rounds', async (t) => {
   const { root, result } = await run(t, { task: 'task: never done' });
   assert.equal(result.status, 'unmet');
   assert.equal(result.rounds, 2);
-  assert.match(result.message, /after 2 rounds: more to do/);
+  assert.equal(result.wrapUp.reason, 'rounds');
+  assert.match(result.message, /after 2 rounds; wrapped up: more to do/);
   const prompts = (await transcript(root, result.sessionKey)).filter((entry) => entry.kind === 'prompt');
-  // Goal, status check, goal again, status check.
-  assert.equal(prompts.length, 4);
+  // Goal, status check, goal again, status check, wrap-up, status check.
+  assert.equal(prompts.length, 6);
   assert.equal(prompts[2].prompt[0].text, prompts[0].prompt[0].text);
+  assert.match(prompts[4].prompt[0].text, /^This run is out of rounds\. Do not start new work/);
+  assert.match(prompts[4].prompt[0].text, /storyteller check reports\/task\.html/);
+});
+
+test('a task whose time is almost up is cut short and wraps up', async (t) => {
+  const { root, result, printed } = await run(t, { task: 'task: hang, never done', report: false }, undefined, {
+    attempt: { wrapUpAt: new Date(Date.now() + 300).toISOString() }
+  });
+  assert.equal(result.status, 'unmet');
+  assert.equal(result.rounds, 1);
+  assert.equal(result.wrapUp.reason, 'time');
+  assert.match(result.message, /^The time limit was near; wrapped up: more to do/);
+  assert.match(printed, /wrapping up: the time is almost up/);
+  const entries = await transcript(root, result.sessionKey);
+  assert.equal(entries.find((entry) => entry.kind === 'turn_end').stopReason, 'cancelled');
+  const prompts = entries.filter((entry) => entry.kind === 'prompt').map((entry) => entry.prompt[0].text);
+  assert.match(prompts[1], /^This run's time is almost up\./);
+  assert.match(prompts[1], /README\.md/);
 });
 
 test('a missing report keeps the task going', async (t) => {
@@ -292,4 +333,116 @@ test('a setting the agent does not offer stops the task before any prompt', asyn
   assert.equal(missing.result.message, '--model: Fake has no model choice');
   const unknown = await run(t, { task: 'task: x', options: { turbo: 'on' } });
   assert.equal(unknown.result.message, '--option turbo: Fake has no setting turbo (it has mode, effort)');
+});
+
+test('a continuation says why the session continues', () => {
+  const task = { task: 'task: cluster', output: '/data/output/x', report: true };
+  const render = (kind, extra = {}) => continuationPrompt(templates.continue, { kind, task, instructions: 'Headless.', ...extra });
+  assert.equal(continuationKind(undefined, { status: 'completed' }), 'restart');
+  assert.equal(continuationKind({}, undefined), 'interrupted');
+  assert.equal(continuationKind({}, { status: 'cancelled' }), 'interrupted');
+  assert.equal(continuationKind({}, { status: 'not_signed_in' }), 'error');
+  assert.equal(continuationKind({}, { status: 'unmet' }), 'unmet');
+  assert.equal(continuationKind({}, { status: 'completed' }), 'completed');
+
+  assert.match(render('interrupted'), /was interrupted before it finished/);
+  assert.match(render('error', { message: 'Usage limit reached.' }), /because of an error: Usage limit reached\./);
+  assert.match(render('unmet', { message: 'Still not done after 3 rounds.' }), /before the task was done: Still not done after 3 rounds\./);
+  assert.match(render('completed'), /go over it again: check the results and the report/);
+  const followUp = render('completed', { followUp: 'Also {{plot}} the genes' });
+  assert.match(followUp, /# Follow-up request from the user\n\nAlso \{\{plot\}\} the genes/);
+  assert.doesNotMatch(followUp, /go over it again/);
+  for (const text of [render('interrupted'), followUp]) {
+    assert.match(text, /# The original task\n\ntask: cluster/);
+    assert.match(text, /report of the work is at \/data\/output\/x\/report\.html/);
+    assert.match(text, /\(repeated\)\n\nHeadless\.$/);
+    assert.doesNotMatch(text.replace('{{plot}}', ''), /\{\{/);
+  }
+});
+
+test('a task records its session before it works, and a later attempt continues it', async (t) => {
+  const context = await setup(t, { task: 'task: cluster the cells' });
+  const first = await attempt(context);
+  assert.equal(first.result.status, 'completed');
+  assert.equal(first.result.attempt, 1);
+  const sessionFile = join(context.taskDirectory, 'session.json');
+  const saved = JSON.parse(await readFile(sessionFile, 'utf8'));
+  assert.equal(saved.nativeSessionId, 'session-1');
+  assert.equal(saved.sessionKey, first.result.sessionKey);
+  assert.equal((await stat(sessionFile)).mode & 0o777, 0o600);
+
+  // Killed before it recorded a result: the next attempt continues the session.
+  await rm(join(context.taskDirectory, 'attempts', '1', 'result.json'));
+  const second = await attempt(context, undefined, { number: 2 });
+  assert.equal(second.result.status, 'completed');
+  assert.equal(second.result.attempt, 2);
+  assert.equal(second.result.rounds, 1);
+  assert.equal(second.result.sessionKey, first.result.sessionKey);
+  assert.deepEqual(second.result.continuation, { kind: 'interrupted', followUp: false });
+  assert.match(second.printed, /Continuing the session after an interruption/);
+
+  const prompts = (await transcript(context.root, first.result.sessionKey)).filter((entry) => entry.kind === 'prompt');
+  assert.equal(prompts.length, 4);
+  assert.match(prompts[2].prompt[0].text, /^This `codeflower task` run continues/);
+  assert.match(prompts[2].prompt[0].text, /interrupted/);
+  assert.match(prompts[2].prompt[0].text, /task: cluster the cells/);
+});
+
+test('a finished task takes a follow-up, which later rounds have as their goal', async (t) => {
+  const context = await setup(t, { task: 'task: cluster the cells' });
+  await attempt(context);
+  const { result } = await attempt(context, undefined, {
+    number: 2,
+    attempt: { followUp: 'task: also plot the genes, never done', maxRounds: 2 }
+  });
+  assert.equal(result.status, 'unmet');
+  assert.equal(result.rounds, 2);
+  assert.deepEqual(result.continuation, { kind: 'completed', followUp: true });
+  const prompts = (await transcript(context.root, result.sessionKey)).filter((entry) => entry.kind === 'prompt');
+  assert.match(prompts[2].prompt[0].text, /# Follow-up request from the user\n\ntask: also plot the genes, never done/);
+  assert.match(prompts[4].prompt[0].text, /^\/goal task: also plot the genes, never done\n\nDone only when/);
+});
+
+test('session/load continues a session when the agent has no session/resume, without recording its replay', async (t) => {
+  const context = await setup(t, { task: 'task: cluster the cells' });
+  await attempt(context, { args: ['--no-resume'] });
+  const { result } = await attempt(context, { args: ['--no-resume'] }, { number: 2 });
+  assert.equal(result.status, 'completed');
+  assert.equal(result.sessionKey, 'claude-session-1');
+  const entries = await transcript(context.root, result.sessionKey);
+  assert.doesNotMatch(agentText(entries), /replayed history/);
+});
+
+test('a session that cannot be continued fails the attempt instead of starting another', async (t) => {
+  const context = await setup(t, { task: 'task: cluster the cells' });
+  await attempt(context);
+  const { result } = await attempt(context, { args: ['--resume-fails'] }, { number: 2 });
+  assert.equal(result.status, 'failed');
+  assert.match(result.message, /could not continue the task's session: Session not found/);
+  assert.equal(result.sessionKey, 'claude-session-1');
+  assert.deepEqual(await readdir(join(context.root, 'sessions')), ['claude-session-1']);
+});
+
+test('a session open on another worker is not continued', async (t) => {
+  const context = await setup(t, { task: 'task: cluster the cells' });
+  await attempt(context);
+  await writeFile(
+    join(context.root, 'sessions', 'claude-session-1', 'lease.json'),
+    JSON.stringify({ instanceId: 'vscode-worker', heartbeatAt: new Date().toISOString() })
+  );
+  const { result } = await attempt(context, undefined, { number: 2 });
+  assert.equal(result.status, 'failed');
+  assert.match(result.message, /open on another worker \(vscode-worker\)/);
+});
+
+test('an attempt after one that never started a session starts over', async (t) => {
+  const context = await setup(t, { task: 'task: cluster the cells' });
+  const first = await attempt(context, { signedIn: false });
+  assert.equal(first.result.status, 'not_signed_in');
+  const { result, printed } = await attempt(context, undefined, { number: 2 });
+  assert.equal(result.status, 'completed');
+  assert.deepEqual(result.continuation, { kind: 'restart', followUp: false });
+  assert.match(printed, /Starting over/);
+  const prompts = (await transcript(context.root, result.sessionKey)).filter((entry) => entry.kind === 'prompt');
+  assert.match(prompts[0].prompt[0].text, /^\/goal task: cluster the cells/);
 });

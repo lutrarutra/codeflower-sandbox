@@ -38,7 +38,7 @@ export async function writeJsonAtomically(file, value) {
   }
 }
 
-async function readJson(file) {
+export async function readJson(file) {
   try {
     return JSON.parse(await readFile(file, 'utf8'));
   } catch (error) {
