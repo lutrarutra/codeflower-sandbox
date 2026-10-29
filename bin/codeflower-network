@@ -1,0 +1,73 @@
+#!/usr/local/bin/node --no-warnings
+// Tells the agent what a network-isolated sandbox may reach. The launcher,
+// outside the sandbox, is its only way out and checks every host against the
+// user's allowlist file; only the user can change that file.
+import { createConnection } from 'node:net';
+
+const usage = `Usage: codeflower-network [check HOST[:PORT]]
+
+Without arguments, lists the hosts this sandbox may reach and the file on the
+user's computer that allows more. "check" tries to reach HOST (port 443 unless
+given) and says whether the launcher allows it.`;
+
+const PROXY = { host: '127.0.0.1', port: 3128 };
+
+// One request to the launcher's proxy; resolves with the status and body.
+function ask(request) {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection(PROXY);
+    let data = '';
+    const finish = () => {
+      socket.destroy();
+      const [head, ...body] = data.split('\r\n\r\n');
+      const status = Number(head.split(' ')[1]);
+      if (!status) reject(new Error('the launcher did not answer'));
+      else resolve({ status, body: body.join('\r\n\r\n').trim() });
+    };
+    socket.setTimeout(30_000, () => reject(new Error('the launcher did not answer in time')));
+    socket.on('connect', () => socket.write(request));
+    socket.on('data', (chunk) => {
+      data += chunk;
+      // A tunnel stays open once it is established: its header is the answer.
+      if (data.startsWith('HTTP/1.1 200 Connection established')) finish();
+    });
+    socket.on('end', finish);
+    socket.on('error', reject);
+  });
+}
+
+const args = process.argv.slice(2);
+if (args.includes('-h') || args.includes('--help')) {
+  console.log(usage);
+  process.exit(0);
+}
+if (process.env.CODEFLOWER_NETWORK !== 'isolated') {
+  console.log('The network is not restricted in this sandbox.');
+  process.exit(0);
+}
+
+try {
+  if (args.length === 0) {
+    const { body } = await ask('GET /allowlist HTTP/1.1\r\nHost: codeflower\r\nConnection: close\r\n\r\n');
+    const list = JSON.parse(body);
+    console.log('The network is isolated: this sandbox reaches only these hosts, through the launcher.');
+    console.log(`\nThe agent's service (always allowed):\n  ${list.agent.join('\n  ') || '(none)'}`);
+    console.log(`\nAllowed by the user:\n  ${list.allowed.join('\n  ') || '(none)'}`);
+    console.log(`\nTo allow more, the user adds lines to this file on their computer (changes apply immediately):\n  ${list.file}`);
+  } else if (args[0] === 'check' && args[1]) {
+    const target = args[1].includes(':') ? args[1] : `${args[1]}:443`;
+    const { status, body } = await ask(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n\r\n`);
+    if (status === 200) {
+      console.log(`${target} is reachable.`);
+    } else {
+      console.log(body || `${target} is not reachable (${status}).`);
+      process.exit(1);
+    }
+  } else {
+    console.error(usage);
+    process.exit(2);
+  }
+} catch (error) {
+  console.error(`codeflower-network: ${error.message}`);
+  process.exit(1);
+}

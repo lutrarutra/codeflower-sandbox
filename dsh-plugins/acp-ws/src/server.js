@@ -93,6 +93,8 @@ export function agentEnvironment(environment, harnessEnvironment = {}) {
   delete result.CODEFLOWER_LISTEN_HOST;
   delete result.CODEFLOWER_ADVERTISE_HOST;
   delete result.CODEFLOWER_PORT;
+  delete result.CODEFLOWER_LISTEN_SOCKET;
+  delete result.CODEFLOWER_EGRESS_SOCKET;
   delete result.CODEFLOWER_LAUNCHER_PID;
   delete result.CODEFLOWER_INSTANCE_ID;
   delete result.CODEFLOWER_SLURM_JOB_ID;
@@ -325,6 +327,9 @@ export async function startBridge(options) {
   const {
     host = '0.0.0.0',
     port = 0,
+    // A network-isolated sandbox listens on a Unix socket the launcher
+    // forwards to; port is then the launcher's.
+    listenSocket,
     advertiseHost = host,
     token,
     connectionFile,
@@ -1155,10 +1160,12 @@ export async function startBridge(options) {
 
   await new Promise((resolve, reject) => {
     server.once('error', reject);
-    server.listen(port, host, () => {
+    const ready = () => {
       server.off('error', reject);
       resolve();
-    });
+    };
+    if (listenSocket) server.listen(listenSocket, ready);
+    else server.listen(port, host, ready);
   });
 
   // The agent asks the user to look at files; the client opens them.
@@ -1186,8 +1193,8 @@ export async function startBridge(options) {
     log(`codeflower-show is unavailable: ${error.message}`);
   }
 
-  const address = server.address();
-  if (!address || typeof address === 'string') {
+  const address = listenSocket ? { port } : server.address();
+  if (!address || typeof address === 'string' || !address.port) {
     clearInterval(pings);
     await new Promise((resolve) => server.close(resolve));
     throw new Error('WebSocket server did not bind to a TCP port');

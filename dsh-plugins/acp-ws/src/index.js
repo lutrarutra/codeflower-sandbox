@@ -1,4 +1,5 @@
 import { AGENT_NAMES, createAgents } from './agents.js';
+import { startEgressForwarder } from './egress.js';
 import { connectionUrl, startBridge } from './server.js';
 
 const RUNTIME_MODULES = '/opt/codeflower/runtime/node_modules';
@@ -41,9 +42,17 @@ async function describe() {
   };
 }
 
+// A network-isolated sandbox's only way out: the launcher's proxy.
+const egress = process.env.CODEFLOWER_EGRESS_SOCKET
+  ? await startEgressForwarder(process.env.CODEFLOWER_EGRESS_SOCKET).catch((error) => {
+      process.stderr.write(`The sandbox has no network: ${error.message}\n`);
+    })
+  : undefined;
+
 const bridge = await startBridge({
   host: process.env.CODEFLOWER_LISTEN_HOST ?? '0.0.0.0',
   port: Number(process.env.CODEFLOWER_PORT ?? 0),
+  listenSocket: process.env.CODEFLOWER_LISTEN_SOCKET || undefined,
   advertiseHost: requiredEnvironment('CODEFLOWER_ADVERTISE_HOST'),
   token: requiredEnvironment('CODEFLOWER_TOKEN'),
   connectionFile: requiredEnvironment('CODEFLOWER_CONNECTION_FILE'),
@@ -73,6 +82,7 @@ process.stderr.write(
 
 let stopping;
 const stop = () => {
+  egress?.close();
   stopping ??= bridge.close().catch((error) => {
     process.stderr.write(`Could not stop ACP WebSocket bridge: ${error.message}\n`);
     process.exitCode = 1;

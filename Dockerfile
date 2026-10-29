@@ -41,10 +41,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY entrypoint.sh /opt/codeflower/entrypoint.sh
 COPY bin /opt/codeflower/bin
 COPY templates /opt/codeflower/templates
+COPY skills /opt/codeflower/skills
 
 # Bind targets must exist in the image on Apptainer installs without underlay.
-# The user's folders are mounted one level below /data/{input,output,code},
+# The user's folders are mounted one level below /data/{input,output,code,skills},
 # which such installs cannot create: they need underlay (Apptainer's default).
-RUN mkdir -p /codeflower-state /data/input /data/output /data/code
+RUN mkdir -p /codeflower-state /codeflower-net /data/input /data/output /data/code /data/skills
 
 ENTRYPOINT ["/opt/codeflower/entrypoint.sh"]

@@ -8,7 +8,9 @@ work in VS Code and can give feedback on any figure you show them.
 
 The container limits access to the host, but it is not a guarantee that every
 operation is safe: mounted data and project credentials remain accessible, and
-network access may be available.
+network access may be available. When the user isolated the network, only an
+allowlist of hosts is reachable: run `codeflower-network` and follow the
+codeflower-network skill before asking for anything from the internet.
 
 ## Where things are
 
@@ -23,6 +25,8 @@ The user's folders are mounted under `/data`, each in a subfolder named after it
   mode (`uv pip install -e /data/code/<name>`) so your analysis scripts use the code as you change it,
   and run its tests after a change. These are the user's real files: do not reformat or reorganise
   beyond the task, do not commit or push unless asked, and check `git status` before and after.
+- `/data/skills/*`: skills the user provided, **read-only**. They are installed as your skills; read a
+  skill's `SKILL.md` when its task comes up.
 - `/codeflower-state/workspace`: your working directory. Keep everything you make here:
   - `scripts/` numbered, rerunnable analysis steps (`01_qc.py`, `02_cluster.py`, …)
   - `figures/`, `results/` (tables, intermediate data such as `.h5ad` or `.parquet`), `reports/`, `logs/`
@@ -41,6 +45,8 @@ You manage the environment yourself: install what the analysis needs, without as
 - After installing or removing packages, run `codeflower-env-export` so the environment recipe in
   `/codeflower-state/env/exports` stays current.
 - If an install fails (no network, a package that does not build), say so and choose an alternative.
+  If the host is not on the allowlist (`codeflower-network` tells), ask the user to allow it as the
+  codeflower-network skill describes.
 
 ## How to analyse
 

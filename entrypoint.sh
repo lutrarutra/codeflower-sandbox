@@ -12,12 +12,18 @@ workspace="${CODEFLOWER_WORKSPACE:-$state/workspace}"
 
 # Packages the agent installs go into the project, not into the read-only
 # image, so every worker on the project sees the same environment.
+# Seeding downloads pip; without a network (an isolated sandbox) the venv
+# starts without it: `uv pip install` works, and pip is added by a later
+# start that has a network.
 if [ ! -x "$venv/bin/python" ]; then
-  uv venv --quiet --seed --system-site-packages --python /opt/conda/bin/python "$venv"
+  if ! uv venv --quiet --seed --system-site-packages --python /opt/conda/bin/python "$venv" 2>/dev/null; then
+    rm -rf "$venv"
+    uv venv --quiet --system-site-packages --python /opt/conda/bin/python "$venv"
+  fi
 fi
 # `pip install` must reach the venv, not the image's conda base; older
 # projects' venvs were made without pip. Without a network this waits for later.
-if [ ! -x "$venv/bin/pip" ]; then
+if [ ! -x "$venv/bin/pip" ] && [ "${CODEFLOWER_NETWORK:-}" != isolated ]; then
   uv pip install --quiet --python "$venv/bin/python" pip || echo "Could not add pip to $venv" >&2
 fi
 mkdir -p "${CONDA_ENVS_DIRS:-$state/env/conda}" "${R_LIBS_USER:-$state/env/R}"
@@ -32,6 +38,53 @@ for name in AGENTS.md CLAUDE.md; do
   if [ ! -e "$workspace/$name" ] || { [ -e "$installed/$name" ] && cmp -s "$workspace/$name" "$installed/$name"; }; then
     cp "$template" "$workspace/$name"
     cp "$template" "$installed/$name"
+  fi
+done
+
+# Skills the user mounted (--skills), and the network skill in an isolated
+# sandbox, are linked where each harness looks for skills. A mounted folder is
+# one skill when it has a SKILL.md, otherwise a folder of skills. Links from
+# earlier starts are replaced, so removed skills disappear.
+skill_roots="${CLAUDE_CONFIG_DIR:-$state/harness/claude}/skills ${CODEX_HOME:-$state/harness/codex}/skills ${DSH_HOME:-$state/dsh-home}/skills"
+for root in $skill_roots; do
+  mkdir -p "$root"
+  for link in "$root"/*; do
+    if [ -L "$link" ]; then
+      case "$(readlink "$link")" in
+        /data/skills/* | /opt/codeflower/skills/*) rm -f "$link" ;;
+      esac
+    fi
+  done
+done
+linked=" "
+link_skill() {
+  name=$(basename "$1")
+  case "$linked" in
+    *" $name "*)
+      echo "Skipping the skill $1: another skill is already called $name" >&2
+      return
+      ;;
+  esac
+  linked="$linked$name "
+  for root in $skill_roots; do
+    if [ -e "$root/$name" ] || [ -L "$root/$name" ]; then
+      echo "Keeping $root/$name rather than linking the skill $1 of the same name" >&2
+    else
+      ln -s "$1" "$root/$name"
+    fi
+  done
+}
+if [ "${CODEFLOWER_NETWORK:-}" = isolated ]; then
+  link_skill /opt/codeflower/skills/codeflower-network
+fi
+for folder in /data/skills/*; do
+  [ -d "$folder" ] || continue
+  if [ -f "$folder/SKILL.md" ]; then
+    link_skill "$folder"
+  else
+    for skill in "$folder"/*; do
+      [ -f "$skill/SKILL.md" ] && link_skill "$skill"
+    done
   fi
 done
 
