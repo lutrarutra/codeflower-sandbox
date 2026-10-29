@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM node:22-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS dsh-runtime
+FROM node:25-bookworm-slim@sha256:81db02c4b671288a03915da9534dbd54f96d0e7c24d80ccc54f5b36b2e684370 AS dsh-runtime
 
 # Harness runtimes: DeepSeek Harness, the Claude Code and Codex ACP adapters,
 # and the official claude and codex CLIs used for sign-in. Exact versions are
