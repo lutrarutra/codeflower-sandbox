@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import WebSocket from 'ws';
 import { createActivity } from '../src/activity.js';
-import { createAgents } from '../src/agents.js';
+import { createAgents, loadRegistry } from '../src/agents.js';
 import { writeCommentsSlot } from '../src/files.js';
 import { agentEnvironment, startBridge } from '../src/server.js';
 import { readTranscript, sessionKey } from '../src/sessions.js';
@@ -108,9 +108,7 @@ async function startTestBridge(t, { agentName = 'claude', ...overrides } = {}) {
   await mkdir(environment.CLAUDE_CONFIG_DIR, { recursive: true });
   const agents = createAgents({
     nodePath: process.execPath,
-    dshBin: fakeAgent,
-    claudeAcpBin: fakeAgent,
-    codexAcpBin: fakeAgent,
+    launch: { dsh: fakeAgent, claude: fakeAgent, codex: fakeAgent },
     environment
   });
   const bridge = await startBridge({
@@ -215,6 +213,45 @@ test('starts the worker agent on connect without passing it any credentials', as
   const apiKey = await call(socket, 'authenticate', { methodId: 'api-key', _meta: { 'api-key': { apiKey: 'sk-test' } } });
   assert.equal(apiKey.result.keyLength, 7);
   await closeSocket(socket);
+});
+
+test('runs an agent added as a folder with only its descriptor', async (t) => {
+  const agentsDirectory = await mkdtemp(join(tmpdir(), 'codeflower-agents-'));
+  t.after(() => rm(agentsDirectory, { recursive: true, force: true }));
+  await mkdir(join(agentsDirectory, 'pi'));
+  await writeFile(
+    join(agentsDirectory, 'pi', 'agent.json'),
+    JSON.stringify({ id: 'pi', name: 'Pi', color: '#3a7bd5', launch: 'pi-acp/dist/index.js', env: { PI_FLAG: '1' } })
+  );
+  const agents = createAgents({ nodePath: process.execPath, launch: { pi: fakeAgent }, agents: await loadRegistry(agentsDirectory) });
+  assert.deepEqual(Object.keys(agents), ['pi']);
+  const { bridge } = await startTestBridge(t, { agentName: 'pi', agent: agents.pi });
+  const socket = await openSocket(bridge.address);
+  await initialize(socket);
+  const status = (await call(socket, '_codeflower/status')).result;
+  assert.equal(status.agent, 'pi');
+  assert.equal(status.agentLabel, 'Pi');
+  assert.deepEqual(status.agentInfo, { id: 'pi', name: 'Pi', color: '#3a7bd5' });
+  // No hooks: the agent signs in through ACP itself.
+  assert.equal(status.signedIn, true);
+  assert.equal(status.credentials, 'agent');
+  const sessionId = (await call(socket, 'session/new', { cwd: '/workspace', mcpServers: [] })).result.sessionId;
+  const answer = call(socket, 'session/prompt', { sessionId, prompt: [{ type: 'text', text: 'hello pi' }] });
+  const update = await receive(socket, (message) => message.method === 'session/update');
+  assert.equal(update.params.update.content.text, `reply to hello pi in ${sessionId}`);
+  assert.equal((await answer).result.stopReason, 'end_turn');
+  await closeSocket(socket);
+});
+
+test('describes every built-in agent completely', async () => {
+  for (const { descriptor } of await loadRegistry()) {
+    assert.match(descriptor.id, /^[a-z][a-z0-9-]*$/);
+    for (const field of ['name', 'color', 'launch']) assert.equal(typeof descriptor[field], 'string', `${descriptor.id}.${field}`);
+    assert.match(descriptor.home.variable, /^[A-Z_]+$/);
+    assert.ok(!descriptor.home.path.startsWith('/') && !descriptor.home.path.includes('..'), descriptor.id);
+    assert.ok(descriptor.providerHosts.length > 0, descriptor.id);
+    for (const path of Object.keys(descriptor.files ?? {})) assert.ok(!path.startsWith('/') && !path.includes('..'), path);
+  }
 });
 
 test('starts and records an initial prompt in a session that VS Code can resume', async (t) => {
@@ -490,6 +527,9 @@ test('stores dsh keys in its own files and adds the endpoint on the next start',
   const patch = await readFile(join(environment.DSH_HOME, 'codeflower-endpoint.patch.yml'), 'utf8');
   assert.match(patch, /llm\.example\.org/);
   assert.doesNotMatch(patch, /sk-compat-secret/);
+  assert.deepEqual(JSON.parse(patch)[0].config.providers['codeflower-openai-compat'].models, [
+    { id: 'qwen3-coder', reasoningEfforts: { low: 'low', medium: 'medium', high: 'high' } }
+  ]);
   assert.equal((await call(socket, '_codeflower/status')).result.signedIn, true);
   const ended = once(socket, 'close');
   assert.deepEqual((await call(socket, '_codeflower/agent/restart')).result, {});

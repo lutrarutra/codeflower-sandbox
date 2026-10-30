@@ -26,9 +26,7 @@ test('an isolated bridge listens on the socket and advertises the app port', asy
   const socket = join(directory, 'bridge.sock');
   const agents = createAgents({
     nodePath: process.execPath,
-    dshBin: fakeAgent,
-    claudeAcpBin: fakeAgent,
-    codexAcpBin: fakeAgent,
+    launch: { dsh: fakeAgent, claude: fakeAgent, codex: fakeAgent },
     environment: process.env
   });
   const bridge = await startBridge({

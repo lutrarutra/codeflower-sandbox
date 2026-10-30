@@ -18,7 +18,7 @@ async function setup(t) {
   };
   await mkdir(environment.CLAUDE_CONFIG_DIR, { recursive: true });
   await mkdir(environment.CODEX_HOME, { recursive: true });
-  const agents = createAgents({ nodePath: 'node', dshBin: 'x', claudeAcpBin: 'x', codexAcpBin: 'x', environment });
+  const agents = createAgents({ nodePath: 'node', launch: { dsh: 'x', claude: 'x', codex: 'x' }, environment });
   return { agents, environment };
 }
 
@@ -32,6 +32,65 @@ test('stores a configured key in dsh .env', async (t) => {
   await agents.dsh.provideKey('sk-dsh');
   assert.match(await readFile(join(environment.DSH_HOME, '.env'), 'utf8'), /^DEEPSEEK_API_KEY=sk-dsh$/m);
   assert.equal(await agents.dsh.signedIn(), true);
+});
+
+test('configures reasoning efforts for custom endpoint models without storing the key in the patch', async (t) => {
+  const { agents, environment } = await setup(t);
+  await agents.dsh.setCredentials({
+    openaiCompatible: {
+      baseURL: 'https://llm.example.org/v1',
+      models: ['reasoning-model'],
+      reasoningEfforts: ['low', 'high'],
+      apiKey: 'sk-compat-secret'
+    }
+  });
+  const patch = JSON.parse(await readFile(join(environment.DSH_HOME, 'codeflower-endpoint.patch.yml'), 'utf8'));
+  const provider = patch[0].config.providers['codeflower-openai-compat'];
+  assert.deepEqual(provider.models, [
+    { id: 'reasoning-model', reasoningEfforts: { low: 'low', high: 'high' } }
+  ]);
+  assert.doesNotMatch(JSON.stringify(patch), /sk-compat-secret/);
+});
+
+test('allows disabling reasoning effort options for a custom endpoint', async (t) => {
+  const { agents, environment } = await setup(t);
+  await agents.dsh.setCredentials({
+    openaiCompatible: {
+      baseURL: 'https://llm.example.org/v1',
+      models: ['plain-model'],
+      reasoningEfforts: [],
+      apiKey: 'sk-compat-secret'
+    }
+  });
+  const path = join(environment.DSH_HOME, 'codeflower-endpoint.patch.yml');
+  const before = JSON.parse(await readFile(path, 'utf8'));
+  assert.equal(before[0].config.providers['codeflower-openai-compat'].models[0].reasoningEfforts, false);
+
+  await agents.dsh.command();
+  const after = JSON.parse(await readFile(path, 'utf8'));
+  assert.equal(after[0].config.providers['codeflower-openai-compat'].models[0].reasoningEfforts, false);
+});
+
+test('adds default effort metadata to existing custom endpoint patches on startup', async (t) => {
+  const { agents, environment } = await setup(t);
+  await mkdir(environment.DSH_HOME, { recursive: true });
+  const path = join(environment.DSH_HOME, 'codeflower-endpoint.patch.yml');
+  await writeFile(
+    path,
+    JSON.stringify([
+      {
+        id: 'llm-pi-ai',
+        config: { providers: { 'codeflower-openai-compat': { models: [{ id: 'existing-model' }] } } }
+      }
+    ])
+  );
+
+  const command = await agents.dsh.command();
+  const patch = JSON.parse(await readFile(path, 'utf8'));
+  assert.deepEqual(patch[0].config.providers['codeflower-openai-compat'].models, [
+    { id: 'existing-model', reasoningEfforts: { low: 'low', medium: 'medium', high: 'high' } }
+  ]);
+  assert.deepEqual(command.slice(-2), ['--patch', path]);
 });
 
 test("stores a configured key in Claude Code's settings and keeps its other settings", async (t) => {

@@ -1326,6 +1326,7 @@ export async function startBridge(options) {
               instanceId,
               agent: agentName,
               agentLabel: agent.label ?? agentName,
+              ...(agent.presentation ? { agentInfo: agent.presentation } : {}),
               signedIn: agent.signedIn ? await agent.signedIn() : true,
               credentials: agent.setCredentials ? 'keys' : 'agent',
               ...(slurmJobId ? { slurmJobId } : {})

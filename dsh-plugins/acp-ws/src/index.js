@@ -6,7 +6,6 @@ import { EXIT_CODES, runTask } from './task.js';
 
 const RUNTIME_MODULES = '/opt/codeflower/runtime/node_modules';
 const TEMPLATES = '/opt/codeflower/templates';
-const DSH_USAGE_PATCH = '/opt/codeflower/dsh-usage/cordis.patch.yml';
 const INITIAL_PROMPT_FILE = process.env.CODEFLOWER_INITIAL_PROMPT_FILE;
 
 function requiredEnvironment(name) {
@@ -21,14 +20,7 @@ const agentName = requiredEnvironment('CODEFLOWER_AGENT');
 if (!AGENT_NAMES.includes(agentName)) {
   throw new Error(`CODEFLOWER_AGENT must be one of: ${AGENT_NAMES.join(', ')}`);
 }
-const agents = createAgents({
-  nodePath: process.execPath,
-  dshBin: `${RUNTIME_MODULES}/@deepseek-ai/dsh/lib/bin.js`,
-  claudeAcpBin: `${RUNTIME_MODULES}/@agentclientprotocol/claude-agent-acp/dist/index.js`,
-  codexAcpBin: `${RUNTIME_MODULES}/@agentclientprotocol/codex-acp/dist/index.js`,
-  codexBin: `${RUNTIME_MODULES}/@openai/codex/bin/codex.js`,
-  dshUsagePatch: DSH_USAGE_PATCH
-});
+const agents = createAgents({ nodePath: process.execPath, modules: RUNTIME_MODULES });
 
 // The app's config may give the agent an API key. It goes into the
 // agent's own files in the project, and leaves this process's environment so

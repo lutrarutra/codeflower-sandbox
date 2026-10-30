@@ -7,5 +7,10 @@
 - [`usage/`](usage/): a dsh plugin that reports each model call's token counts to the bridge, which dsh's ACP
   app does not send. The bridge adds it with `--patch` and reads its lines on file descriptor 3.
 
+For custom OpenAI-compatible endpoints, code flower offers `low`, `medium`, and `high` reasoning effort
+levels by default. The endpoint must accept those values; the sign-in flow lets you change or clear the
+list. DSH approval requests are one-shot and do not identify the tool to the client, so the chat's
+auto-approve toggle covers all DSH approval requests. It starts enabled; turn it off to review requests.
+
 The kernel and notebook integration follow later as an MCP server, so all three agents can use it.
 See [the architecture document](https://github.com/lutrarutra/codeflower-workspace/blob/main/docs/architecture.md#3-bridge-sandboxdsh-pluginsacp-ws).

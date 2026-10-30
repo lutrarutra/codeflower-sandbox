@@ -30,6 +30,10 @@ and DeepSeek Harness), and the bridge that connects it to VS Code.
   `TASK.md` for every run, `task/continue.md` when a task is continued, `task/wrap-up.md` when its
   time or rounds run out
 - `dsh-plugins/acp-ws/`: the authenticated ACP WebSocket bridge, session recorder, and sign-in relay
+- `dsh-plugins/acp-ws/src/agents/<id>/`: one folder per agent, `agent.json` (name, launch script, home, credential
+  variables, provider hosts, files to write once) and an optional `index.js` (login checks, where a key goes). To
+  add an agent, add its folder and its adapter to `package.json`, then run `make agents` in the app, which embeds
+  the descriptors
 
 ## How code flower fits together
 

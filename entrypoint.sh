@@ -72,7 +72,8 @@ fi
 # sandbox, are linked where each harness looks for skills. A mounted folder is
 # one skill when it has a SKILL.md, otherwise a folder of skills. Links from
 # earlier starts are replaced, so removed skills disappear.
-skill_roots="${CLAUDE_CONFIG_DIR:-$state/harness/claude}/skills ${CODEX_HOME:-$state/harness/codex}/skills ${DSH_HOME:-$state/dsh-home}/skills"
+# Every agent's home comes from its descriptor (the bridge's src/agents/*/agent.json).
+skill_roots=$(/usr/local/bin/node /opt/codeflower/acp-ws/src/agents/homes.js "$state" | sed 's|$|/skills|')
 for root in $skill_roots; do
   mkdir -p "$root"
   for link in "$root"/*; do
