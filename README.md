@@ -1,4 +1,22 @@
-# code flower sandbox
+<p align="center">
+  <img src="assets/icon.svg" width="112" height="112" alt="code flower sandbox icon">
+</p>
+
+<h1 align="center">code flower sandbox</h1>
+
+<p align="center">The isolated image the agents work in, and the bridge to VS Code.</p>
+
+<p align="center">
+  <a href="https://github.com/lutrarutra/codeflower-launcher"><img src="https://raw.githubusercontent.com/lutrarutra/codeflower-launcher/main/assets/icon.png" width="20" height="20" alt=""> launcher</a>
+  &nbsp;·&nbsp;
+  <b><img src="assets/icon.svg" width="20" height="20" alt=""> sandbox</b>
+  &nbsp;·&nbsp;
+  <a href="https://github.com/lutrarutra/codeflower-vsc-extension"><img src="https://raw.githubusercontent.com/lutrarutra/codeflower-vsc-extension/main/media/icon.svg" width="20" height="20" alt=""> VS Code extension</a>
+  &nbsp;·&nbsp;
+  <a href="https://github.com/lutrarutra/storyteller"><img src="https://raw.githubusercontent.com/lutrarutra/storyteller/main/assets/icon.svg" width="20" height="20" alt=""> storyteller</a>
+  &nbsp;·&nbsp;
+  <a href="https://codeflower.dev">codeflower.dev</a>
+</p>
 
 The isolated runtime image of a code flower worker, with all three agents (Claude Code, Codex,
 and DeepSeek Harness), and the bridge that connects it to VS Code.
