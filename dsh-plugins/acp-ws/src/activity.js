@@ -4,8 +4,12 @@
 
 const PLAN_KIND = 'switch_mode';
 const MAX_TOOL_KINDS = 500;
+// Ended turns are kept a minute for pollers (the client's notifications),
+// the latest 20 at most.
+const MAX_ENDED = 20;
+const ENDED_MS = 60_000;
 
-export function createActivity(onChange = () => {}) {
+export function createActivity(onChange = () => {}, now = Date.now) {
   // Turn request id -> session id.
   const turns = new Map();
   // Agent request id -> { sessionId, waitingFor }.
@@ -13,6 +17,9 @@ export function createActivity(onChange = () => {}) {
   // Session id -> tool call id -> kind, from tool_call updates: a permission
   // request may name only the tool call (plan approval is kind switch_mode).
   const toolKinds = new Map();
+  // { seq, sessionId, stopReason, at } of the latest ended turns; seq only goes up.
+  const ended = [];
+  let turnCount = 0;
 
   const kindOf = (sessionId, toolCall) =>
     toolCall?.kind ?? toolKinds.get(sessionId)?.get(toolCall?.toolCallId);
@@ -23,10 +30,13 @@ export function createActivity(onChange = () => {}) {
       onChange();
     },
 
-    turnEnded(id) {
+    // stopReason: the prompt's (end_turn, cancelled, …), or 'error'.
+    turnEnded(id, stopReason = null) {
       const sessionId = turns.get(id);
       if (sessionId === undefined) return;
       turns.delete(id);
+      ended.push({ seq: ++turnCount, sessionId, stopReason, at: now() });
+      if (ended.length > MAX_ENDED) ended.shift();
       if (![...turns.values()].includes(sessionId)) toolKinds.delete(sessionId);
       onChange();
     },
@@ -61,6 +71,7 @@ export function createActivity(onChange = () => {}) {
       return turns.size > 0;
     },
 
+    // Ended turns stay: a poller would otherwise see them again.
     clear() {
       turns.clear();
       requests.clear();
@@ -80,7 +91,9 @@ export function createActivity(onChange = () => {}) {
       return {
         chats: list,
         working: list.filter((chat) => chat.state === 'working').length,
-        waiting: list.filter((chat) => chat.state === 'waiting').length
+        waiting: list.filter((chat) => chat.state === 'waiting').length,
+        ended: ended.filter((turn) => now() - turn.at < ENDED_MS).map(({ at: _, ...turn }) => turn),
+        turns: turnCount
       };
     }
   };

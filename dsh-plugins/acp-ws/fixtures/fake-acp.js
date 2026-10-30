@@ -215,6 +215,10 @@ input.on('line', async (line) => {
         reply(message.params.sessionId, message.id, `answer ${result.action} ${JSON.stringify(result.content ?? {})}`);
         break;
       }
+      if (text === 'fail me') {
+        send({ jsonrpc: '2.0', id: message.id, error: { code: -32603, message: 'Internal error' } });
+        break;
+      }
       if (text === 'long task') {
         const { sessionId } = message.params;
         longTasks.set(sessionId, message.id);

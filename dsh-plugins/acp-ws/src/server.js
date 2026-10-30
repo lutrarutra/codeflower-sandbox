@@ -24,6 +24,9 @@ import { createUsage, dshTokens } from './usage.js';
 
 const CONNECTION_PATH = '/acp';
 const STATUS_PATH = '/status';
+// The launcher's client asks chats to wrap up here before it stops the sandbox.
+const WRAP_UP_PATH = '/wrap-up';
+const MAX_WRAP_UP_BODY = 4096;
 // A window that misses two pings in a row is gone, e.g. a laptop that went to sleep.
 const PING_MS = 30_000;
 const TAKEN_OVER = 4001;
@@ -365,6 +368,9 @@ export async function startBridge(options) {
     allocationEnd,
     wrapUpTemplate,
     wrapUpLeadMs = WRAP_UP_LEAD_MS,
+    // What chats are told when the client that started the sandbox quits
+    // ({{minutes}}: at most how long it waits for them).
+    wrapUpQuitTemplate,
     describe = async () => ({}),
     ptyHelper,
     environment: workerEnvironment = process.env,
@@ -374,14 +380,14 @@ export async function startBridge(options) {
     showSocket = join(tmpdir(), `codeflower-show-${instanceId}.sock`),
     // The project state: only its workspace may be shown or read.
     privateDirectory = sessionsDirectory ? dirname(sessionsDirectory) : undefined,
+    // Read-write mounts (/data/output/NAME, /data/code/NAME), where reports may also take comments.
+    writableFolders = [],
     log = (message) => process.stderr.write(`${message}\n`)
   } = options;
 
   if (typeof token !== 'string' || Buffer.byteLength(token) < 32) {
     throw new Error('CODEFLOWER_TOKEN must contain at least 32 bytes');
   }
-    // Read-write mounts (/data/output/NAME, /data/code/NAME), where reports may also take comments.
-    writableFolders = [],
   if (!connectionFile) {
     throw new Error('CODEFLOWER_CONNECTION_FILE is required');
   }
@@ -412,6 +418,11 @@ export async function startBridge(options) {
   let client;
   let closing = false;
   const shells = new Map();
+  // The latest wrap-up's reason, how many chats it and earlier ones asked,
+  // and the chats whose wrap-up has not ended yet.
+  let wrapUpReason;
+  let wrapUpAsked = 0;
+  const wrappingUp = new Set();
 
   const sendToClient = (message) => client?.send(message);
   const activity = createActivity(() =>
@@ -419,12 +430,9 @@ export async function startBridge(options) {
   );
 
   function activitySnapshot() {
-    const { chats, working, waiting } = activity.snapshot();
-    return {
-      chats: chats.map(({ sessionId, ...chat }) => ({ key: sessionKey(agentName, sessionId), ...chat })),
-      working,
-      waiting
-    };
+    const { chats, working, waiting, ended, turns } = activity.snapshot();
+    const keyed = ({ sessionId, ...chat }) => ({ key: sessionKey(agentName, sessionId), ...chat });
+    return { chats: chats.map(keyed), working, waiting, ended: ended.map(keyed), turns };
   }
 
   // ---- usage: token counts, cost, and the login's quota ----
@@ -495,10 +503,11 @@ export async function startBridge(options) {
     // The worker's account and totals; per chat only in the window.
     const { sessions: _, ...account } = usageSnapshot();
     const titles = new Map();
-    if (snapshot.chats.length && sessionsDirectory) {
+    if ((snapshot.chats.length || snapshot.ended.length) && sessionsDirectory) {
       await recorder?.flush();
       for (const session of await listSessions(sessionsDirectory).catch(() => [])) titles.set(session.key, session.title);
     }
+    const titled = (chat) => ({ ...chat, title: titles.get(chat.key) ?? 'Untitled session' });
     return {
       agent: agentName,
       agentLabel: agent.label ?? agentName,
@@ -506,10 +515,49 @@ export async function startBridge(options) {
       running: Boolean(agentHost),
       working: snapshot.working,
       waiting: snapshot.waiting,
-      chats: snapshot.chats.map((chat) => ({ ...chat, title: titles.get(chat.key) ?? 'Untitled session' })),
-      usage: account
+      chats: snapshot.chats.map(titled),
+      ended: snapshot.ended.map(titled),
+      turns: snapshot.turns,
+      usage: account,
+      ...(wrapUpReason
+        ? { wrapUp: { reason: wrapUpReason, state: wrappingUp.size ? 'running' : 'done', chats: wrapUpAsked } }
+        : {})
     };
   }
+
+  // POST /wrap-up {reason: "quit", minutes}: answers how many chats were asked
+  // and wraps them up in the background; /status says when they are done.
+  const wrapUpRequest = (request, response) => {
+    const reply = (code, body) => {
+      response.writeHead(code, { 'content-type': 'application/json', 'cache-control': 'no-store', connection: 'close' });
+      response.end(body === undefined ? undefined : JSON.stringify(body));
+    };
+    let body = '';
+    let tooLarge = false;
+    request.setEncoding('utf8');
+    request.on('data', (chunk) => {
+      body += chunk;
+      if (body.length > MAX_WRAP_UP_BODY) tooLarge = true;
+    });
+    request.on('end', () => {
+      if (tooLarge) return reply(413, { error: 'request too large' });
+      let params;
+      try {
+        params = JSON.parse(body || '{}');
+      } catch {
+        return reply(400, { error: 'invalid JSON' });
+      }
+      const minutes = params?.minutes;
+      if (params?.reason !== 'quit' || !Number.isFinite(minutes) || minutes <= 0 || minutes > 24 * 60) {
+        return reply(400, { error: 'expected {"reason": "quit", "minutes": N}' });
+      }
+      if (!wrapUpQuitTemplate) return reply(501, { error: 'this worker cannot wrap up chats on request' });
+      if (closing) return reply(503, { error: 'the worker is stopping' });
+      const { chats, done } = wrapUpChats('quit', Math.round(minutes));
+      void done.catch((error) => log(`Could not wrap up: ${error.message}`));
+      reply(202, { chats });
+    });
+  };
 
   const bearer = (request) => {
     const authorization = request.headers.authorization;
@@ -535,6 +583,15 @@ export async function startBridge(options) {
         response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
         response.end(JSON.stringify(status));
       });
+      return;
+    }
+    if (request.method === 'POST' && pathname === WRAP_UP_PATH) {
+      if (!constantTimeTokenMatch(bearer(request), token)) {
+        response.writeHead(401, { connection: 'close' });
+        response.end();
+        return;
+      }
+      wrapUpRequest(request, response);
       return;
     }
     response.writeHead(404, { connection: 'close' });
@@ -749,27 +806,54 @@ export async function startBridge(options) {
     if (!Number.isFinite(allocationEnd) || !wrapUpTemplate) return;
     const wait = allocationEnd - wrapUpLeadMs - Date.now();
     wrapUpTimer = setTimeout(
-      () => (wait > MAX_TIMER_MS ? scheduleWrapUp() : void wrapUpChats().catch((error) => log(`Could not wrap up: ${error.message}`))),
+      () =>
+        wait > MAX_TIMER_MS
+          ? scheduleWrapUp()
+          : void wrapUpChats('time').done.catch((error) => log(`Could not wrap up: ${error.message}`)),
       Math.min(Math.max(0, wait), MAX_TIMER_MS)
     );
     wrapUpTimer.unref();
   };
 
-  const wrapUpNotice = () => {
-    const minutes = Math.max(0, Math.round((allocationEnd - Date.now()) / 60_000));
-    return { end: new Date(allocationEnd).toISOString(), minutes };
+  // time: the batch job ends ({{end}}, {{minutes}} until then); quit: the
+  // client that started the sandbox quits and waits at most {{minutes}}.
+  const wrapUpNotice = (reason, minutes) => {
+    if (reason === 'quit') return { reason, minutes };
+    return {
+      reason,
+      end: new Date(allocationEnd).toISOString(),
+      minutes: Math.max(0, Math.round((allocationEnd - Date.now()) / 60_000))
+    };
   };
 
-  const wrapUpChats = async () => {
+  // Asks the chats with a turn running or a request waiting, and not already
+  // wrapping up, to wrap up; returns how many, and a promise of their end.
+  const wrapUpChats = (reason, minutes) => {
+    const template = reason === 'quit' ? wrapUpQuitTemplate : wrapUpTemplate;
     const host = agentHost;
-    const sessionIds = host && !closing ? [...new Set(activity.snapshot().chats.map((chat) => chat.sessionId))] : [];
-    const notice = wrapUpNotice();
-    log(`The job ends at ${notice.end}; asking ${sessionIds.length} working chat(s) to wrap up`);
+    const sessionIds =
+      host && !closing
+        ? [...new Set(activity.snapshot().chats.map((chat) => chat.sessionId))].filter((id) => !wrappingUp.has(id))
+        : [];
+    const notice = wrapUpNotice(reason, minutes);
+    log(
+      reason === 'quit'
+        ? `The client is quitting; asking ${sessionIds.length} working chat(s) to wrap up`
+        : `The job ends at ${notice.end}; asking ${sessionIds.length} working chat(s) to wrap up`
+    );
+    wrapUpReason = reason;
+    wrapUpAsked += sessionIds.length;
+    for (const sessionId of sessionIds) wrappingUp.add(sessionId);
     sendToClient({ jsonrpc: '2.0', method: '_codeflower/wrapUp', params: { ...notice, chats: sessionIds.length } });
-    await Promise.all(sessionIds.map((sessionId) => wrapUpChat(host, sessionId)));
+    const done = Promise.all(
+      sessionIds.map((sessionId) =>
+        wrapUpChat(host, sessionId, notice, template).finally(() => wrappingUp.delete(sessionId))
+      )
+    );
+    return { chats: sessionIds.length, done };
   };
 
-  const wrapUpChat = async (host, sessionId) => {
+  const wrapUpChat = async (host, sessionId, notice, template) => {
     // As a client cancels: the turn, then the requests it waits on.
     writeToAgent(host, { jsonrpc: '2.0', method: 'session/cancel', params: { sessionId } });
     for (const [key, { message, sessionId: owner }] of host.waiting) {
@@ -787,8 +871,7 @@ export async function startBridge(options) {
       log(`A chat did not stop within ${WRAP_UP_CANCEL_MS / 1000} s; it was not asked to wrap up`);
       return;
     }
-    const notice = wrapUpNotice();
-    const text = wrapUpTemplate.replace(/\{\{(\w+)\}\}/g, (placeholder, name) => String(notice[name] ?? placeholder)).trim();
+    const text = template.replace(/\{\{(\w+)\}\}/g, (placeholder, name) => String(notice[name] ?? placeholder)).trim();
     // The window shows the prompt, as it did not send it.
     sendToClient({
       jsonrpc: '2.0',
@@ -863,7 +946,7 @@ export async function startBridge(options) {
   // The agent answered a client request.
   const settleRequest = (host, request, message) => {
     const { method, params, key } = request;
-    if (method === 'session/prompt') activity.turnEnded(key);
+    if (method === 'session/prompt') activity.turnEnded(key, message.error ? 'error' : (message.result?.stopReason ?? null));
     const result = message.result;
     if (method === 'initialize') {
       // Remember the sign-in methods the agent offers, so terminal sign-ins

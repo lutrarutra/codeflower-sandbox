@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import WebSocket from 'ws';
+import { createActivity } from '../src/activity.js';
 import { createAgents } from '../src/agents.js';
 import { writeCommentsSlot } from '../src/files.js';
 import { agentEnvironment, startBridge } from '../src/server.js';
@@ -355,6 +356,57 @@ test('asks chats with a turn running to wrap up before the job ends', async (t) 
   await closeSocket(socket);
 });
 
+async function wrapUp(address, body, headers = { authorization: `Bearer ${token}` }) {
+  const response = await fetch(`http://127.0.0.1:${address.port}/wrap-up`, {
+    method: 'POST',
+    headers: { ...headers, 'content-type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  return { code: response.status, body: await response.json().catch(() => undefined) };
+}
+
+test('asks working chats to wrap up when the client quits', async (t) => {
+  const { bridge, sessionsDirectory } = await startTestBridge(t, {
+    wrapUpQuitTemplate: 'wrap up: the client quits, at most {{minutes}} minutes\n'
+  });
+  assert.equal((await wrapUp(bridge.address, { reason: 'quit', minutes: 10 }, {})).code, 401);
+  assert.equal((await wrapUp(bridge.address, { reason: 'time', minutes: 10 })).code, 400);
+  assert.equal((await wrapUp(bridge.address, { reason: 'quit' })).code, 400);
+
+  const socket = await openSocket(bridge.address);
+  await initialize(socket);
+  const newSession = async () => (await call(socket, 'session/new', { cwd: '/workspace', mcpServers: [] })).result.sessionId;
+  const working = await newSession();
+  const idle = await newSession();
+  const cancelled = call(socket, 'session/prompt', { sessionId: working, prompt: [{ type: 'text', text: 'cancel me' }] });
+  await receive(socket, (message) => message.method === '_codeflower/activity' && message.params.working === 1);
+  assert.equal((await status(bridge.address)).body.wrapUp, undefined);
+
+  assert.deepEqual(await wrapUp(bridge.address, { reason: 'quit', minutes: 10 }), { code: 202, body: { chats: 1 } });
+  assert.deepEqual((await status(bridge.address)).body.wrapUp, { reason: 'quit', state: 'running', chats: 1 });
+  // A second request does not ask the same chat again.
+  assert.deepEqual(await wrapUp(bridge.address, { reason: 'quit', minutes: 10 }), { code: 202, body: { chats: 0 } });
+
+  const notice = await receive(socket, (message) => message.method === '_codeflower/wrapUp' && !message.params.key);
+  assert.deepEqual(notice.params, { reason: 'quit', minutes: 10, chats: 1 });
+  assert.equal((await cancelled).result.stopReason, 'cancelled');
+  const expected = 'wrap up: the client quits, at most 10 minutes';
+  const prompt = await receive(
+    socket,
+    (message) => message.method === '_codeflower/wrapUp' && message.params.key === sessionKey('claude', working)
+  );
+  assert.equal(prompt.params.prompt, expected);
+  await waitFor(async () => (await status(bridge.address)).body.wrapUp.state === 'done');
+  assert.deepEqual((await status(bridge.address)).body.wrapUp, { reason: 'quit', state: 'done', chats: 1 });
+  assert.deepEqual(await readTranscript(sessionsDirectory, sessionKey('claude', idle)), []);
+  await closeSocket(socket);
+});
+
+test('refuses a wrap-up on request without its template', async (t) => {
+  const { bridge } = await startTestBridge(t);
+  assert.equal((await wrapUp(bridge.address, { reason: 'quit', minutes: 10 })).code, 501);
+});
+
 test('refuses to resume a session leased by another worker', async (t) => {
   const { bridge, sessionsDirectory } = await startTestBridge(t, { agentName: 'codex' });
   const directory = join(sessionsDirectory, sessionKey('codex', 'busy'));
@@ -519,6 +571,11 @@ test("saves the user's comments on a report into its store and its page, and now
   await writeFile(join(reports, 'pbmc.html'), page('[]'));
   await writeFile(join(reports, 'loose.html'), page('[]'));
   await writeFile(join(reports, 'other.html'), '<html><body>no slot</body></html>');
+  await mkdir(join(output, 'pbmc.report'), { recursive: true });
+  await writeFile(join(output, 'pbmc.report', 'report.json'), '{}');
+  await writeFile(join(output, 'pbmc.html'), page('[]'));
+  await mkdir(input, { recursive: true });
+  await writeFile(join(input, 'pbmc.html'), page('[]'));
 
   const socket = await openSocket(bridge.address);
   await initialize(socket);
@@ -533,6 +590,10 @@ test("saves the user's comments on a report into its store and its page, and now
   );
   // A page without a store keeps them in the page only.
   assert.equal((await save(join(reports, 'loose.html'), '[]')).result.stored, false);
+  // Reports in an output folder too, but not in a read-only one.
+  assert.equal((await save(join(output, 'pbmc.html'), comments)).result.stored, true);
+  assert.equal(JSON.parse(await readFile(join(output, 'pbmc.report', 'comments.json'), 'utf8'))[0].id, 'c-1');
+  assert.match((await save(join(input, 'pbmc.html'), '[]')).error.message, /workspace or an output folder/);
 
   assert.match((await save(join(reports, 'other.html'), '[]')).error.message, /does not take comments/);
   assert.match((await save(join(reports, 'pbmc.report', 'report.json'), '[]')).error.message, /only be saved on HTML reports/);
@@ -571,11 +632,6 @@ test('does not report success when the report changes during every comment save 
   assert.equal(writes, 0);
 });
 
-  await mkdir(join(output, 'pbmc.report'), { recursive: true });
-  await writeFile(join(output, 'pbmc.report', 'report.json'), '{}');
-  await writeFile(join(output, 'pbmc.html'), page('[]'));
-  await mkdir(input, { recursive: true });
-  await writeFile(join(input, 'pbmc.html'), page('[]'));
 async function status(address, headers = { authorization: `Bearer ${token}` }) {
   const response = await fetch(`http://127.0.0.1:${address.port}/status`, { headers });
   return { code: response.status, body: response.ok ? await response.json() : undefined };
@@ -590,10 +646,6 @@ test('keeps the agent and its chats working while no window is connected', async
   const first = await openSocket(bridge.address);
   const { pid } = await initialize(first);
   const sessionId = (await call(first, 'session/new', { cwd: '/workspace', mcpServers: [] })).result.sessionId;
-  // Reports in an output folder too, but not in a read-only one.
-  assert.equal((await save(join(output, 'pbmc.html'), comments)).result.stored, true);
-  assert.equal(JSON.parse(await readFile(join(output, 'pbmc.report', 'comments.json'), 'utf8'))[0].id, 'c-1');
-  assert.match((await save(join(input, 'pbmc.html'), '[]')).error.message, /workspace or an output folder/);
   const promptId = nextId++;
   send(first, { jsonrpc: '2.0', id: promptId, method: 'session/prompt', params: { sessionId, prompt: [{ type: 'text', text: 'long task' }] } });
   assert.equal(text(await receive(first, (message) => message.method === 'session/update')), 'started');
@@ -611,7 +663,9 @@ test('keeps the agent and its chats working while no window is connected', async
     running: true,
     working: 1,
     waiting: 0,
-    chats: [{ key: sessionKey('claude', sessionId), state: 'working', title: 'long task' }]
+    chats: [{ key: sessionKey('claude', sessionId), state: 'working', title: 'long task' }],
+    ended: [],
+    turns: 0
   });
 
   // The next window gets the same agent and reattaches to the running turn.
@@ -635,6 +689,10 @@ test('keeps the agent and its chats working while no window is connected', async
   assert.equal(text(await receive(second, (message) => message.method === 'session/update')), 'done');
   await receive(second, (message) => message.method === '_codeflower/activity' && message.params.working === 0);
   assert.equal(inboxes.get(second).messages.filter((message) => message.id === promptId).length, 0);
+  // Pollers (the client's notifications) see the turn that ended.
+  const finished = (await status(bridge.address)).body;
+  assert.deepEqual(finished.ended, [{ seq: 1, key: sessionKey('claude', sessionId), stopReason: 'end_turn', title: 'long task' }]);
+  assert.equal(finished.turns, 1);
 
   // The transcript up to the reattach plus what came live is the whole chat.
   const entries = (await call(second, '_codeflower/sessions/transcript', { key: sessionKey('claude', sessionId) })).result.entries;
@@ -691,9 +749,53 @@ test('reports its activity only to holders of the token', async (t) => {
   assert.equal((await fetch(`http://127.0.0.1:${bridge.address.port}/other`)).status, 404);
   const { body } = await status(bridge.address);
   const { usage, ...activity } = body;
-  assert.deepEqual(activity, { agent: 'claude', agentLabel: 'Claude Code', connected: false, running: false, working: 0, waiting: 0, chats: [] });
+  assert.deepEqual(activity, {
+    agent: 'claude',
+    agentLabel: 'Claude Code',
+    connected: false,
+    running: false,
+    working: 0,
+    waiting: 0,
+    chats: [],
+    ended: [],
+    turns: 0
+  });
   // Numbers only: the account and the worker's totals, never a chat's.
   assert.deepEqual(Object.keys(usage).sort(), ['auth', 'costEstimate', 'limits', 'limitsUpdatedAt', 'totals']);
+});
+
+test('reports ended turns with their stop reason for a minute', async (t) => {
+  const { bridge } = await startTestBridge(t);
+  const socket = await openSocket(bridge.address);
+  await initialize(socket);
+  const sessionId = (await call(socket, 'session/new', { cwd: '/workspace', mcpServers: [] })).result.sessionId;
+  const key = sessionKey('claude', sessionId);
+  assert.ok((await call(socket, 'session/prompt', { sessionId, prompt: [{ type: 'text', text: 'fail me' }] })).error);
+  const cancelled = call(socket, 'session/prompt', { sessionId, prompt: [{ type: 'text', text: 'cancel me' }] });
+  await receive(socket, (message) => message.method === '_codeflower/activity' && message.params.working === 1);
+  send(socket, { jsonrpc: '2.0', method: 'session/cancel', params: { sessionId } });
+  assert.equal((await cancelled).result.stopReason, 'cancelled');
+  const { ended, turns } = (await status(bridge.address)).body;
+  assert.deepEqual(
+    ended.map(({ seq, key, stopReason }) => ({ seq, key, stopReason })),
+    [
+      { seq: 1, key, stopReason: 'error' },
+      { seq: 2, key, stopReason: 'cancelled' }
+    ]
+  );
+  assert.equal(turns, 2);
+  await closeSocket(socket);
+});
+
+test('forgets ended turns after a minute, keeping their count', () => {
+  let clock = 0;
+  const activity = createActivity(undefined, () => clock);
+  activity.turnStarted('a', 's1');
+  activity.turnEnded('a', 'end_turn');
+  assert.deepEqual(activity.snapshot().ended, [{ seq: 1, sessionId: 's1', stopReason: 'end_turn' }]);
+  clock = 60_000;
+  assert.deepEqual(activity.snapshot().ended, []);
+  assert.equal(activity.snapshot().turns, 1);
 });
 
 test('tracks token counts, cost, and quota, and records them with the session', async (t) => {
