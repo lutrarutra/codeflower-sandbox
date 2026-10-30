@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { AGENT_NAMES, createAgents, PROVIDED_KEY_VARIABLE } from './agents.js';
+import { readActions } from './actions.js';
 import { startEgressForwarder } from './egress.js';
 import { connectionUrl, startBridge } from './server.js';
 import { EXIT_CODES, runTask } from './task.js';
@@ -138,6 +139,7 @@ const bridge = await startBridge({
   initialPrompt,
   // The batch job's end, from the app (Slurm, PBS, HTCondor or --time-limit).
   allocationEnd: Date.parse(process.env.CODEFLOWER_ALLOCATION_END ?? '') || undefined,
+  actions: await readActions(`${TEMPLATES}/actions`),
   wrapUpTemplate: await readFile(`${TEMPLATES}/wrap-up.md`, 'utf8'),
   wrapUpQuitTemplate: await readFile(`${TEMPLATES}/wrap-up-quit.md`, 'utf8'),
   ptyHelper: ['/opt/conda/bin/python3', '/opt/codeflower/bin/codeflower-pty'],

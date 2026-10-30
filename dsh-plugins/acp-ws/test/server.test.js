@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import WebSocket from 'ws';
 import { createActivity } from '../src/activity.js';
+import { readActions } from '../src/actions.js';
 import { createAgents, loadRegistry } from '../src/agents.js';
 import { writeCommentsSlot } from '../src/files.js';
 import { agentEnvironment, startBridge } from '../src/server.js';
@@ -91,6 +92,23 @@ test('does not pass the initial prompt file path to the agent', () => {
   });
   assert.equal(environment.CODEFLOWER_INITIAL_PROMPT_FILE, undefined);
   assert.equal(environment.CODEFLOWER_TOKEN, undefined);
+});
+
+test('lists actions loaded from the configured templates', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'codeflower-actions-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const actionsDirectory = join(directory, 'actions');
+  await mkdir(actionsDirectory);
+  await writeFile(
+    join(actionsDirectory, '01-checkpoint.md'),
+    '---\ntitle: Checkpoint\ndescription: Save progress\nicon: save\nmode: queue\n---\nSave progress.'
+  );
+  const actions = await readActions(actionsDirectory);
+  const { bridge } = await startTestBridge(t, { actions });
+  const socket = await openSocket(bridge.address);
+  t.after(() => closeSocket(socket));
+  await initialize(socket);
+  assert.deepEqual((await call(socket, '_codeflower/actions/list')).result, { actions });
 });
 
 async function startTestBridge(t, { agentName = 'claude', ...overrides } = {}) {

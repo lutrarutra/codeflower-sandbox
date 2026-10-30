@@ -369,6 +369,7 @@ export async function startBridge(options) {
     // When the batch job ends (ms since the epoch), and what chats with a turn
     // running are told some minutes before ({{end}}, {{minutes}}).
     allocationEnd,
+    actions = [],
     wrapUpTemplate,
     wrapUpLeadMs = WRAP_UP_LEAD_MS,
     // What chats are told when the client that started the sandbox quits
@@ -1359,6 +1360,9 @@ export async function startBridge(options) {
               credentials: agent.setCredentials ? 'keys' : 'agent',
               ...(slurmJobId ? { slurmJobId } : {})
             });
+            break;
+          case '_codeflower/actions/list':
+            respond({ actions });
             break;
           case '_codeflower/activity':
             respond(activitySnapshot());
