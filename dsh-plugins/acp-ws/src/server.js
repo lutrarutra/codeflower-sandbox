@@ -26,6 +26,9 @@ const CONNECTION_PATH = '/acp';
 const STATUS_PATH = '/status';
 // The app's client asks chats to wrap up here before it stops the sandbox.
 const WRAP_UP_PATH = '/wrap-up';
+// The app lists the chats here without opening a window, which would take
+// the worker over from the one connected.
+const SESSIONS_PATH = '/sessions';
 const MAX_WRAP_UP_BODY = 4096;
 // A window that misses two pings in a row is gone, e.g. a laptop that went to sleep.
 const PING_MS = 30_000;
@@ -559,6 +562,12 @@ export async function startBridge(options) {
     });
   };
 
+  // This agent's recorded sessions, as _codeflower/sessions/list and GET /sessions list them.
+  const ownSessions = async () => {
+    const sessions = sessionsDirectory ? await listSessions(sessionsDirectory) : [];
+    return sessions.filter((session) => session.harness === agentName);
+  };
+
   const bearer = (request) => {
     const authorization = request.headers.authorization;
     return typeof authorization === 'string' && authorization.startsWith('Bearer ')
@@ -583,6 +592,25 @@ export async function startBridge(options) {
         response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
         response.end(JSON.stringify(status));
       });
+      return;
+    }
+    if (request.method === 'GET' && pathname === SESSIONS_PATH) {
+      if (!constantTimeTokenMatch(bearer(request), token)) {
+        response.writeHead(401, { connection: 'close' });
+        response.end();
+        return;
+      }
+      ownSessions().then(
+        (sessions) => {
+          response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+          response.end(JSON.stringify({ sessions }));
+        },
+        (error) => {
+          log(`Could not list the sessions: ${error.message}`);
+          response.writeHead(500, { 'content-type': 'application/json' });
+          response.end(JSON.stringify({ error: 'could not list the sessions' }));
+        }
+      );
       return;
     }
     if (request.method === 'POST' && pathname === WRAP_UP_PATH) {
@@ -1340,11 +1368,9 @@ export async function startBridge(options) {
             // Codex's limits, if the last read is old; the notification brings them.
             refreshLimits();
             break;
-          case '_codeflower/sessions/list': {
-            const sessions = sessionsDirectory ? await listSessions(sessionsDirectory) : [];
-            respond({ sessions: sessions.filter((session) => session.harness === agentName) });
+          case '_codeflower/sessions/list':
+            respond({ sessions: await ownSessions() });
             break;
-          }
           case '_codeflower/sessions/transcript': {
             const directory = requireSessions();
             const key = requireOwnSession();

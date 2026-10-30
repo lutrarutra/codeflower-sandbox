@@ -312,6 +312,12 @@ test('relays chat, permissions, cancellation, and several sessions, and records 
   assert.deepEqual(sessions.map((session) => session.key).sort(), [firstKey, sessionKey('claude', second)].sort());
   assert.equal(sessions.find((session) => session.key === firstKey).title, 'say hello');
   assert.equal(sessions[0].openOn, 'instance-test');
+  // The app lists the same chats over HTTP, without opening a window.
+  const listing = (headers) => fetch(`http://127.0.0.1:${bridge.address.port}/sessions`, { headers });
+  assert.equal((await listing({})).status, 401);
+  const listed = await listing({ authorization: `Bearer ${token}` });
+  assert.equal(listed.status, 200);
+  assert.deepEqual((await listed.json()).sessions, sessions);
 
   assert.deepEqual(
     (await call(socket, '_codeflower/sessions/transcript', { key: firstKey })).result.entries.map((entry) => entry.kind),
