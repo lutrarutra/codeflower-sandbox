@@ -7,7 +7,7 @@
 <p align="center">The isolated image the agents work in, and the bridge to VS Code.</p>
 
 <p align="center">
-  <a href="https://github.com/lutrarutra/codeflower-launcher"><img src="https://raw.githubusercontent.com/lutrarutra/codeflower-launcher/main/assets/icon.png" width="20" height="20" alt=""> launcher</a>
+  <a href="https://github.com/lutrarutra/codeflower-app"><img src="https://raw.githubusercontent.com/lutrarutra/codeflower-app/main/assets/icon.png" width="20" height="20" alt=""> app</a>
   &nbsp;·&nbsp;
   <b><img src="assets/icon.svg" width="20" height="20" alt=""> sandbox</b>
   &nbsp;·&nbsp;
@@ -74,7 +74,7 @@ flowchart LR
 4. The agent writes its findings as storyteller reports, which open in VS Code beside the chat.
 
 Releases are published as `ghcr.io/lutrarutra/codeflower-sandbox` for linux/amd64 and linux/arm64,
-tagged `X.Y.Z`, `X.Y`, `latest` and `sha-<commit>`. The launcher downloads the `X.Y` it was tested
+tagged `X.Y.Z`, `X.Y`, `latest` and `sha-<commit>`. The app downloads the `X.Y` it was tested
 with (`codeflower pull`); to get it yourself:
 
 ```sh
@@ -90,12 +90,12 @@ make sandbox-build-linux    # build/codeflower-sandbox-amd64.tar for an x86_64 c
 make bridge-install bridge-test
 ```
 
-The launcher ([codeflower-launcher](https://github.com/lutrarutra/codeflower-launcher)) starts
+The app ([codeflower-app](https://github.com/lutrarutra/codeflower-app)) starts
 the image. The `CODEFLOWER_*` environment and `/opt/codeflower` paths it relies on are described
 in the [architecture document](https://github.com/lutrarutra/codeflower-workspace/blob/main/docs/architecture.md).
 At startup each worker writes its own snapshot under `run/`; `codeflower-doctor` reads that
 snapshot and checks current resources and, when isolated, the current network allowlist. It
-reports the allocation the launcher found (`CODEFLOWER_ALLOCATION_*`: the batch job's CPUs, memory,
+reports the allocation the app found (`CODEFLOWER_ALLOCATION_*`: the batch job's CPUs, memory,
 GPUs and end, or `--cpus`, `--memory`, `--time-limit`) and the tightest cgroup limit above the
 process, found through `/proc/self/cgroup` because Apptainer shows the host's cgroup tree.
 It also writes a data inventory of `/data/input` there (`CODEFLOWER_INVENTORY_FILE`, at most

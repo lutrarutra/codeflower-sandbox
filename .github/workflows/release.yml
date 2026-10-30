@@ -154,7 +154,7 @@ jobs:
 
       - uses: docker/setup-buildx-action@v4
 
-      # 1.2.3, 1.2, sha-abc1234 and latest. The launcher pins major.minor.
+      # 1.2.3, 1.2, sha-abc1234 and latest. The app pins major.minor.
       - uses: docker/metadata-action@v6
         id: meta
         with:
@@ -198,7 +198,7 @@ jobs:
           apptainer pull codeflower-sandbox.sif docker://$IMAGE:$VERSION
           \`\`\`
 
-          The launcher pulls the image itself (\`codeflower pull\`). Platforms: linux/amd64, linux/arm64.
+          The app pulls the image itself (\`codeflower pull\`). Platforms: linux/amd64, linux/arm64.
           NOTES
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release edit "$GITHUB_REF_NAME" --notes-file notes.md

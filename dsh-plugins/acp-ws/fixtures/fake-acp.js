@@ -133,7 +133,7 @@ input.on('line', async (line) => {
           agentCapabilities: process.argv.includes('--no-system-prompt')
             ? {}
             : { sessionCapabilities: { systemPrompt: { mode: { append: {} } } } },
-          leakedLauncherToken: process.env.CODEFLOWER_TOKEN ?? null,
+          leakedAppToken: process.env.CODEFLOWER_TOKEN ?? null,
           credentialVariables: CREDENTIAL_VARIABLES.filter((name) => process.env[name] !== undefined),
           noBrowser: process.env.NO_BROWSER ?? null,
           argv: process.argv.slice(2),

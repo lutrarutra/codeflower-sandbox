@@ -1,5 +1,5 @@
 #!/usr/local/bin/node --no-warnings
-// Tells the agent what a network-isolated sandbox may reach. The launcher,
+// Tells the agent what a network-isolated sandbox may reach. The app,
 // outside the sandbox, is its only way out and checks every host against the
 // user's allowlist file; only the user can change that file.
 import { createConnection } from 'node:net';
@@ -8,11 +8,11 @@ const usage = `Usage: codeflower-network [check HOST[:PORT]]
 
 Without arguments, lists the hosts this sandbox may reach and the file on the
 user's computer that allows more. "check" tries to reach HOST (port 443 unless
-given) and says whether the launcher allows it.`;
+given) and says whether the app allows it.`;
 
 const PROXY = { host: '127.0.0.1', port: 3128 };
 
-// One request to the launcher's proxy; resolves with the status and body.
+// One request to the app's proxy; resolves with the status and body.
 function ask(request) {
   return new Promise((resolve, reject) => {
     const socket = createConnection(PROXY);
@@ -21,10 +21,10 @@ function ask(request) {
       socket.destroy();
       const [head, ...body] = data.split('\r\n\r\n');
       const status = Number(head.split(' ')[1]);
-      if (!status) reject(new Error('the launcher did not answer'));
+      if (!status) reject(new Error('the app did not answer'));
       else resolve({ status, body: body.join('\r\n\r\n').trim() });
     };
-    socket.setTimeout(30_000, () => reject(new Error('the launcher did not answer in time')));
+    socket.setTimeout(30_000, () => reject(new Error('the app did not answer in time')));
     socket.on('connect', () => socket.write(request));
     socket.on('data', (chunk) => {
       data += chunk;
@@ -50,11 +50,11 @@ try {
   if (args.length === 0) {
     const { body } = await ask('GET /allowlist HTTP/1.1\r\nHost: codeflower\r\nConnection: close\r\n\r\n');
     const list = JSON.parse(body);
-    console.log('The network is isolated: this sandbox reaches only these hosts, through the launcher.');
+    console.log('The network is isolated: this sandbox reaches only these hosts, through the app.');
     console.log(`\nThe agent's service (always allowed):\n  ${list.agent.join('\n  ') || '(none)'}`);
     console.log(`\nAllowed by the user:\n  ${list.allowed.join('\n  ') || '(none)'}`);
     console.log(`\nTo allow more, the user adds lines to this file on their computer (changes apply immediately):\n  ${list.file}`);
-    // Older launchers do not send presets.
+    // Older apps do not send presets.
     if (list.presets?.length) {
       console.log('\nPresets: one line "@name" in that file allows every host of one service:');
       for (const preset of list.presets) {

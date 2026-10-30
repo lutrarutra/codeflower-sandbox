@@ -16,7 +16,7 @@ import { createUsage, dshTokens } from './usage.js';
 export const EXIT_CODES = { completed: 0, failed: 1, unmet: 2, not_signed_in: 3, cancelled: 130 };
 
 const DEFAULT_ROUNDS = 3;
-// The launcher stops the sandbox 15 s after asking; the turn's end must be recorded before.
+// The app stops the sandbox 15 s after asking; the turn's end must be recorded before.
 const CANCEL_GRACE_MS = 8_000;
 const STATUS_PATTERN = /TASK_STATUS:\s*(complete|incomplete|impossible)\b[\s:—–-]*(.*)/i;
 const AUTH_INITIALIZE_ID = 'task-auth-initialize';
@@ -352,7 +352,7 @@ const ATTEMPT_SETTINGS = ['maxRounds', 'model', 'effort', 'options', 'progress']
 /**
  * Reads what one attempt at a task needs from the task's folder:
  *
- *   tasks/<id>/task.json               the task, written once by the launcher
+ *   tasks/<id>/task.json               the task, written once by the app
  *   tasks/<id>/session.json            its session, once one was started
  *   tasks/<id>/attempts/<n>/attempt.json   this attempt's follow-up and settings
  *   tasks/<id>/attempts/<n>/result.json    how it ended

@@ -110,7 +110,7 @@ test('cgroup v1 limits are read per controller', (t) => {
   assert.match(facts, /cgroup memory limit: 2\.00 GiB \(set on \/slurm\/uid_1\/job_9\)/);
 });
 
-test('the allocation the launcher found is reported with the time left', (t) => {
+test('the allocation the app found is reported with the time left', (t) => {
   const root = fakeRoot(t, { 'proc/self/cgroup': '0::/\n' });
   const end = new Date(Date.now() + (2 * 60 + 30.5) * 60000).toISOString();
   const facts = startup({

@@ -203,7 +203,7 @@ test('starts the worker agent on connect without passing it any credentials', as
 
   const initialized = await initialize(socket);
   assert.deepEqual(initialized.credentialVariables, []);
-  assert.equal(initialized.leakedLauncherToken, null);
+  assert.equal(initialized.leakedAppToken, null);
   assert.equal(initialized.noBrowser, '1');
 
   const status = (await call(socket, '_codeflower/status')).result;

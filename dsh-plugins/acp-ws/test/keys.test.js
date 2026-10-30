@@ -22,7 +22,7 @@ async function setup(t) {
   return { agents, environment };
 }
 
-test('the key from the launcher config is never passed on to an agent', () => {
+test('the key from the app config is never passed on to an agent', () => {
   assert.ok(CREDENTIAL_VARIABLES.includes(PROVIDED_KEY_VARIABLE));
 });
 
@@ -125,7 +125,7 @@ for (const [agentName, homeName, fileName] of [
       timeout: 5000
     });
     assert.equal(result.status, 1, result.stderr);
-    assert.match(result.stderr, /Could not store the API key from the launcher's config: Invalid JSON/);
+    assert.match(result.stderr, /Could not store the API key from the app's config: Invalid JSON/);
     assert.doesNotMatch(result.stderr, /test-key|existing":"secret|worker ready/);
     assert.equal(await readFile(file, 'utf8'), content);
   });

@@ -141,7 +141,7 @@ if [ -n "${CODEFLOWER_INSTANCE_ID:-}" ]; then
   fi
 fi
 
-# The launcher's development --inspect-port sets this; the agents never
+# The app's development --inspect-port sets this; the agents never
 # inherit an inspector because it is a node flag, not NODE_OPTIONS.
 if [ -n "${CODEFLOWER_BRIDGE_INSPECT:-}" ]; then
   exec /usr/local/bin/node "--inspect=$CODEFLOWER_BRIDGE_INSPECT" /opt/codeflower/acp-ws/src/index.js

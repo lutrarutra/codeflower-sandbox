@@ -30,7 +30,7 @@ const agents = createAgents({
   dshUsagePatch: DSH_USAGE_PATCH
 });
 
-// The launcher's config may give the agent an API key. It goes into the
+// The app's config may give the agent an API key. It goes into the
 // agent's own files in the project, and leaves this process's environment so
 // that nothing started from here inherits it.
 const providedKey = process.env[PROVIDED_KEY_VARIABLE];
@@ -38,14 +38,14 @@ delete process.env[PROVIDED_KEY_VARIABLE];
 if (providedKey) {
   try {
     const kept = await agents[agentName].provideKey?.(providedKey);
-    if (kept) process.stderr.write(`The API key from the launcher's config was not used: ${kept}\n`);
+    if (kept) process.stderr.write(`The API key from the app's config was not used: ${kept}\n`);
   } catch (error) {
-    throw new Error(`Could not store the API key from the launcher's config: ${error.message}`);
+    throw new Error(`Could not store the API key from the app's config: ${error.message}`);
   }
 }
 
 // What the extension shows about this worker.
-// The folders the launcher mounted, e.g. /data/input/study42, with their host paths.
+// The folders the app mounted, e.g. /data/input/study42, with their host paths.
 function mounts() {
   try {
     const value = JSON.parse(process.env.CODEFLOWER_MOUNTS ?? '[]');
@@ -63,7 +63,7 @@ async function describe() {
   };
 }
 
-// A network-isolated sandbox's only way out: the launcher's proxy.
+// A network-isolated sandbox's only way out: the app's proxy.
 const egress = process.env.CODEFLOWER_EGRESS_SOCKET
   ? await startEgressForwarder(process.env.CODEFLOWER_EGRESS_SOCKET).catch((error) => {
       process.stderr.write(`The sandbox has no network: ${error.message}\n`);
@@ -137,14 +137,14 @@ const bridge = await startBridge({
   advertiseHost: requiredEnvironment('CODEFLOWER_ADVERTISE_HOST'),
   token: requiredEnvironment('CODEFLOWER_TOKEN'),
   connectionFile: requiredEnvironment('CODEFLOWER_CONNECTION_FILE'),
-  launcherPid: Number(process.env.CODEFLOWER_LAUNCHER_PID ?? process.pid),
+  appPid: Number(process.env.CODEFLOWER_APP_PID ?? process.pid),
   instanceId: requiredEnvironment('CODEFLOWER_INSTANCE_ID'),
   slurmJobId: process.env.CODEFLOWER_SLURM_JOB_ID,
   sessionsDirectory: requiredEnvironment('CODEFLOWER_SESSIONS_DIR'),
   agentName,
   agent: agents[agentName],
   initialPrompt,
-  // The batch job's end, from the launcher (Slurm, PBS, HTCondor or --time-limit).
+  // The batch job's end, from the app (Slurm, PBS, HTCondor or --time-limit).
   allocationEnd: Date.parse(process.env.CODEFLOWER_ALLOCATION_END ?? '') || undefined,
   wrapUpTemplate: await readFile(`${TEMPLATES}/wrap-up.md`, 'utf8'),
   wrapUpQuitTemplate: await readFile(`${TEMPLATES}/wrap-up-quit.md`, 'utf8'),

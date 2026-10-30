@@ -6,7 +6,7 @@ description: This sandbox's network is isolated to an allowlist. Use whenever a 
 # Working in a network-isolated sandbox
 
 The user started this sandbox with its network isolated, so their data cannot
-leave it. The sandbox has no network of its own; the code flower launcher,
+leave it. The sandbox has no network of its own; the code flower app,
 outside the sandbox, is its only way out and lets through only:
 
 - your own service (the model API you run on), and

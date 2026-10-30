@@ -21,7 +21,7 @@ async function socketDirectory(t) {
   return directory;
 }
 
-test('an isolated bridge listens on the socket and advertises the launcher port', async (t) => {
+test('an isolated bridge listens on the socket and advertises the app port', async (t) => {
   const directory = await socketDirectory(t);
   const socket = join(directory, 'bridge.sock');
   const agents = createAgents({
@@ -59,13 +59,13 @@ test('an isolated bridge listens on the socket and advertises the launcher port'
   status.resume();
 });
 
-test('the egress forwarder passes connections to the launcher socket', async (t) => {
+test('the egress forwarder passes connections to the app socket', async (t) => {
   const directory = await socketDirectory(t);
   const socket = join(directory, 'egress.sock');
-  const launcher = createServer((connection) => connection.pipe(connection));
-  launcher.listen(socket);
-  await once(launcher, 'listening');
-  t.after(() => launcher.close());
+  const app = createServer((connection) => connection.pipe(connection));
+  app.listen(socket);
+  await once(app, 'listening');
+  t.after(() => app.close());
 
   const forwarder = await startEgressForwarder(socket, { port: 0 });
   t.after(() => forwarder.close());
@@ -76,7 +76,7 @@ test('the egress forwarder passes connections to the launcher socket', async (t)
   assert.equal(echoed, 'CONNECT pypi.org:443 HTTP/1.1\r\n\r\n');
 });
 
-test('the egress forwarder closes clients when the launcher is gone', async (t) => {
+test('the egress forwarder closes clients when the app is gone', async (t) => {
   const directory = await socketDirectory(t);
   const forwarder = await startEgressForwarder(join(directory, 'missing.sock'), { port: 0 });
   t.after(() => forwarder.close());

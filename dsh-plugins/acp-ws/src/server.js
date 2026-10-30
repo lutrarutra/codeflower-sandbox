@@ -24,7 +24,7 @@ import { createUsage, dshTokens } from './usage.js';
 
 const CONNECTION_PATH = '/acp';
 const STATUS_PATH = '/status';
-// The launcher's client asks chats to wrap up here before it stops the sandbox.
+// The app's client asks chats to wrap up here before it stops the sandbox.
 const WRAP_UP_PATH = '/wrap-up';
 const MAX_WRAP_UP_BODY = 4096;
 // A window that misses two pings in a row is gone, e.g. a laptop that went to sleep.
@@ -113,7 +113,7 @@ export function agentEnvironment(environment, harnessEnvironment = {}) {
   delete result.CODEFLOWER_PORT;
   delete result.CODEFLOWER_LISTEN_SOCKET;
   delete result.CODEFLOWER_EGRESS_SOCKET;
-  delete result.CODEFLOWER_LAUNCHER_PID;
+  delete result.CODEFLOWER_APP_PID;
   delete result.CODEFLOWER_INSTANCE_ID;
   delete result.CODEFLOWER_SLURM_JOB_ID;
   delete result.CODEFLOWER_SESSIONS_DIR;
@@ -350,13 +350,13 @@ export async function startBridge(options) {
   const {
     host = '0.0.0.0',
     port = 0,
-    // A network-isolated sandbox listens on a Unix socket the launcher
-    // forwards to; port is then the launcher's.
+    // A network-isolated sandbox listens on a Unix socket the app
+    // forwards to; port is then the app's.
     listenSocket,
     advertiseHost = host,
     token,
     connectionFile,
-    launcherPid = process.pid,
+    appPid = process.pid,
     instanceId = randomUUID(),
     slurmJobId,
     agentName,
@@ -572,7 +572,7 @@ export async function startBridge(options) {
     try {
       pathname = new URL(request.url, 'http://localhost').pathname;
     } catch {}
-    // What the launcher shows about the worker: counts and chat titles only.
+    // What the app shows about the worker: counts and chat titles only.
     if (request.method === 'GET' && pathname === STATUS_PATH) {
       if (!constantTimeTokenMatch(bearer(request), token)) {
         response.writeHead(401, { connection: 'close' });
@@ -1566,7 +1566,7 @@ export async function startBridge(options) {
     path: CONNECTION_PATH,
     transport: 'websocket',
     token,
-    pid: launcherPid,
+    pid: appPid,
     started_at: new Date().toISOString(),
     agent: agentName,
     ...(initialPrompt !== undefined ? { initialPrompt: true } : {}),

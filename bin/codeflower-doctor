@@ -79,11 +79,11 @@ function remaining(end) {
   return `${Math.floor(minutes / 60)} h ${minutes % 60} min left`;
 }
 
-// What the launcher read from the batch job or the user's flags, on the host.
+// What the app read from the batch job or the user's flags, on the host.
 function allocation() {
   const env = process.env;
   if (!env.CODEFLOWER_ALLOCATION_SOURCE) {
-    return ['- None reported: the launcher found no batch job (Slurm, PBS, LSF, Grid Engine, HTCondor) and no --cpus, --memory or --time-limit.'];
+    return ['- None reported: the app found no batch job (Slurm, PBS, LSF, Grid Engine, HTCondor) and no --cpus, --memory or --time-limit.'];
   }
   const lines = [`- Source: ${env.CODEFLOWER_ALLOCATION_SOURCE}`];
   if (env.CODEFLOWER_ALLOCATION_CPUS) lines.push(`- CPUs: ${env.CODEFLOWER_ALLOCATION_CPUS}`);

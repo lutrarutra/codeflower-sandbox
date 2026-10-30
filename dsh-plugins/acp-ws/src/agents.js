@@ -2,7 +2,7 @@ import { access, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 
-// Where the launcher passes the API key from its config, for the worker's agent.
+// Where the app passes the API key from its config, for the worker's agent.
 export const PROVIDED_KEY_VARIABLE = 'CODEFLOWER_API_KEY';
 
 // Every credential variable any agent understands. The bridge never passes
@@ -16,7 +16,7 @@ export const CREDENTIAL_VARIABLES = [
   'CODEX_API_KEY',
   'DEEPSEEK_API_KEY',
   'CODEFLOWER_OPENAI_COMPAT_API_KEY',
-  // The key the launcher's config gives this worker's agent; see provideKey.
+  // The key the app's config gives this worker's agent; see provideKey.
   PROVIDED_KEY_VARIABLE
 ];
 
@@ -182,7 +182,7 @@ export function createAgents({
         const env = dshHome ? await readText(join(dshHome, '.env')) : '';
         return /^(DEEPSEEK_API_KEY|CODEFLOWER_OPENAI_COMPAT_API_KEY)=./m.test(env);
       },
-      // The launcher config's key goes where setCredentials puts it.
+      // The app config's key goes where setCredentials puts it.
       async provideKey(key) {
         await this.setCredentials({ deepseekApiKey: key });
       },
@@ -227,7 +227,7 @@ export function createAgents({
         if (/"primaryApiKey"\s*:\s*"[^"]+"/.test(await readText(join(claudeHome, '.claude.json')))) return 'api_key';
         return (await readJson(join(claudeHome, 'settings.json')))?.env?.ANTHROPIC_API_KEY ? 'api_key' : undefined;
       },
-      // The launcher config's key goes into the env of Claude Code's own
+      // The app config's key goes into the env of Claude Code's own
       // settings, which it applies to its sessions. A subscription login is kept.
       async provideKey(key) {
         if (!claudeHome) throw new InvalidRequest('CLAUDE_CONFIG_DIR is not set');
@@ -273,7 +273,7 @@ export function createAgents({
         if (auth?.auth_mode === 'apikey' || (auth?.OPENAI_API_KEY && !auth?.tokens)) return 'api_key';
         return auth?.tokens ? 'subscription' : undefined;
       },
-      // The launcher config's key goes into Codex's own auth.json, as its
+      // The app config's key goes into Codex's own auth.json, as its
       // API-key login does. A subscription login is kept.
       async provideKey(key) {
         if (!codexHome) throw new InvalidRequest('CODEX_HOME is not set');
