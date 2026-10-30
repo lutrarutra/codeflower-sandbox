@@ -506,8 +506,13 @@ test('shows the files the agent asks for and lets the client read them', async (
 test("saves the user's comments on a report into its store and its page, and nowhere else", async (t) => {
   const workspaceDirectory = await mkdtemp(join(tmpdir(), 'codeflower-workspace-'));
   t.after(() => rm(workspaceDirectory, { recursive: true, force: true }));
-  const { bridge, sessionsDirectory } = await startTestBridge(t, { workspace: workspaceDirectory });
-  const reports = join(workspaceDirectory, 'reports');
+  const output = join(workspaceDirectory, 'output');
+  const input = join(workspaceDirectory, 'input');
+  const { bridge, sessionsDirectory } = await startTestBridge(t, {
+    workspace: join(workspaceDirectory, 'workspace'),
+    writableFolders: [output]
+  });
+  const reports = join(workspaceDirectory, 'workspace', 'reports');
   await mkdir(join(reports, 'pbmc.report'), { recursive: true });
   await writeFile(join(reports, 'pbmc.report', 'report.json'), '{}');
   const page = (slot) => `<html><body><p>6,000 cells</p><script type="application/json" id="cf-comments">${slot}</script></body></html>`;
@@ -566,6 +571,11 @@ test('does not report success when the report changes during every comment save 
   assert.equal(writes, 0);
 });
 
+  await mkdir(join(output, 'pbmc.report'), { recursive: true });
+  await writeFile(join(output, 'pbmc.report', 'report.json'), '{}');
+  await writeFile(join(output, 'pbmc.html'), page('[]'));
+  await mkdir(input, { recursive: true });
+  await writeFile(join(input, 'pbmc.html'), page('[]'));
 async function status(address, headers = { authorization: `Bearer ${token}` }) {
   const response = await fetch(`http://127.0.0.1:${address.port}/status`, { headers });
   return { code: response.status, body: response.ok ? await response.json() : undefined };
@@ -580,6 +590,10 @@ test('keeps the agent and its chats working while no window is connected', async
   const first = await openSocket(bridge.address);
   const { pid } = await initialize(first);
   const sessionId = (await call(first, 'session/new', { cwd: '/workspace', mcpServers: [] })).result.sessionId;
+  // Reports in an output folder too, but not in a read-only one.
+  assert.equal((await save(join(output, 'pbmc.html'), comments)).result.stored, true);
+  assert.equal(JSON.parse(await readFile(join(output, 'pbmc.report', 'comments.json'), 'utf8'))[0].id, 'c-1');
+  assert.match((await save(join(input, 'pbmc.html'), '[]')).error.message, /workspace or an output folder/);
   const promptId = nextId++;
   send(first, { jsonrpc: '2.0', id: promptId, method: 'session/prompt', params: { sessionId, prompt: [{ type: 'text', text: 'long task' }] } });
   assert.equal(text(await receive(first, (message) => message.method === 'session/update')), 'started');

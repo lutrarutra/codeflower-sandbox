@@ -380,6 +380,8 @@ export async function startBridge(options) {
   if (typeof token !== 'string' || Buffer.byteLength(token) < 32) {
     throw new Error('CODEFLOWER_TOKEN must contain at least 32 bytes');
   }
+    // Read-write mounts (/data/output/NAME, /data/code/NAME), where reports may also take comments.
+    writableFolders = [],
   if (!connectionFile) {
     throw new Error('CODEFLOWER_CONNECTION_FILE is required');
   }
@@ -394,7 +396,7 @@ export async function startBridge(options) {
   }
 
   const environment = { ...workerEnvironment, CODEFLOWER_SHOW_SOCKET: showSocket };
-  const fileOptions = { workspace, privateDirectory };
+  const fileOptions = { workspace, privateDirectory, writableFolders };
 
   // One store and recorder for the worker: sessions stay open, and their
   // leases fresh, while no window is connected.

@@ -141,10 +141,12 @@ export async function writeCommentsSlot(path, slot, initialStat, initialHtml, fi
  * Saves the comments the user left on a storyteller report in VS Code (an array
  * as JSON): into the report's store, `<name>.report/comments.json`, when it has
  * one, and into the page's comment slot, so the file the user shares has them
- * too. Only HTML reports in the workspace, and only those two files.
+ * too. Only HTML reports in the workspace or a read-write mount (output and
+ * code folders), and only those two files.
  */
 export async function saveReportComments(path, json, options) {
-  if (!options.workspace) throw new InvalidRequest('There is no workspace to save comments in');
+  const candidates = [options.workspace, ...(options.writableFolders ?? [])].filter(Boolean);
+  if (!candidates.length) throw new InvalidRequest('There is no workspace to save comments in');
   if (typeof json !== 'string' || Buffer.byteLength(json) > MAX_COMMENTS_BYTES) {
     throw new InvalidRequest('Comments must be JSON text of at most 2 MB');
   }
@@ -155,15 +157,16 @@ export async function saveReportComments(path, json, options) {
     throw new InvalidRequest('Comments must be JSON');
   }
   if (!Array.isArray(comments)) throw new InvalidRequest('Comments must be a list');
-  const workspace = await realpath(options.workspace);
+  const folders = (await Promise.all(candidates.map((folder) => realpath(folder).catch(() => null)))).filter(Boolean);
   const file = await resolveFile(path, options);
-  if (!inside(file.path, workspace) || file.mimeType !== 'text/html') {
-    throw new InvalidRequest('Comments can only be saved on HTML reports in the workspace');
+  const folder = folders.find((candidate) => inside(file.path, candidate));
+  if (!folder || file.mimeType !== 'text/html') {
+    throw new InvalidRequest('Comments can only be saved on HTML reports in the workspace or an output folder');
   }
   // In a script element: no "<" can end it early.
   const slot = JSON.stringify(comments).replace(/</g, '\\u003c');
   const store = await realpath(file.path.replace(/\.html?$/i, '.report')).catch(() => null);
-  const stored = store && inside(store, workspace) && (await stat(join(store, 'report.json')).catch(() => null))?.isFile();
+  const stored = store && inside(store, folder) && (await stat(join(store, 'report.json')).catch(() => null))?.isFile();
   // Checked before anything is written: a page without the slot does not take comments.
   const read = await stat(file.path);
   const html = await readFile(file.path, 'utf8');

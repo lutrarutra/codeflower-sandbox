@@ -149,6 +149,10 @@ const bridge = await startBridge({
   wrapUpTemplate: await readFile(`${TEMPLATES}/wrap-up.md`, 'utf8'),
   ptyHelper: ['/opt/conda/bin/python3', '/opt/codeflower/bin/codeflower-pty'],
   describe
+  // Output and code folders: reports there take comments, like those in the workspace.
+  writableFolders: mounts()
+    .filter((mount) => mount && typeof mount.target === 'string' && mount.readOnly === false)
+    .map((mount) => mount.target),
 });
 
 process.stderr.write(
