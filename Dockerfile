@@ -18,7 +18,7 @@ COPY dsh-plugins/acp-ws/src ./src
 # installs a copy in the project, editable). Pinned by tag; a development build
 # uses the workspace checkout instead: --build-context storyteller=../storyteller.
 FROM scratch AS storyteller
-ADD --keep-git-dir=false https://github.com/lutrarutra/storyteller.git#v0.2.0 /
+ADD --keep-git-dir=false https://github.com/lutrarutra/storyteller.git#v0.2.1 /
 
 FROM continuumio/miniconda3:26.7.1-1@sha256:eca594d684f495c1a02beff33a9fab53aec8c5830eaf431bb149912dc6c9e4c1
 
