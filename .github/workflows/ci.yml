@@ -103,4 +103,17 @@ jobs:
             export PYTHONPATH=/opt/codeflower/src/storyteller/src
             python -c "import storyteller as sty; r = sty.Report(\"Smoke\", \"/tmp/smoke.html\"); r.text(\"ok\", key=\"t\"); r.save()"
             python -m storyteller.cli check /tmp/smoke.html
+            test -f /opt/codeflower/skills/codeflower-sketch/SKILL.md -a -f /opt/codeflower/skills/codeflower-sketch/SOURCES.md
+            test -d /data/icons
+            rsvg-convert --version
+            fc-match -f "%{family}\n" Arial | grep -q "Liberation Sans"
+            mkdir -p /tmp/icons
+            CODEFLOWER_ICONS=/tmp/icons codeflower-sketch find heart
+            codeflower-sketch sources > /dev/null
+            printf "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 20 10\"><text id=\"t\" data-label=\"T\" y=\"8\" font-family=\"Arial\" font-size=\"8\">ok</text></svg>" > /tmp/smoke.svg
+            CODEFLOWER_ICONS=/tmp/icons codeflower-sketch check /tmp/smoke.svg
+            codeflower-sketch render /tmp/smoke.svg
+            test -s /tmp/smoke.pdf -a -s /tmp/smoke.png
+            # Without fonts the text is missing and the PNG is blank.
+            python -c "from PIL import Image; assert Image.open(\"/tmp/smoke.png\").convert(\"L\").getextrema()[0] < 128, \"the text did not render\""
           '

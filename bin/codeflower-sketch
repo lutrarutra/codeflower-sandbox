@@ -1,0 +1,739 @@
+#!/usr/bin/env python3
+"""Icons and figures for schematic scientific figures: the user's icon gallery.
+
+The gallery ($CODEFLOWER_ICONS, the user's ~/.codeflower/icons) is shared by all
+of the user's projects. Icons come only from files the user downloaded and
+attached: Servier Medical Art (PNG or slide kits) and SciDraw (SVG or PNG), or
+icons generated on the user's request. Nothing here downloads icons; only
+`generate` uses the network, to call the image provider the user configured.
+Each icon keeps its source, license and credit, so `credits` can write the
+attribution a figure needs. Only the standard library is used.
+"""
+
+import argparse
+import base64
+import hashlib
+import html
+import io
+import json
+import os
+import posixpath
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
+from xml.etree import ElementTree
+
+SOURCES = ("servier", "scidraw", "own", "generated")
+IMAGE_SUFFIXES = {".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}
+SERVIER_CREDIT = "Servier Medical Art (https://smart.servier.com), licensed under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/)"
+LICENSE_URLS = {
+    "CC BY 4.0": "https://creativecommons.org/licenses/by/4.0/",
+    "CC BY 3.0": "https://creativecommons.org/licenses/by/3.0/",
+    "CC BY 2.0": "https://creativecommons.org/licenses/by/2.0/",
+    "CC0 1.0": "https://creativecommons.org/publicdomain/zero/1.0/",
+}
+# The gallery page is shown in a tab, which takes files up to 10 MB.
+GALLERY_BYTES = 9_000_000
+FIND_LIMIT = 20
+IMAGE_DEFAULT_MODELS = {"openai": "gpt-image-1", "google": "gemini-2.5-flash-image"}
+NS = {
+    "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+    "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
+    "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    "asvg": "http://schemas.microsoft.com/office/drawing/2016/SVG/main",
+}
+SVG_NS = "http://www.w3.org/2000/svg"
+XLINK_NS = "http://www.w3.org/1999/xlink"
+# Children of a figure's root that need no id: they draw nothing the user would point at.
+UNNAMED_TAGS = {"defs", "style", "title", "desc", "metadata", "script"}
+
+
+class Failure(Exception):
+    def __init__(self, message, status=1):
+        super().__init__(message)
+        self.status = status
+
+
+def gallery_root():
+    # The app sets it only when it mounted the gallery: /data/icons alone is the
+    # image's empty folder, and icons written there would be lost.
+    root = os.environ.get("CODEFLOWER_ICONS", "")
+    if not root or not os.path.isdir(root):
+        raise Failure("The user's icon gallery is not mounted in this sandbox. It needs a code flower app that mounts it "
+                      "(~/.codeflower/icons), and `icons: {folder: off}` must not be set in its config.yaml.")
+    return Path(root)
+
+
+def workspace():
+    return Path(os.environ.get("CODEFLOWER_WORKSPACE") or os.getcwd())
+
+
+def slug(text, limit=60):
+    text = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return text[:limit].strip("-") or "icon"
+
+
+def sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def normalize_license(text):
+    """'CC BY 4.0' or 'CC0 1.0' from the ways licenses are written; None for any other license."""
+    compact = re.sub(r"[\s_-]+", "", text.lower()).replace("creativecommons", "cc").replace("attribution", "by")
+    compact = compact.replace("international", "").replace("license", "").replace("publicdomain", "")
+    if compact in ("cc0", "cc01.0", "cczero"):
+        return "CC0 1.0"
+    match = re.fullmatch(r"ccby(\d\.\d)?", compact)
+    if match:
+        return f"CC BY {match.group(1) or '4.0'}"
+    return None
+
+
+# ---- the gallery ----
+
+def icons(root):
+    """Every icon in the gallery, as its meta.json with `ref` and `file` added."""
+    found = []
+    for source in SOURCES:
+        folder = root / source
+        if not folder.is_dir():
+            continue
+        for entry in sorted(folder.iterdir()):
+            meta_path = entry / "meta.json"
+            if entry.name.startswith(".") or not meta_path.is_file():
+                continue
+            try:
+                meta = json.loads(meta_path.read_text())
+            except (OSError, ValueError):
+                continue
+            meta["ref"] = f"{source}/{entry.name}"
+            meta["file"] = str(entry / meta.get("filename", ""))
+            found.append(meta)
+    return found
+
+
+def lookup(root, ref):
+    source, _, name = ref.partition("/")
+    meta_path = root / source / name / "meta.json"
+    if source not in SOURCES or not name or "/" in name or name.startswith(".") or not meta_path.is_file():
+        raise Failure(f"No icon {ref} in the gallery. `codeflower-sketch find TERM` lists the icons.")
+    meta = json.loads(meta_path.read_text())
+    meta["ref"] = ref
+    meta["file"] = str(root / source / name / meta["filename"])
+    return meta
+
+
+def add_icon(root, source, data, suffix, meta, known):
+    """Stores one icon. Returns (ref, True) when added, or (ref of the same image, False)."""
+    digest = sha256(data)
+    if digest in known:
+        return known[digest], False
+    folder = root / source
+    folder.mkdir(parents=True, exist_ok=True)
+    meta = {**meta, "source": source, "filename": f"icon{suffix}", "sha256": digest, "importedAt": now()}
+    # Written aside and renamed into place: other sandboxes of the user share the gallery.
+    staging = Path(tempfile.mkdtemp(prefix=".import-", dir=folder))
+    try:
+        (staging / meta["filename"]).write_bytes(data)
+        (staging / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n")
+        base = slug(meta["title"])
+        for attempt in range(1, 1000):
+            name = base if attempt == 1 else f"{base}-{attempt}"
+            try:
+                os.rename(staging, folder / name)
+            except OSError:
+                if (folder / name).exists():
+                    continue
+                raise
+            ref = f"{source}/{name}"
+            known[digest] = ref
+            return ref, True
+        raise Failure(f"Too many icons called {base} in {folder}")
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def known_digests(root):
+    return {meta.get("sha256"): meta["ref"] for meta in icons(root) if meta.get("sha256")}
+
+
+# ---- reading slide kits ----
+
+def title_from_name(name):
+    stem = Path(name).stem
+    stem = re.sub(r"^(SMART|ServierMedicalArt)[-_ ]*", "", stem, flags=re.IGNORECASE)
+    return re.sub(r"[-_]+", " ", stem).strip() or "icon"
+
+
+def shape_text(shape):
+    return " ".join(" ".join(t.text or "" for t in p.iter(f"{{{NS['a']}}}t")).strip()
+                    for p in shape.iter(f"{{{NS['a']}}}p")).strip()
+
+
+def shape_center(shape):
+    off = shape.find(".//a:xfrm/a:off", NS)
+    ext = shape.find(".//a:xfrm/a:ext", NS)
+    if off is None or ext is None:
+        return None
+    return (int(off.get("x", 0)) + int(ext.get("cx", 0)) / 2, int(off.get("y", 0)) + int(ext.get("cy", 0)) / 2)
+
+
+def is_placeholder_name(text):
+    return not text or re.fullmatch(r"(picture|image|grafik|bild|graphic|object|group)\s*\d*", text.strip(), re.IGNORECASE) is not None
+
+
+def slide_pictures(package, kit):
+    """(data, suffix, title) for each picture on the slides of one .pptx, with the nearest text as its name."""
+    names = set(package.namelist())
+    slides = sorted((n for n in names if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)),
+                    key=lambda n: int(re.search(r"(\d+)\.xml$", n).group(1)))
+    for slide_name in slides:
+        rels_name = posixpath.join(posixpath.dirname(slide_name), "_rels", posixpath.basename(slide_name) + ".rels")
+        targets = {}
+        if rels_name in names:
+            for rel in ElementTree.fromstring(package.read(rels_name)):
+                targets[rel.get("Id")] = posixpath.normpath(posixpath.join(posixpath.dirname(slide_name), rel.get("Target", "")))
+        tree = ElementTree.fromstring(package.read(slide_name))
+        texts = []
+        for shape in tree.iter(f"{{{NS['p']}}}sp"):
+            text, center = shape_text(shape), shape_center(shape)
+            if text and center:
+                texts.append((center, text))
+        heading = texts[0][1] if texts else ""
+        for number, picture in enumerate(tree.iter(f"{{{NS['p']}}}pic"), 1):
+            svg_blip = picture.find(".//asvg:svgBlip", NS)
+            blip = picture.find(".//a:blip", NS)
+            embed = (svg_blip if svg_blip is not None else blip)
+            target = targets.get(embed.get(f"{{{NS['r']}}}embed")) if embed is not None else None
+            suffix = Path(target or "").suffix.lower()
+            if target not in names or suffix not in IMAGE_SUFFIXES:
+                continue
+            properties = picture.find("p:nvPicPr/p:cNvPr", NS)
+            title = (properties.get("descr") or "").strip() if properties is not None else ""
+            if is_placeholder_name(title):
+                title = (properties.get("name") or "").strip() if properties is not None else ""
+            if is_placeholder_name(title):
+                center = shape_center(picture)
+                if center and texts:
+                    title = min(texts, key=lambda item: (item[0][0] - center[0]) ** 2 + (item[0][1] - center[1]) ** 2)[1]
+            if is_placeholder_name(title):
+                title = f"{heading or kit} {number}"
+            yield package.read(target), (".jpg" if suffix == ".jpeg" else suffix), title[:120]
+
+
+def servier_files(path):
+    """(data, suffix, title, category) from a PNG, a .pptx kit, or a zip of kits."""
+    suffix = path.suffix.lower()
+    if suffix in IMAGE_SUFFIXES:
+        yield path.read_bytes(), (".jpg" if suffix == ".jpeg" else suffix), title_from_name(path.name), ""
+    elif suffix == ".pptx":
+        kit = title_from_name(path.name)
+        with zipfile.ZipFile(path) as package:
+            for data, image_suffix, title in slide_pictures(package, kit):
+                yield data, image_suffix, title, kit
+    elif suffix == ".zip":
+        with zipfile.ZipFile(path) as archive:
+            for member in archive.namelist():
+                if member.lower().endswith(".pptx") and not posixpath.basename(member).startswith("."):
+                    kit = title_from_name(posixpath.basename(member))
+                    with zipfile.ZipFile(io.BytesIO(archive.read(member))) as package:
+                        for data, image_suffix, title in slide_pictures(package, kit):
+                            yield data, image_suffix, title, kit
+                elif Path(member).suffix.lower() in IMAGE_SUFFIXES and not posixpath.basename(member).startswith("."):
+                    image_suffix = Path(member).suffix.lower()
+                    yield archive.read(member), (".jpg" if image_suffix == ".jpeg" else image_suffix), title_from_name(member), ""
+    else:
+        raise Failure(f"{path}: Servier icons are PNG files, slide kits (.pptx) or the zip of all kits")
+
+
+def image_suffix(path):
+    suffix = path.suffix.lower()
+    if suffix not in IMAGE_SUFFIXES:
+        raise Failure(f"{path}: icons are SVG, PNG or JPEG files")
+    return ".jpg" if suffix == ".jpeg" else suffix
+
+
+# ---- commands ----
+
+def command_find(args):
+    root = gallery_root()
+    terms = [term.lower() for term in args.terms]
+    scored = []
+    for meta in icons(root):
+        haystack = " ".join([meta["ref"], meta.get("title", ""), meta.get("category", ""), " ".join(meta.get("tags", []))]).lower()
+        score = sum(term in haystack for term in terms)
+        if score == len(terms) or (score and not args.all_terms):
+            scored.append((-score, meta["ref"], meta))
+    scored.sort(key=lambda item: item[:2])
+    if scored:
+        print(f"{len(scored)} icon(s) in the gallery match{'' if len(scored) <= args.limit else f'; the first {args.limit}'}:")
+        for _, ref, meta in scored[:args.limit]:
+            kind = Path(meta["filename"]).suffix.lstrip(".").upper()
+            category = f" ({meta['category']})" if meta.get("category") else ""
+            print(f"- {ref}: {meta.get('title', '')}{category} [{kind}, {meta.get('license') or 'no license recorded'}]")
+        print("\nInsert one with `codeflower-sketch place REF`.")
+    query = " ".join(args.terms)
+    if not scored or args.links:
+        if not scored:
+            print(f"No icon in the gallery matches {query!r}.")
+        print(search_links(query))
+    return 0
+
+
+def search_links(query):
+    zenodo = urllib.parse.quote(f'description:"uploaded to scidraw.io" AND {query}')
+    return "\n".join([
+        "",
+        "Search the catalogs (the user downloads by hand; their sites forbid automated downloads):",
+        f"- Servier Medical Art (PNG, CC BY 4.0): https://smart.servier.com/?s={urllib.parse.quote_plus(query)}",
+        "  or a whole slide kit (.pptx): https://smart.servier.com/image-kits-by-category/",
+        "- SciDraw (mostly SVG, CC BY 4.0; each drawing's page shows its authors, license and DOI): https://scidraw.io",
+        f"  the same drawings on Zenodo: https://zenodo.org/search?q={zenodo}",
+        "",
+        "Ask the user to download the file and attach it in the chat (the paperclip, or drag and drop),",
+        "then run `codeflower-sketch import FILE --source servier|scidraw`.",
+    ])
+
+
+def command_import(args):
+    root = gallery_root()
+    known = known_digests(root)
+    added, same = [], []
+    source = args.source
+    meta = {}
+    if source == "scidraw":
+        missing = [flag for flag, value in (("--authors", args.authors), ("--license", args.license), ("--url or --doi", args.url or args.doi)) if not value]
+        if missing:
+            raise Failure("SciDraw drawings need " + ", ".join(missing) + ": ask the user, they are on the drawing's page on scidraw.io.")
+        license_name = normalize_license(args.license)
+        if not license_name:
+            raise Failure(f"{args.license!r} is not CC BY or CC0: the drawing cannot be used in a figure without asking its authors.")
+        meta = {"authors": args.authors, "license": license_name, "url": args.url or f"https://doi.org/{args.doi}", "doi": args.doi}
+    elif source == "generated":
+        if not args.model or not args.prompt:
+            raise Failure("Generated icons need --model and --prompt, so the figure can say how they were made.")
+        meta = {"model": args.model, "provider": args.provider, "prompt": args.prompt, "license": None}
+    elif source == "own":
+        license_name = normalize_license(args.license) if args.license else None
+        meta = {"authors": args.authors, "license": license_name or args.license, "url": args.url, "credit": args.credit}
+    for path in map(Path, args.paths):
+        if not path.is_file():
+            raise Failure(f"{path} does not exist")
+        if source == "servier":
+            for data, suffix, title, category in servier_files(path):
+                item = {"title": title, "category": category, "license": "CC BY 4.0", "url": "https://smart.servier.com",
+                        "importedFrom": path.name, "tags": [], **({"title": args.title} if args.title and len(args.paths) == 1 and path.suffix.lower() in IMAGE_SUFFIXES else {})}
+                ref, new = add_icon(root, source, data, suffix, item, known)
+                (added if new else same).append(ref)
+        else:
+            item = {**meta, "title": args.title or title_from_name(path.name), "importedFrom": path.name, "tags": args.tag or []}
+            ref, new = add_icon(root, source, path.read_bytes(), image_suffix(path), item, known)
+            (added if new else same).append(ref)
+    for ref in added[:50]:
+        print(f"added {ref}")
+    if len(added) > 50:
+        print(f"… and {len(added) - 50} more")
+    if same:
+        print(f"{len(same)} image(s) were already in the gallery: {', '.join(sorted(set(same))[:10])}{' …' if len(set(same)) > 10 else ''}")
+    print(f"{len(added)} icon(s) added to the gallery.")
+    return 0
+
+
+def command_gallery(args):
+    root = gallery_root()
+    terms = [term.lower() for term in args.terms]
+    chosen = [meta for meta in icons(root)
+              if all(term in " ".join([meta["ref"], meta.get("title", ""), meta.get("category", "")]).lower() for term in terms)]
+    output = Path(args.output) if args.output else workspace() / "figures" / "icons" / "gallery.html"
+    cards, size, left_out = [], 0, 0
+    for meta in chosen:
+        try:
+            data = Path(meta["file"]).read_bytes()
+        except OSError:
+            continue
+        if size + len(data) * 4 // 3 > GALLERY_BYTES:
+            left_out += 1
+            continue
+        size += len(data) * 4 // 3
+        uri = f"data:{IMAGE_SUFFIXES[Path(meta['file']).suffix]};base64,{base64.b64encode(data).decode()}"
+        cards.append(f'<figure><img src="{uri}" alt=""><figcaption><b>{html.escape(meta["ref"])}</b><br>{html.escape(meta.get("title", ""))}'
+                     f'<br><small>{html.escape(credit_of(meta))}</small></figcaption></figure>')
+    note = f"<p>{left_out} more icons were left out to keep the page small: narrow it with search terms.</p>" if left_out else ""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(f"""<!doctype html><html><head><meta charset="utf-8"><title>Icon gallery</title><style>
+body{{font:14px system-ui,sans-serif;margin:16px;background:#fff;color:#222}}main{{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px}}
+figure{{margin:0;border:1px solid #ddd;border-radius:6px;padding:8px}}img{{width:100%;height:120px;object-fit:contain}}small{{color:#666}}
+</style></head><body><h1>Icon gallery</h1><p>{len(cards)} icon(s){' matching ' + html.escape(' '.join(args.terms)) if terms else ''}.</p>{note}<main>{''.join(cards)}</main></body></html>
+""")
+    print(output)
+    return 0
+
+
+def image_size(data, suffix):
+    if suffix == ".png" and data[:8] == b"\x89PNG\r\n\x1a\n":
+        return struct.unpack(">II", data[16:24])
+    if suffix == ".jpg":
+        index = 2
+        while index + 9 < len(data):
+            if data[index] != 0xFF:
+                index += 1
+                continue
+            marker, length = data[index + 1], struct.unpack(">H", data[index + 2:index + 4])[0]
+            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                height, width = struct.unpack(">HH", data[index + 5:index + 9])
+                return width, height
+            index += 2 + length
+    return None
+
+
+def svg_box(root):
+    view_box = root.get("viewBox")
+    if view_box:
+        numbers = [float(n) for n in re.split(r"[\s,]+", view_box.strip())]
+        if len(numbers) == 4:
+            return numbers
+    width = float(re.sub(r"[a-z%]+$", "", root.get("width", "100")) or 100)
+    height = float(re.sub(r"[a-z%]+$", "", root.get("height", "100")) or 100)
+    return [0, 0, width, height]
+
+
+def inline_svg(data, prefix):
+    """The icon's SVG as a nested <svg>, its ids prefixed so several icons can share a figure."""
+    text = data.decode("utf-8", errors="replace")
+    text = re.sub(r"<\?xml[^>]*\?>|<!DOCTYPE[^>[]*(\[[^\]]*\])?>|<!--.*?-->", "", text, flags=re.DOTALL)
+    ids = set(re.findall(r'\bid="([^"]+)"', text))
+    for name in sorted(ids, key=len, reverse=True):
+        escaped = re.escape(name)
+        text = re.sub(rf'\bid="{escaped}"', f'id="{prefix}-{name}"', text)
+        text = re.sub(rf'url\(#{escaped}\)', f'url(#{prefix}-{name})', text)
+        text = re.sub(rf'href="#{escaped}"', f'href="#{prefix}-{name}"', text)
+    return text.strip()
+
+
+def command_place(args):
+    root = gallery_root()
+    for ref in args.refs:
+        meta = lookup(root, ref)
+        data = Path(meta["file"]).read_bytes()
+        suffix = Path(meta["file"]).suffix
+        element_id = args.id if args.id and len(args.refs) == 1 else slug(meta.get("title") or ref.split("/")[1], 40)
+        label = html.escape(args.label or meta.get("title", ""), quote=True)
+        if suffix == ".svg":
+            try:
+                box = svg_box(ElementTree.fromstring(data))
+            except ElementTree.ParseError as error:
+                raise Failure(f"{ref}: the SVG cannot be read ({error})")
+            ratio = box[3] / box[2] if box[2] else 1
+            height = args.width * ratio
+            nested = inline_svg(data, element_id)
+            nested = re.sub(r"<svg\b[^>]*>", lambda m: f'<svg x="0" y="0" width="{args.width:g}" height="{height:g}" viewBox="{" ".join(f"{n:g}" for n in box)}" preserveAspectRatio="xMidYMid meet">', nested, count=1)
+            body = nested
+        else:
+            size = image_size(data, suffix) or (1, 1)
+            height = args.width * size[1] / size[0]
+            uri = f"data:{IMAGE_SUFFIXES[suffix]};base64,{base64.b64encode(data).decode()}"
+            body = f'<image width="{args.width:g}" height="{height:g}" href="{uri}"/>'
+        print(f'<g id="{element_id}" data-label="{label}" data-cf-icon="{ref}" transform="translate({args.x:g} {args.y:g})">\n  {body}\n</g>')
+    return 0
+
+
+def credit_of(meta, adapted=False):
+    source = meta.get("source") or meta["ref"].split("/")[0]
+    verb = "adapted from" if adapted else "provided by"
+    if source == "servier":
+        return f"Image {verb} {SERVIER_CREDIT}"
+    if source == "scidraw":
+        doi = f", doi:{meta['doi']}" if meta.get("doi") else f", {meta.get('url')}" if meta.get("url") else ""
+        license_name = meta.get("license") or "CC BY 4.0"
+        license_url = LICENSE_URLS.get(license_name, "")
+        return f"{'Adapted from ' if adapted else ''}\"{meta.get('title')}\" by {meta.get('authors')}, SciDraw{doi}, {license_name}" + (f" ({license_url})" if license_url else "")
+    if source == "generated":
+        return f"\"{meta.get('title')}\" generated with {meta.get('model')}" + (f" ({meta.get('provider')})" if meta.get("provider") else "")
+    if meta.get("credit"):
+        return meta["credit"]
+    parts = [f"\"{meta.get('title')}\""]
+    if meta.get("authors"):
+        parts.append(f"by {meta['authors']}")
+    if meta.get("license"):
+        parts.append(meta["license"])
+    return ", ".join(parts)
+
+
+def figure_icons(path):
+    try:
+        tree = ElementTree.parse(path)
+    except (OSError, ElementTree.ParseError) as error:
+        raise Failure(f"{path}: {error}")
+    return tree, [(element.get("data-cf-icon"), element.get("data-cf-adapted", "").lower() in ("1", "true", "yes"))
+                  for element in tree.iter() if element.get("data-cf-icon")]
+
+
+def command_credits(args):
+    root = gallery_root()
+    path = Path(args.figure)
+    _, used = figure_icons(path)
+    adapted = {}
+    for ref, changed in used:
+        adapted[ref] = adapted.get(ref, False) or changed
+    lines, missing = [], []
+    servier = [ref for ref in adapted if ref.startswith("servier/")]
+    if servier:
+        any_adapted = any(adapted[ref] for ref in servier)
+        lines.append(f"Images {'adapted from' if any_adapted else 'provided by'} {SERVIER_CREDIT}.")
+    for ref in adapted:
+        if ref.startswith("servier/"):
+            continue
+        try:
+            meta = lookup(root, ref)
+        except Failure:
+            missing.append(ref)
+            continue
+        lines.append(credit_of(meta, adapted[ref]) + ".")
+    generated = [ref for ref in adapted if ref.startswith("generated/")]
+    if not lines:
+        print(f"{path} uses no icons from the gallery (no data-cf-icon attributes): no credit is needed for icons.")
+        return 0
+    legend = " ".join(lines)
+    details = [f"# Credits for {path.name}", "", legend, "", "## Icons", ""]
+    for ref in adapted:
+        try:
+            meta = lookup(root, ref)
+        except Failure:
+            continue
+        details.append(f"- `{ref}`: {meta.get('title')}{' (adapted)' if adapted[ref] else ''}; {credit_of(meta, adapted[ref])}")
+    if generated:
+        details += ["", "Some icons were generated by an AI model: check the journal's policy on AI-generated images before submitting."]
+    output = path.with_name(path.stem + ".credits.md")
+    output.write_text("\n".join(details) + "\n")
+    print(legend)
+    print(f"\nWritten to {output}")
+    if missing:
+        print(f"Not in the gallery, so not credited: {', '.join(missing)}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def local(tag):
+    return tag.rsplit("}", 1)[-1]
+
+
+def command_check(args):
+    root = gallery_root()
+    path = Path(args.figure)
+    tree, used = figure_icons(path)
+    problems = []
+    svg = tree.getroot()
+    if local(svg.tag) != "svg":
+        problems.append("the root element is not <svg>")
+    if not svg.get("viewBox"):
+        problems.append("the root <svg> has no viewBox, so it does not scale")
+    seen = {}
+    for element in svg.iter():
+        if element.get("id"):
+            seen[element.get("id")] = seen.get(element.get("id"), 0) + 1
+    problems += [f"the id {name!r} is used {count} times" for name, count in seen.items() if count > 1]
+    for child in svg:
+        name = local(child.tag)
+        if name in UNNAMED_TAGS:
+            continue
+        if not child.get("id"):
+            problems.append(f"a top-level <{name}> has no id: the user cannot select it")
+        elif not child.get("data-label"):
+            problems.append(f"#{child.get('id')} has no data-label")
+    for element in svg.iter():
+        for attribute in ("href", f"{{{XLINK_NS}}}href"):
+            target = element.get(attribute)
+            if target and not target.startswith(("#", "data:")):
+                problems.append(f"<{local(element.tag)}> refers to {target[:80]!r}: embed it, the figure must stand alone")
+        if local(element.tag) == "foreignObject":
+            problems.append("<foreignObject> does not render in PDF; use SVG text")
+    for ref, _ in used:
+        try:
+            lookup(root, ref)
+        except Failure:
+            problems.append(f"the icon {ref} is not in the gallery, so it cannot be credited")
+    if problems:
+        print("\n".join(f"- {problem}" for problem in problems))
+        return 1
+    print(f"{path}: no problems found ({len(used)} gallery icon(s)).")
+    return 0
+
+
+def command_render(args):
+    if not shutil.which("rsvg-convert"):
+        raise Failure("rsvg-convert is missing (the librsvg2-bin package): this image is too old to render figures.")
+    path = Path(args.figure)
+    outputs = []
+    for kind in args.format:
+        output = path.with_suffix(f".{kind}")
+        command = ["rsvg-convert", "--format", kind, "--output", str(output)]
+        if kind == "png":
+            command += ["--zoom", f"{args.dpi / 96:g}", "--background-color", "white"]
+        command.append(str(path))
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode:
+            raise Failure(f"rsvg-convert failed for {output}: {result.stderr.strip()}")
+        outputs.append(str(output))
+    print("\n".join(outputs))
+    return 0
+
+
+def image_settings():
+    provider = os.environ.get("CODEFLOWER_IMAGE_PROVIDER", "")
+    key_file = os.environ.get("CODEFLOWER_IMAGE_KEY_FILE", "")
+    if not provider or not key_file or not os.path.isfile(key_file):
+        raise Failure("No image provider is configured. The user can add one to their code flower config.yaml:\n"
+                      "  images:\n    provider: openai        # or google\n    api_key_env: OPENAI_API_KEY\n"
+                      "and start a new sandbox. Codex users can also use its built-in image tool.", status=3)
+    if provider not in IMAGE_DEFAULT_MODELS:
+        raise Failure(f"Unknown image provider {provider!r}: use openai or google", status=3)
+    key = Path(key_file).read_text().strip()
+    model = os.environ.get("CODEFLOWER_IMAGE_MODEL") or IMAGE_DEFAULT_MODELS[provider]
+    return provider, model, key
+
+
+def post_json(url, body, headers):
+    request = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json", **headers})
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode(errors="replace")[:500]
+        raise Failure(f"The image provider refused the request ({error.code}): {detail}")
+    except urllib.error.URLError as error:
+        raise Failure(f"The image provider cannot be reached ({error.reason}). In a network-isolated sandbox, see the codeflower-network skill.")
+
+
+def generate_image(provider, model, key, prompt, transparent):
+    base = os.environ.get("CODEFLOWER_IMAGE_BASE_URL")
+    if provider == "openai":
+        body = {"model": model, "prompt": prompt, "n": 1, "size": "1024x1024"}
+        if transparent:
+            body["background"] = "transparent"
+        answer = post_json(f"{base or 'https://api.openai.com'}/v1/images/generations", body, {"Authorization": f"Bearer {key}"})
+        return base64.b64decode(answer["data"][0]["b64_json"]), ".png"
+    answer = post_json(f"{base or 'https://generativelanguage.googleapis.com'}/v1beta/models/{model}:generateContent",
+                       {"contents": [{"parts": [{"text": prompt}]}]}, {"x-goog-api-key": key})
+    for candidate in answer.get("candidates", []):
+        for part in candidate.get("content", {}).get("parts", []):
+            inline = part.get("inlineData") or part.get("inline_data")
+            if inline and inline.get("data"):
+                return base64.b64decode(inline["data"]), ".jpg" if "jpeg" in inline.get("mimeType", "") else ".png"
+    raise Failure("The image provider answered without an image.")
+
+
+def command_generate(args):
+    root = gallery_root()
+    provider, model, key = image_settings()
+    prompt = args.prompt
+    if not args.raw:
+        prompt += (". A single scientific illustration icon in a clean, flat vector style, centered, on a plain "
+                   f"{'transparent' if args.transparent else 'white'} background, with no text, labels or frame.")
+    data, suffix = generate_image(provider, model, key, prompt, args.transparent)
+    ref, _ = add_icon(root, "generated", data, suffix,
+                      {"title": args.name, "model": model, "provider": provider, "prompt": args.prompt, "license": None, "tags": []},
+                      known_digests(root))
+    print(f"added {ref}")
+    return 0
+
+
+def command_sources(args):
+    candidates = [os.environ.get("CODEFLOWER_SKETCH_SOURCES", ""),
+                  "/opt/codeflower/skills/codeflower-sketch/SOURCES.md",
+                  str(Path(__file__).resolve().parent.parent / "skills" / "codeflower-sketch" / "SOURCES.md")]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            print(Path(candidate).read_text(), end="")
+            return 0
+    raise Failure("SOURCES.md is missing from this image")
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="codeflower-sketch", description=__doc__.split("\n\n")[0])
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    find = commands.add_parser("find", help="search the gallery; prints the catalogs' search links when nothing fits")
+    find.add_argument("terms", nargs="+")
+    find.add_argument("--all-terms", action="store_true", help="only icons that match every term")
+    find.add_argument("--links", action="store_true", help="print the search links even when icons match")
+    find.add_argument("--limit", type=int, default=FIND_LIMIT)
+    find.set_defaults(run=command_find)
+
+    importing = commands.add_parser("import", help="add files the user downloaded and attached to the gallery")
+    importing.add_argument("paths", nargs="+", metavar="PATH")
+    importing.add_argument("--source", required=True, choices=SOURCES)
+    importing.add_argument("--title", help="the icon's name (default: from the file name or the slide)")
+    importing.add_argument("--authors", help="SciDraw: the drawing's authors")
+    importing.add_argument("--license", help="SciDraw: the drawing's license (CC BY or CC0)")
+    importing.add_argument("--url", help="the page the file came from")
+    importing.add_argument("--doi", help="SciDraw: the drawing's DOI")
+    importing.add_argument("--credit", help="own: the credit line to use")
+    importing.add_argument("--tag", action="append", help="a search word (repeatable)")
+    importing.add_argument("--model", help="generated: the image model")
+    importing.add_argument("--provider", help="generated: who runs the model")
+    importing.add_argument("--prompt", help="generated: the prompt")
+    importing.set_defaults(run=command_import)
+
+    gallery = commands.add_parser("gallery", help="write an HTML contact sheet of the gallery to show the user")
+    gallery.add_argument("terms", nargs="*")
+    gallery.add_argument("--output", help="default: figures/icons/gallery.html in the workspace")
+    gallery.set_defaults(run=command_gallery)
+
+    place = commands.add_parser("place", help="print an SVG group with the icon inlined, to paste into a figure")
+    place.add_argument("refs", nargs="+", metavar="REF")
+    place.add_argument("--x", type=float, default=0)
+    place.add_argument("--y", type=float, default=0)
+    place.add_argument("--width", type=float, default=100)
+    place.add_argument("--id", help="the group's id (default: from the icon's title)")
+    place.add_argument("--label", help="the group's data-label (default: the icon's title)")
+    place.set_defaults(run=command_place)
+
+    credits = commands.add_parser("credits", help="the attribution for the icons a figure uses")
+    credits.add_argument("figure")
+    credits.set_defaults(run=command_credits)
+
+    check = commands.add_parser("check", help="find what keeps a figure from being selectable, standalone or credited")
+    check.add_argument("figure")
+    check.set_defaults(run=command_check)
+
+    render = commands.add_parser("render", help="convert the SVG figure to PDF and PNG")
+    render.add_argument("figure")
+    render.add_argument("--format", action="append", choices=("pdf", "png"), help="default: both")
+    render.add_argument("--dpi", type=float, default=300)
+    render.set_defaults(run=command_render)
+
+    generate = commands.add_parser("generate", help="generate an icon with the image provider the user configured")
+    generate.add_argument("prompt")
+    generate.add_argument("--name", required=True, help="the icon's title in the gallery")
+    generate.add_argument("--transparent", action="store_true", help="ask for a transparent background (OpenAI)")
+    generate.add_argument("--raw", action="store_true", help="send the prompt as it is, without the icon style")
+    generate.set_defaults(run=command_generate)
+
+    sources = commands.add_parser("sources", help="where icons come from, their licenses and how to credit them")
+    sources.set_defaults(run=command_sources)
+
+    args = parser.parse_args()
+    if getattr(args, "format", None) is None and args.command == "render":
+        args.format = ["pdf", "png"]
+    try:
+        return args.run(args)
+    except Failure as failure:
+        print(f"codeflower-sketch: {failure}", file=sys.stderr)
+        return failure.status
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -37,7 +37,10 @@ COPY --from=dsh-runtime /opt/codeflower/acp-ws /opt/codeflower/acp-ws
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
+    fonts-dejavu-core \
+    fonts-liberation2 \
     git \
+    librsvg2-bin \
     ripgrep \
     && rm -rf /var/lib/apt/lists/* \
     && conda install --yes --freeze-installed -c conda-forge \
@@ -61,6 +64,7 @@ COPY dsh-plugins/usage /opt/codeflower/dsh-usage
 # Bind targets must exist in the image on Apptainer installs without underlay.
 # The user's folders are mounted one level below /data/{input,output,code,skills},
 # which such installs cannot create: they need underlay (Apptainer's default).
-RUN mkdir -p /codeflower-state /codeflower-net /data/input /data/output /data/code /data/skills
+# /data/icons is the user's icon gallery (codeflower-sketch).
+RUN mkdir -p /codeflower-state /codeflower-net /data/input /data/output /data/code /data/skills /data/icons
 
 ENTRYPOINT ["/opt/codeflower/entrypoint.sh"]

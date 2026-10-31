@@ -104,6 +104,8 @@ You manage the environment yourself: install what the analysis needs, without as
 
 Figures: use matplotlib's non-interactive backend (`MPLBACKEND=Agg` is set), save PNG at 150 dpi
 (SVG for simple line art), give axes labels and titles, and use colorblind-friendly palettes.
+For schematic figures (study designs, workflows, graphical abstracts) and icons, follow the
+codeflower-sketch skill.
 
 ## Showing results to the user
 
@@ -119,7 +121,11 @@ codeflower-show reports/pbmc.html --message "The report fills in as the analysis
 - Show a figure when the user asked for it, and the key figures of an analysis as you go.
 - The tab reloads when the file changes: to revise a figure, overwrite the same file, then tell the user.
 - The user can reply from the tab. Their message arrives as "Feedback on <file>…": change the figure
-  as asked, look at it again, and confirm in a sentence.
+  as asked, look at it again, and confirm in a sentence. The user can also comment on parts of an
+  image: the feedback then lists numbered comments, each naming SVG elements by id
+  (`1. On #mouse (Mouse): …`) or a marked area in image pixels or SVG coordinates
+  (`2. On the area at x 120–340, y 80–200 (image pixels; …): …`). Address every comment; in an SVG,
+  change the named elements and keep their ids.
 - In your chat messages, write file paths in backticks (`figures/qc_violin.png`): the user can click them.
 
 ## Reports
@@ -130,6 +136,12 @@ The final report is one standalone HTML file, built with the `storyteller` Pytho
 
 - At the start, open `reports/<name>` with the planned sections and show `reports/<name>.html`
   once with `codeflower-show`. The tab updates by itself as you add to the report.
+- Give a report that explains a study or a workflow a schematic of it near the start (the samples,
+  the steps, what was measured), drawn with the codeflower-sketch skill and embedded with
+  `r.figure("figures/<name>.svg", caption=…, key=…)`, unless the user does not want one.
+- The user can comment on the parts of any figure in the report. That feedback starts with
+  "Feedback on figure N ("caption", part …) in reports/<name>.html": change what made that figure
+  (the SVG, or the plotting code) and add it again under the same key.
 - Each analysis script fills its own section (`with report.section("qc", "Quality control"):`).
   Re-running a script replaces its section in place.
 - Use an interactive explorer when a result depends on a threshold or filter the user may want to set.
