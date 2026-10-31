@@ -92,6 +92,26 @@ export function claudeLimits(info) {
   ];
 }
 
+/**
+ * Claude's `/api/oauth/usage` answer (what Claude Code's `/usage` shows):
+ * every window of the login, with the utilization in percent.
+ */
+export function claudeUsageLimits(response) {
+  if (!object(response)) return [];
+  return Object.entries(response)
+    .filter(([id, window]) => id in LIMIT_LABELS && object(window) && Number.isFinite(window.utilization))
+    .map(([id, window]) => {
+      const resetsAt = typeof window.resets_at === 'string' ? new Date(window.resets_at) : undefined;
+      return {
+        id,
+        label: LIMIT_LABELS[id],
+        usedPercent: window.utilization,
+        resetsAt: resetsAt && !Number.isNaN(resetsAt.getTime()) ? resetsAt.toISOString() : null,
+        ...(window.utilization >= 100 ? { status: 'rejected' } : {})
+      };
+    });
+}
+
 function windowName(minutes) {
   if (minutes === 300) return ['five_hour', '5-hour'];
   if (minutes === 10080) return ['seven_day', 'Weekly'];
@@ -281,6 +301,14 @@ export function createUsage({ costEstimate = false, saved, onChange = () => {}, 
     },
 
     claudeRateLimit,
+
+    /** Claude's usage read beside the agent; windows it leaves out are kept. */
+    claudeUsage(response) {
+      const next = claudeUsageLimits(response);
+      if (!next.length) return;
+      setLimits(next);
+      accountChanged();
+    },
 
     codexRateLimits(response) {
       const { limits: next, credits: nextCredits, plan } = codexLimits(response);

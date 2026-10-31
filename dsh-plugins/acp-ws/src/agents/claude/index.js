@@ -2,6 +2,9 @@
 import { join } from 'node:path';
 import { exists, InvalidRequest, readJson, readText, writePrivate } from '../support.js';
 
+const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
+const USAGE_TIMEOUT_MS = 15_000;
+
 export default function claude({ home }) {
   return {
     // No NO_BROWSER: with it the adapter offers only Claude's full-screen
@@ -30,6 +33,22 @@ export default function claude({ home }) {
       if (settings.env?.ANTHROPIC_API_KEY === key) return undefined;
       await writePrivate(file, `${JSON.stringify({ ...settings, env: { ...settings.env, ANTHROPIC_API_KEY: key } }, null, 2)}\n`);
       return undefined;
+    },
+    // The login's quota as Claude Code's `/usage` reads it, for windows that
+    // open a chat before its first turn. Only with a subscription token that
+    // Claude Code has not let expire; it refreshes the token itself.
+    async readUsage() {
+      if (!home) return undefined;
+      const oauth = (await readJson(join(home, '.credentials.json')))?.claudeAiOauth;
+      if (typeof oauth?.accessToken !== 'string' || (Number.isFinite(oauth.expiresAt) && oauth.expiresAt <= Date.now())) {
+        return undefined;
+      }
+      const response = await fetch(USAGE_URL, {
+        headers: { authorization: `Bearer ${oauth.accessToken}`, 'anthropic-beta': 'oauth-2025-04-20' },
+        signal: AbortSignal.timeout(USAGE_TIMEOUT_MS)
+      });
+      if (!response.ok) throw new Error(`${USAGE_URL} answered ${response.status}`);
+      return response.json();
     },
     // Asks for the rate limit events, which the adapter otherwise passes on
     // only once a turn's first answer has started.

@@ -527,13 +527,24 @@ export async function startBridge(options) {
 
   const usageSnapshot = () => usage.snapshot((sessionId) => sessionKey(agentName, sessionId));
 
-  // Codex's limits, from a separate app-server: after turns, at most once a
-  // minute, with the last turn's read made when the minute is over.
+  // The login's limits, read beside the agent: Codex's from a separate
+  // app-server, Claude's as its `/usage` reads them. When a window asks for
+  // the usage (opening or focusing a chat) and after Codex's turns, whose
+  // limits come no other way; at most once a minute, with the last read made
+  // when the minute is over.
+  const readLimits = agent.limitsCommand
+    ? () =>
+        readCodexLimits(agent.limitsCommand(), agentEnvironment(environment, agent.env)).then((response) =>
+          usage.codexRateLimits(response)
+        )
+    : agent.readUsage
+      ? () => agent.readUsage().then((response) => usage.claudeUsage(response))
+      : undefined;
   let limitsReading;
   let limitsReadAt = 0;
   let limitsTimer;
   const refreshLimits = () => {
-    if (!agent.limitsCommand || usage.authKind === 'api_key' || limitsReading || closing) return;
+    if (!readLimits || usage.authKind === 'api_key' || limitsReading || closing) return;
     const wait = limitsReadAt + LIMITS_INTERVAL_MS - Date.now();
     if (wait > 0) {
       limitsTimer ??= setTimeout(() => {
@@ -543,9 +554,8 @@ export async function startBridge(options) {
       return;
     }
     limitsReadAt = Date.now();
-    limitsReading = readCodexLimits(agent.limitsCommand(), agentEnvironment(environment, agent.env))
-      .then((response) => usage.codexRateLimits(response))
-      .catch((error) => log(`Could not read Codex's rate limits: ${error.message}`))
+    limitsReading = readLimits()
+      .catch((error) => log(`Could not read ${agent.label ?? agentName}'s rate limits: ${error.message}`))
       .finally(() => {
         limitsReading = undefined;
       });
@@ -1357,7 +1367,7 @@ export async function startBridge(options) {
     if (message.error || typeof sessionId !== 'string' || !protocolObject(message.result)) return undefined;
     const turn = usage.turnEnded(sessionId, message.result);
     if (turn?.usage && !protocolObject(message.result.usage)) message.result.usage = turn.usage;
-    refreshLimits();
+    if (agent.limitsCommand) refreshLimits();
     return turn;
   };
 
@@ -1700,7 +1710,7 @@ export async function startBridge(options) {
             break;
           case '_codeflower/usage':
             respond(usageSnapshot());
-            // Codex's limits, if the last read is old; the notification brings them.
+            // The login's limits, if the last read is old; the notification brings them.
             refreshLimits();
             break;
           case '_codeflower/sessions/list':

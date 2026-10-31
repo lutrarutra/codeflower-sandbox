@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { readCodexLimits } from '../src/codex-limits.js';
-import { authFromStatus, claudeLimits, codexLimits, createUsage, dshTokens, tokenCounts } from '../src/usage.js';
+import { authFromStatus, claudeLimits, claudeUsageLimits, codexLimits, createUsage, dshTokens, tokenCounts } from '../src/usage.js';
 
 const fakeAppServer = fileURLToPath(new URL('../fixtures/fake-app-server.js', import.meta.url));
 
@@ -42,6 +42,29 @@ test("Claude Code's rate limits become percentages with reset times", () => {
   });
   assert.deepEqual(both.map((limit) => [limit.id, Math.round(limit.usedPercent)]), [['five_hour', 50], ['seven_day', 10]]);
   assert.deepEqual(claudeLimits({ status: 'allowed' }), []);
+});
+
+test("Claude's usage endpoint gives every window in percent", () => {
+  const limits = claudeUsageLimits({
+    five_hour: { utilization: 42, resets_at: '2027-01-15T08:00:00.123456+00:00' },
+    seven_day: { utilization: 100, resets_at: null },
+    seven_day_opus: null,
+    extra_usage: { is_enabled: false, utilization: null }
+  });
+  assert.deepEqual(limits, [
+    { id: 'five_hour', label: '5-hour', usedPercent: 42, resetsAt: '2027-01-15T08:00:00.123Z' },
+    { id: 'seven_day', label: 'Weekly', usedPercent: 100, resetsAt: null, status: 'rejected' }
+  ]);
+  assert.deepEqual(claudeUsageLimits({ error: { type: 'rate_limit_error' } }), []);
+
+  // It updates the windows the agent's events reported, and keeps the others.
+  const usage = createUsage();
+  usage.claudeRateLimit({ status: 'allowed', rateLimitType: 'seven_day_overage_included', utilization: 0.2, resetsAt: 1800000000 });
+  usage.claudeUsage({ five_hour: { utilization: 42, resets_at: null } });
+  assert.deepEqual(usage.snapshot().limits.map((limit) => [limit.id, Math.round(limit.usedPercent)]), [
+    ['seven_day_overage_included', 20],
+    ['five_hour', 42]
+  ]);
 });
 
 test("Codex's rate limits are named by their window", () => {
