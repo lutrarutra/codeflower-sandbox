@@ -20,6 +20,7 @@ import {
   sessionKey,
   writeJsonAtomically
 } from './sessions.js';
+import { DEFAULT_UPLOAD_MAX_BYTES, createUploads } from './uploads.js';
 import { createUsage, dshTokens } from './usage.js';
 
 const CONNECTION_PATH = '/acp';
@@ -392,6 +393,8 @@ export async function startBridge(options) {
     privateDirectory = sessionsDirectory ? dirname(sessionsDirectory) : undefined,
     // Read-write mounts (/data/output/NAME, /data/code/NAME), where reports may also take comments.
     writableFolders = [],
+    // Files attached to chat messages, at most this large (the app sets it).
+    uploadMaxBytes = Number(workerEnvironment.CODEFLOWER_UPLOAD_MAX) || DEFAULT_UPLOAD_MAX_BYTES,
     log = (message) => process.stderr.write(`${message}\n`)
   } = options;
 
@@ -413,6 +416,8 @@ export async function startBridge(options) {
 
   const environment = { ...workerEnvironment, CODEFLOWER_SHOW_SOCKET: showSocket };
   const fileOptions = { workspace, privateDirectory, writableFolders };
+  const uploads = createUploads({ workspace, maxBytes: uploadMaxBytes, log });
+  await uploads.removeLeftovers();
 
   // One store and recorder for the worker: sessions stay open, and their
   // leases fresh, while no window is connected.
@@ -1244,7 +1249,12 @@ export async function startBridge(options) {
 
   const withMultiClient = (result) => ({
     ...result,
-    _meta: { ...(protocolObject(result._meta) ? result._meta : {}), 'codeflower/multiClient': true }
+    _meta: {
+      ...(protocolObject(result._meta) ? result._meta : {}),
+      'codeflower/multiClient': true,
+      // Windows may attach files to messages (`_codeflower/files/upload`).
+      'codeflower/uploads': uploads.capability
+    }
   });
 
   // The bridge told the windows of the message itself (`_codeflower/prompted`).
@@ -1316,6 +1326,7 @@ export async function startBridge(options) {
       released = true;
       for (const terminal of self.terminals.values()) terminal.kill('SIGTERM');
       self.terminals.clear();
+      void uploads.release(self);
       clients.delete(self);
       const why = [code, reason?.toString().trim()].filter(Boolean).join(' ');
       log(`Client ${self.id} disconnected${why ? ` (${why})` : ''}; ${clients.size} connected`);
@@ -1659,6 +1670,9 @@ export async function startBridge(options) {
           case '_codeflower/files/list':
             respond(await listDirectory(params.path, fileOptions));
             break;
+          case '_codeflower/files/upload':
+            respond(await uploads.handle(params, self));
+            break;
           case '_codeflower/reports/comments':
             respond(await saveReportComments(params.path, params.comments, fileOptions));
             break;
@@ -1852,6 +1866,7 @@ export async function startBridge(options) {
       await new Promise((resolve) => server.close(resolve));
       sockets.close();
       await showServer?.close();
+      await uploads.close();
       await unlink(connectionFile).catch((error) => {
         if (error.code !== 'ENOENT') throw error;
       });

@@ -126,6 +126,8 @@ codeflower-show reports/pbmc.html --message "The report fills in as the analysis
   (`1. On #mouse (Mouse): …`) or a marked area in image pixels or SVG coordinates
   (`2. On the area at x 120–340, y 80–200 (image pixels; …): …`). Address every comment; in an SVG,
   change the named elements and keep their ids.
+- Files the user attaches to a message are saved in `uploads/` in the workspace, and the message links
+  them.
 - In your chat messages, write file paths in backticks (`figures/qc_violin.png`): the user can click them.
 
 ## Reports

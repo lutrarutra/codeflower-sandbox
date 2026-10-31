@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -653,6 +654,62 @@ test('shows the files the agent asks for and lets the client read them', async (
   assert.match(denied.error.message, /cannot be shown/);
   assert.match((await show('missing.png')).stderr, /No such file: missing.png/);
   await closeSocket(socket);
+});
+
+test('takes files attached to messages in chunks, into the workspace uploads folder only', async (t) => {
+  const workspaceDirectory = await mkdtemp(join(tmpdir(), 'codeflower-workspace-'));
+  t.after(() => rm(workspaceDirectory, { recursive: true, force: true }));
+  const uploadsFolder = join(workspaceDirectory, 'uploads');
+  await mkdir(uploadsFolder);
+  // A part an earlier bridge left behind.
+  await writeFile(join(uploadsFolder, '.left-over.part'), 'stale');
+  const { bridge } = await startTestBridge(t, { workspace: workspaceDirectory, uploadMaxBytes: 64 });
+  assert.deepEqual(await readdir(uploadsFolder), []);
+  const socket = await openSocket(bridge.address);
+  t.after(() => closeSocket(socket));
+  const initialized = await initialize(socket);
+  assert.deepEqual(initialized._meta['codeflower/uploads'], { maxBytes: 64, chunkBytes: 1024 * 1024 });
+
+  const upload = async (name, content, chunkSize = 7) => {
+    const data = Buffer.from(content);
+    const started = await call(socket, '_codeflower/files/upload', { name, size: data.length });
+    if (started.error) return started;
+    const { uploadId } = started.result;
+    for (let offset = 0; offset < data.length; offset += chunkSize) {
+      const sent = await call(socket, '_codeflower/files/upload', {
+        uploadId, offset, data: data.subarray(offset, offset + chunkSize).toString('base64')
+      });
+      assert.equal(sent.result.received, Math.min(offset + chunkSize, data.length));
+    }
+    return call(socket, '_codeflower/files/upload', { uploadId, finish: true });
+  };
+
+  const kit = (await upload('../../etc/SMART-Heart.pptx', 'slides of the heart')).result;
+  assert.equal(kit.path, join(uploadsFolder, 'SMART-Heart.pptx'));
+  assert.equal(kit.size, 19);
+  assert.equal(kit.sha256, createHash('sha256').update('slides of the heart').digest('hex'));
+  assert.equal(await readFile(kit.path, 'utf8'), 'slides of the heart');
+  // The same name again is numbered, never overwritten; odd names stay in the folder.
+  assert.equal((await upload('SMART-Heart.pptx', 'other slides')).result.name, 'SMART-Heart-1.pptx');
+  assert.equal((await upload('C:\\Users\\ana\\.hidden\u0007.svg', '<svg/>')).result.name, 'hidden.svg');
+  assert.match((await upload('big.zip', 'x'.repeat(65))).error.message, /larger than/);
+
+  // Chunks out of order, or larger than announced, are refused.
+  const { uploadId } = (await call(socket, '_codeflower/files/upload', { name: 'a.png', size: 4 })).result;
+  assert.match((await call(socket, '_codeflower/files/upload', { uploadId, offset: 2, data: 'AA==' })).error.message, /Expected the chunk at byte 0/);
+  assert.match((await call(socket, '_codeflower/files/upload', { uploadId, finish: true })).error.message, /0 of 4 bytes/);
+  assert.deepEqual((await call(socket, '_codeflower/files/upload', { uploadId, cancel: true })).result, {});
+  assert.match((await call(socket, '_codeflower/files/upload', { uploadId, offset: 0, data: 'AA==' })).error.message, /Unknown upload/);
+
+  // Another window cannot continue this window's upload; a window that leaves takes its parts along.
+  const started = (await call(socket, '_codeflower/files/upload', { name: 'b.png', size: 4 })).result;
+  const other = await openSocket(bridge.address);
+  await initialize(other);
+  assert.match((await call(other, '_codeflower/files/upload', { uploadId: started.uploadId, offset: 0, data: 'AA==' })).error.message, /Unknown upload/);
+  await closeSocket(other);
+  await closeSocket(socket);
+  await waitFor(async () => !(await readdir(uploadsFolder)).some((name) => name.endsWith('.part')));
+  assert.deepEqual((await readdir(uploadsFolder)).sort(), ['SMART-Heart-1.pptx', 'SMART-Heart.pptx', 'hidden.svg']);
 });
 
 test("saves the user's comments on a report into its store and its page, and nowhere else", async (t) => {
