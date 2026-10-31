@@ -3,7 +3,7 @@ import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { request as httpRequest } from 'node:http';
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -711,6 +711,150 @@ test('takes files attached to messages in chunks, into the workspace uploads fol
   await closeSocket(socket);
   await waitFor(async () => !(await readdir(uploadsFolder)).some((name) => name.endsWith('.part')));
   assert.deepEqual((await readdir(uploadsFolder)).sort(), ['SMART-Heart-1.pptx', 'SMART-Heart.pptx', 'hidden.svg']);
+});
+
+test('sends files and folders to writable folders only, asking before replacing, checked by hash', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'codeflower-files-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspaceDirectory = join(root, 'workspace');
+  const output = join(root, 'output');
+  const input = join(root, 'input');
+  await mkdir(join(workspaceDirectory, '.git'), { recursive: true });
+  await mkdir(output);
+  await mkdir(input);
+  const { bridge } = await startTestBridge(t, { workspace: workspaceDirectory, writableFolders: [output] });
+  const socket = await openSocket(bridge.address);
+  t.after(() => closeSocket(socket));
+  const initialized = await initialize(socket);
+  assert.deepEqual(initialized._meta['codeflower/files'], {
+    upload: { maxBytes: 1024 * 1024 * 1024, chunkBytes: 1024 * 1024, folders: true },
+    download: { chunkBytes: 1024 * 1024, folders: true }
+  });
+
+  // Chunks sent without waiting for each answer still land in order.
+  const send = async (params, content, { chunkSize = 3, sha256 } = {}) => {
+    const data = Buffer.from(content);
+    const started = await call(socket, '_codeflower/files/upload', { ...params, size: data.length });
+    if (started.error) return started;
+    const { uploadId } = started.result;
+    const chunks = [];
+    for (let offset = 0; offset < data.length; offset += chunkSize) {
+      chunks.push(call(socket, '_codeflower/files/upload', { uploadId, offset, data: data.subarray(offset, offset + chunkSize).toString('base64') }));
+    }
+    for (const sent of await Promise.all(chunks)) assert.equal(sent.error, undefined);
+    return call(socket, '_codeflower/files/upload', {
+      uploadId,
+      finish: true,
+      sha256: sha256 ?? createHash('sha256').update(data).digest('hex')
+    });
+  };
+
+  // A dropped folder keeps its structure.
+  const csv = (await send({ dir: workspaceDirectory, relativePath: 'data/run1/a.csv' }, 'x,y\n1,2\n')).result;
+  assert.equal(csv.path, join(workspaceDirectory, 'data', 'run1', 'a.csv'));
+  assert.equal(await readFile(csv.path, 'utf8'), 'x,y\n1,2\n');
+  const listing = (await call(socket, '_codeflower/files/list', { path: workspaceDirectory })).result;
+  assert.equal(listing.writable, true);
+  assert.deepEqual(listing.entries.map((entry) => [entry.name, entry.writable]), [['data', true]]);
+  assert.equal((await call(socket, '_codeflower/files/list', { path: input })).result.writable, false);
+  assert.equal((await call(socket, '_codeflower/files/list', { path: join(workspaceDirectory, '.git') })).result.writable, false);
+
+  // Clashes are found first; then numbered, or replaced when the user chose so.
+  const exists = await call(socket, '_codeflower/files/exists', { dir: workspaceDirectory, paths: ['data/run1/a.csv', 'b.txt', 'data'] });
+  assert.deepEqual(exists.result.existing, [{ path: 'data/run1/a.csv', type: 'file' }, { path: 'data', type: 'directory' }]);
+  assert.equal((await send({ dir: join(workspaceDirectory, 'data', 'run1'), name: 'a.csv' }, 'second')).result.name, 'a-1.csv');
+  const replaced = (await send({ dir: workspaceDirectory, relativePath: 'data/run1/a.csv', conflict: 'replace' }, 'third')).result;
+  assert.equal(replaced.replaced, true);
+  assert.equal(await readFile(csv.path, 'utf8'), 'third');
+  assert.equal((await send({ dir: output, name: 'table.tsv' }, 'a\tb')).result.path, join(output, 'table.tsv'));
+
+  // Only the workspace and read-write mounts, never a hidden folder, never out through a link.
+  assert.match((await send({ dir: input, name: 'x.txt' }, 'x')).error.message, /read-only/);
+  assert.match((await send({ dir: workspaceDirectory, relativePath: '../x.txt' }, 'x')).error.message, /Hidden files and folders/);
+  assert.match((await send({ dir: workspaceDirectory, relativePath: '.git/hooks/pre-commit' }, 'x')).error.message, /Hidden files/);
+  assert.match((await send({ dir: join(workspaceDirectory, '.git'), name: 'config' }, 'x')).error.message, /read-only/);
+  await symlink(input, join(workspaceDirectory, 'linked'));
+  assert.match((await send({ dir: workspaceDirectory, relativePath: 'linked/deeper/x.txt' }, 'x')).error.message, /read-only/);
+  assert.deepEqual(await readdir(input), []);
+  await symlink(csv.path, join(workspaceDirectory, 'link.csv'));
+  assert.match((await send({ dir: workspaceDirectory, name: 'link.csv', conflict: 'replace' }, 'x')).error.message, /not a file/);
+
+  // A file that arrives damaged is not kept.
+  assert.match((await send({ dir: output, name: 'damaged.txt' }, 'abc', { sha256: '0'.repeat(64) })).error.message, /damaged/);
+  assert.deepEqual((await readdir(output)).sort(), ['table.tsv']);
+});
+
+test('sends files and folders to the window in chunks, a folder as a zip', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'codeflower-files-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspaceDirectory = join(root, 'workspace');
+  const input = join(root, 'input');
+  await mkdir(join(workspaceDirectory, 'results'), { recursive: true });
+  await mkdir(join(input, 'run', 'figures'), { recursive: true });
+  await mkdir(join(input, 'run', 'empty'));
+  const big = Buffer.alloc(2.5 * 1024 * 1024, 7);
+  await writeFile(join(workspaceDirectory, 'results', 'big.bin'), big);
+  await writeFile(join(input, 'run', 'notes.txt'), 'six thousand cells');
+  await writeFile(join(input, 'run', 'figures', 'umap.png'), 'not really a png');
+  await writeFile(join(input, 'run', '.secret'), 'hidden');
+  await symlink('/etc/passwd', join(input, 'run', 'passwd'));
+  const { bridge } = await startTestBridge(t, { workspace: workspaceDirectory });
+  const socket = await openSocket(bridge.address);
+  t.after(() => closeSocket(socket));
+  await initialize(socket);
+
+  const fetchAll = async (path) => {
+    const started = (await call(socket, '_codeflower/files/download', { path })).result;
+    const parts = [];
+    let offset = 0;
+    for (;;) {
+      const answer = await call(socket, '_codeflower/files/download', { downloadId: started.downloadId, offset });
+      if (answer.error) return answer;
+      const data = Buffer.from(answer.result.data, 'base64');
+      parts.push(data);
+      offset += data.length;
+      if (answer.result.done) return { started, data: Buffer.concat(parts), sha256: answer.result.sha256 };
+    }
+  };
+
+  const file = await fetchAll(join(workspaceDirectory, 'results', 'big.bin'));
+  assert.deepEqual([file.started.kind, file.started.name, file.started.size], ['file', 'big.bin', big.length]);
+  assert.ok(file.data.equals(big));
+  assert.equal(file.sha256, createHash('sha256').update(big).digest('hex'));
+
+  // Requests out of order, from another window, or for a file that changed meanwhile, are refused.
+  const { downloadId } = (await call(socket, '_codeflower/files/download', { path: join(workspaceDirectory, 'results', 'big.bin') })).result;
+  assert.match((await call(socket, '_codeflower/files/download', { downloadId, offset: 5 })).error.message, /Expected a request for byte 0/);
+  const other = await openSocket(bridge.address);
+  await initialize(other);
+  assert.match((await call(other, '_codeflower/files/download', { downloadId, offset: 0 })).error.message, /Unknown download/);
+  await closeSocket(other);
+  await call(socket, '_codeflower/files/download', { downloadId, offset: 0 });
+  await appendFile(join(workspaceDirectory, 'results', 'big.bin'), 'more');
+  await call(socket, '_codeflower/files/download', { downloadId, offset: 1024 * 1024 });
+  assert.match((await call(socket, '_codeflower/files/download', { downloadId, offset: 2 * 1024 * 1024 })).error.message, /changed while downloading/);
+
+  // A folder, here a read-only input, comes as a zip of its visible files; links are not followed.
+  const zip = await fetchAll(join(input, 'run'));
+  assert.deepEqual([zip.started.kind, zip.started.name, zip.started.files], ['zip', 'run.zip', 2]);
+  assert.equal(zip.sha256, createHash('sha256').update(zip.data).digest('hex'));
+  const zipPath = join(root, 'run.zip');
+  await writeFile(zipPath, zip.data);
+  const unzip = (...args) =>
+    new Promise((resolve, reject) => execFile('unzip', args, (error, stdout) => (error ? reject(error) : resolve(stdout))));
+  try {
+    assert.deepEqual((await unzip('-Z1', zipPath)).trim().split('\n').sort(), ['empty/', 'figures/umap.png', 'notes.txt']);
+    assert.equal(await unzip('-p', zipPath, 'notes.txt'), 'six thousand cells');
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    t.diagnostic('unzip is not installed; the zip was not opened');
+  }
+
+  // Too many files for one zip are refused before anything is sent.
+  const many = join(workspaceDirectory, 'many');
+  await mkdir(many);
+  await Promise.all(Array.from({ length: 10_001 }, (_, index) => writeFile(join(many, `${index}.txt`), '')));
+  assert.match((await call(socket, '_codeflower/files/download', { path: many })).error.message, /more than 10000 files/);
 });
 
 test("saves the user's comments on a report into its store and its page, and nowhere else", async (t) => {

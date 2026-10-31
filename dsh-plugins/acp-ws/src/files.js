@@ -3,8 +3,8 @@
 // The user may edit text files in the workspace and the read-write mounts.
 import { createServer } from 'node:net';
 import { randomBytes } from 'node:crypto';
-import { readdir, readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
-import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
+import { access, constants, readdir, readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { InvalidRequest } from './agents.js';
 
 export const MAX_FILE_BYTES = 10 * 1024 * 1024;
@@ -61,7 +61,7 @@ export function mimeType(path) {
   return MIME_TYPES[extname(path).toLowerCase()] ?? 'application/octet-stream';
 }
 
-const inside = (path, directory) => {
+export const inside = (path, directory) => {
   const rest = relative(directory, path);
   return rest === '' || (!rest.startsWith('..') && !isAbsolute(rest));
 };
@@ -71,7 +71,7 @@ const inside = (path, directory) => {
  * virtual filesystems and, inside the project state, only in the workspace
  * (logins and session records stay private).
  */
-async function resolvePath(path, { workspace, privateDirectory, cwd = workspace }) {
+export async function resolvePath(path, { workspace, privateDirectory, cwd = workspace }) {
   if (typeof path !== 'string' || !path || path.length > 4096) throw new InvalidRequest('Invalid path');
   let real;
   try {
@@ -86,11 +86,29 @@ async function resolvePath(path, { workspace, privateDirectory, cwd = workspace 
   return { real, info: await stat(real) };
 }
 
-/** The workspace or read-write mount a resolved path is in, if any: where the user may write. */
-async function writableFolder(real, options) {
+/** The real paths of the workspace and the read-write mounts: where the user may write. */
+async function writableRoots(options) {
   const candidates = [options.workspace, ...(options.writableFolders ?? [])].filter(Boolean);
-  const folders = await Promise.all(candidates.map((folder) => realpath(folder).catch(() => null)));
-  return folders.find((folder) => folder && inside(real, folder));
+  return (await Promise.all(candidates.map((folder) => realpath(folder).catch(() => null)))).filter(Boolean);
+}
+
+/** The workspace or read-write mount a resolved path is in, if any. */
+export async function writableFolder(real, options, roots) {
+  return (roots ?? (await writableRoots(options))).find((folder) => inside(real, folder));
+}
+
+/**
+ * Whether the user may put files in a resolved directory: in a writable
+ * folder, not in a hidden folder below it (`.git`, `.ssh`, where a file can
+ * become code that runs), and writable for us.
+ */
+export async function directoryWritable(real, options, roots) {
+  const root = await writableFolder(real, options, roots);
+  if (!root || relative(root, real).split(sep).some((segment) => segment.startsWith('.'))) return false;
+  return access(real, constants.W_OK).then(
+    () => true,
+    () => false
+  );
 }
 
 export async function resolveFile(path, options) {
@@ -110,6 +128,7 @@ export async function listDirectory(path, options) {
   const { real, info } = await resolvePath(path, options);
   if (!info.isDirectory()) throw new InvalidRequest(`Not a directory: ${path}`);
   const names = (await readdir(real)).filter((name) => !name.startsWith('.'));
+  const roots = await writableRoots(options);
   const entries = [];
   for (const name of names) {
     const entryPath = join(real, name);
@@ -121,11 +140,16 @@ export async function listDirectory(path, options) {
       type: entryInfo.isDirectory() ? 'directory' : 'file',
       size: entryInfo.size,
       mtimeMs: entryInfo.mtimeMs,
-      ...(entryInfo.isFile() ? { mimeType: mimeType(entryPath) } : {})
+      ...(entryInfo.isFile() ? { mimeType: mimeType(entryPath) } : { writable: await directoryWritable(await realpath(entryPath).catch(() => entryPath), options, roots) })
     });
   }
   entries.sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === 'directory' ? -1 : 1));
-  return { path: real, entries: entries.slice(0, MAX_LIST_ENTRIES), truncated: entries.length > MAX_LIST_ENTRIES };
+  return {
+    path: real,
+    writable: await directoryWritable(real, options, roots),
+    entries: entries.slice(0, MAX_LIST_ENTRIES),
+    truncated: entries.length > MAX_LIST_ENTRIES
+  };
 }
 
 export async function readClientFile(path, options) {

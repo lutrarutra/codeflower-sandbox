@@ -21,6 +21,7 @@ import {
   sessionKey,
   writeJsonAtomically
 } from './sessions.js';
+import { createDownloads } from './downloads.js';
 import { DEFAULT_UPLOAD_MAX_BYTES, createUploads } from './uploads.js';
 import { createUsage, dshTokens } from './usage.js';
 
@@ -436,7 +437,8 @@ export async function startBridge(options) {
 
   const environment = { ...workerEnvironment, CODEFLOWER_SHOW_SOCKET: showSocket };
   const fileOptions = { workspace, privateDirectory, writableFolders };
-  const uploads = createUploads({ workspace, maxBytes: uploadMaxBytes, log });
+  const uploads = createUploads({ workspace, fileOptions, maxBytes: uploadMaxBytes, log });
+  const downloads = createDownloads({ fileOptions, log });
   await uploads.removeLeftovers();
 
   // One store and recorder for the worker: sessions stay open, and their
@@ -1365,7 +1367,9 @@ export async function startBridge(options) {
       ...(protocolObject(result._meta) ? result._meta : {}),
       'codeflower/multiClient': true,
       // Windows may attach files to messages (`_codeflower/files/upload`).
-      'codeflower/uploads': uploads.capability
+      'codeflower/uploads': uploads.capability,
+      // ...and send files to folders and save files and folders (`_codeflower/files/download`).
+      'codeflower/files': { upload: { ...uploads.capability, folders: true }, download: downloads.capability }
     }
   });
 
@@ -1439,6 +1443,7 @@ export async function startBridge(options) {
       for (const terminal of self.terminals.values()) terminal.kill('SIGTERM');
       self.terminals.clear();
       void uploads.release(self);
+      void downloads.release(self);
       clients.delete(self);
       const why = [code, reason?.toString().trim()].filter(Boolean).join(' ');
       log(`Client ${self.id} disconnected${why ? ` (${why})` : ''}; ${clients.size} connected`);
@@ -1785,6 +1790,12 @@ export async function startBridge(options) {
           case '_codeflower/files/upload':
             respond(await uploads.handle(params, self));
             break;
+          case '_codeflower/files/exists':
+            respond(await uploads.exists(params));
+            break;
+          case '_codeflower/files/download':
+            respond(await downloads.handle(params, self));
+            break;
           case '_codeflower/files/write':
             respond(await writeClientFile(params.path, params.text, params.expectedMtimeMs, fileOptions));
             break;
@@ -1983,6 +1994,7 @@ export async function startBridge(options) {
       sockets.close();
       await showServer?.close();
       await uploads.close();
+      await downloads.close();
       await unlink(connectionFile).catch((error) => {
         if (error.code !== 'ENOENT') throw error;
       });
