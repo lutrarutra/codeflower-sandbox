@@ -155,7 +155,8 @@ export function createSessionStore({
         createdAt: timestamp,
         autoTitle: null
       };
-      meta.updatedAt = timestamp;
+      // Opening a chat is not a change to it: only a new one gets its time here, later ones when recorded.
+      meta.updatedAt ??= timestamp;
       const recorded = await readFile(sessionPaths.transcript, 'utf8').catch(() => '');
       const state = {
         nativeSessionId,
