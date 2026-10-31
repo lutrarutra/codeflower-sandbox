@@ -20,6 +20,20 @@ COPY dsh-plugins/acp-ws/src ./src
 FROM scratch AS storyteller
 ADD --keep-git-dir=false https://github.com/lutrarutra/storyteller.git#v0.2.2 /
 
+# The chat page the worker serves with `codeflower interactive --server`:
+# codeflower-ui's web build, pinned by tag. A development build uses the
+# workspace's build instead: --build-context page=../ui/dist-web.
+FROM scratch AS ui-source
+ADD --keep-git-dir=false https://github.com/lutrarutra/codeflower-ui.git#v0.3.0 /
+
+FROM node:22-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS page-build
+WORKDIR /ui
+COPY --from=ui-source / ./
+RUN npm ci --no-audit --no-fund && npm run build:web
+
+FROM scratch AS page
+COPY --from=page-build /ui/dist-web /
+
 FROM continuumio/miniconda3:26.7.1-1@sha256:eca594d684f495c1a02beff33a9fab53aec8c5830eaf431bb149912dc6c9e4c1
 
 ENV PYTHONUNBUFFERED=1 \
@@ -51,6 +65,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # storyteller's dependencies and build backend live in the base environment, which
 # project venvs see, so the entrypoint can install the editable copy offline.
 COPY --from=storyteller / /opt/codeflower/src/storyteller
+COPY --from=page / /opt/codeflower/page
 RUN pip install --no-cache-dir pillow==13.0.0 markdown-it-py==4.2.0 mdurl==0.1.2 hatchling==1.33.0 editables==0.6 pygments==2.21.0 \
     && python -c "import sys; sys.path.insert(0, '/opt/codeflower/src/storyteller/src'); import storyteller"
 

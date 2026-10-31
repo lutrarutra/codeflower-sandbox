@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
+import { request as httpRequest } from 'node:http';
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -12,7 +13,7 @@ import { createActivity } from '../src/activity.js';
 import { readActions } from '../src/actions.js';
 import { createAgents, loadRegistry } from '../src/agents.js';
 import { writeCommentsSlot } from '../src/files.js';
-import { agentEnvironment, startBridge } from '../src/server.js';
+import { agentEnvironment, clientLink, connectionUrl, pageLink, startBridge } from '../src/server.js';
 import { listSessions, readTranscript, sessionKey } from '../src/sessions.js';
 
 const fakeAgent = fileURLToPath(new URL('../fixtures/fake-acp.js', import.meta.url));
@@ -1173,4 +1174,93 @@ test("gives dsh's turns the token counts its usage plugin reports", async (t) =>
   assert.equal(usage.costEstimate, false);
   assert.equal(usage.totals.tokens.totalTokens, 19);
   await closeSocket(socket);
+});
+
+test('prints a link that adds the worker in the code flower app', () => {
+  const line = connectionUrl('10.20.3.17', 41234, 'a+b/c=');
+  assert.equal(line, 'codeflower://10.20.3.17:41234?token=a%2Bb%2Fc%3D');
+  const link = new URL(clientLink(line));
+  assert.equal(link.origin, 'http://127.0.0.1:7720');
+  // The line, token included, travels only in the fragment, which the browser never sends.
+  assert.equal(link.search, '');
+  assert.equal(decodeURIComponent(link.hash.slice('#add='.length)), line);
+});
+
+// A request with any Host header, which fetch does not let a test set.
+function get(address, path, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const request = httpRequest({ host: '127.0.0.1', port: address.port, path, headers }, (response) => {
+      let body = '';
+      response.setEncoding('utf8');
+      response.on('data', (chunk) => (body += chunk));
+      response.on('end', () => resolve({ code: response.statusCode, headers: response.headers, body }));
+    });
+    request.on('error', reject);
+    request.end();
+  });
+}
+
+test('serves the chat page only with --server, to the link\'s holder, on its own host', async (t) => {
+  const plain = await startTestBridge(t);
+  assert.equal((await get(plain.bridge.address, '/')).code, 404);
+
+  const page = await mkdtemp(join(tmpdir(), 'codeflower-page-'));
+  t.after(() => rm(page, { recursive: true, force: true }));
+  await writeFile(join(page, 'index.html'), '<!doctype html><title>code flower</title>');
+  let quit = 0;
+  const { bridge } = await startTestBridge(t, { page: { directory: page }, onQuit: () => quit++ });
+  const { address } = bridge;
+  assert.equal(pageLink('node7.example', 8123, 'a+b'), 'http://node7.example:8123/?key=a%2Bb');
+
+  // The link's key becomes a cookie; a wrong one, or none, opens nothing.
+  assert.equal((await get(address, '/?key=wrong')).code, 403);
+  assert.equal((await get(address, '/')).code, 403);
+  const signIn = await get(address, `/?key=${token}`);
+  assert.equal(signIn.code, 303);
+  assert.equal(signIn.headers.location, '/');
+  const cookie = signIn.headers['set-cookie'][0].split(';')[0];
+  assert.match(signIn.headers['set-cookie'][0], /HttpOnly; SameSite=Strict/);
+  const index = await get(address, '/', { cookie });
+  assert.equal(index.code, 200);
+  assert.match(index.body, /code flower/);
+  assert.match(index.headers['content-security-policy'], /frame-ancestors 'none'/);
+  assert.equal((await get(address, '/../package.json', { cookie })).code, 404);
+
+  // Another host name (DNS rebinding) is refused, even with the cookie.
+  assert.equal((await get(address, '/', { cookie, host: `evil.example:${address.port}` })).code, 403);
+
+  // The page API for one sandbox.
+  const system = JSON.parse((await get(address, '/api/system', { cookie })).body);
+  assert.deepEqual(system.capabilities, { connect: false, start: false, connectOnly: true, single: true });
+  const [worker, ...others] = JSON.parse((await get(address, '/api/workers', { cookie })).body);
+  assert.equal(others.length, 0);
+  assert.equal(worker.id, 'local');
+  assert.equal(worker.status, 'ready');
+  assert.equal(worker.activity.agent, 'claude');
+  assert.deepEqual(JSON.parse((await get(address, '/api/workers/local/sessions', { cookie })).body), { sessions: [] });
+  const frame = await get(address, '/frame');
+  assert.equal(frame.code, 200);
+  assert.match(frame.headers['content-security-policy'], /default-src 'none'.*frame-ancestors 'self'/);
+
+  // The agent, by the cookie, from the page only.
+  const origin = `http://127.0.0.1:${address.port}`;
+  const url = `ws://127.0.0.1:${address.port}/api/workers/local/acp`;
+  const socket = trackSocket(new WebSocket(url, { headers: { cookie, origin } }));
+  await once(socket, 'open');
+  assert.equal((await initialize(socket)).protocolVersion, 1);
+  await closeSocket(socket);
+  for (const headers of [{ cookie, origin: 'http://evil.example' }, { cookie }, { origin }]) {
+    const refused = new WebSocket(url, { headers });
+    const [error] = await once(refused, 'error');
+    assert.match(error.message, /Unexpected server response: 40[13]/);
+  }
+
+  // Quit with no chat working: the worker stops at once.
+  const response = await fetch(`${origin}/api/quit`, {
+    method: 'POST',
+    headers: { cookie, 'content-type': 'application/json' },
+    body: JSON.stringify({ wrapUp: true })
+  });
+  assert.equal((await response.json()).stopping, true);
+  await waitFor(() => quit === 1);
 });

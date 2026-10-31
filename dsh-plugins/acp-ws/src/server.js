@@ -10,6 +10,7 @@ import { createActivity } from './activity.js';
 import { CREDENTIAL_VARIABLES, InvalidRequest, terminalAuthCommand } from './agents.js';
 import { readCodexLimits } from './codex-limits.js';
 import { listDirectory, readClientFile, resolveFile, saveReportComments, startShowServer } from './files.js';
+import { createPage } from './page.js';
 import {
   LeaseError,
   createSessionStore,
@@ -60,6 +61,21 @@ const STEER_METHOD = '_session/steering';
 export function connectionUrl(host, port, token) {
   const address = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
   return `codeflower://${address}:${port}?token=${encodeURIComponent(token)}`;
+}
+
+// The code flower app's usual port on the user's computer (DefaultPort in
+// the app's client).
+const CLIENT_PORT = 7720;
+
+/** A link that opens the app's page and offers to add this worker; the line stays in the fragment, which is never sent. */
+export function clientLink(workerLine) {
+  return `http://127.0.0.1:${CLIENT_PORT}/#add=${encodeURIComponent(workerLine)}`;
+}
+
+/** The chat page the worker serves (`--server`), with its key; like Jupyter's link. */
+export function pageLink(host, port, token) {
+  const address = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+  return `http://${address}:${port}/?key=${encodeURIComponent(token)}`;
 }
 
 function constantTimeTokenMatch(received, expected) {
@@ -395,7 +411,11 @@ export async function startBridge(options) {
     writableFolders = [],
     // Files attached to chat messages, at most this large (the app sets it).
     uploadMaxBytes = Number(workerEnvironment.CODEFLOWER_UPLOAD_MAX) || DEFAULT_UPLOAD_MAX_BYTES,
-    log = (message) => process.stderr.write(`${message}\n`)
+    log = (message) => process.stderr.write(`${message}\n`),
+    // The chat page, served on the bridge's own port (`--server`): false, or
+    // { directory, version }. onQuit stops the worker when the page quits.
+    page: pageOptions = false,
+    onQuit = () => {}
   } = options;
 
   if (typeof token !== 'string' || Buffer.byteLength(token) < 32) {
@@ -606,12 +626,83 @@ export async function startBridge(options) {
       : undefined;
   };
 
+  // Quitting from the page: the chats wrap up, then the worker stops.
+  let pageQuit;
+  // The address once the bridge listens, for the page.
+  let listening;
+  const QUIT_MINUTES = 10;
+  const quitPlan = () => {
+    const { working } = activity.snapshot();
+    return {
+      sandboxes: 1,
+      working,
+      busy: working > 0 ? 1 : 0,
+      elsewhere: 0,
+      minutes: QUIT_MINUTES,
+      ...(pageQuit ? { quitting: pageQuit } : {}),
+      stopping: closing || pageQuit?.workers.local === 'stopping'
+    };
+  };
+  const quitNow = () => {
+    if (pageQuit) pageQuit.workers.local = 'stopping';
+    else pageQuit = { started: new Date().toISOString(), deadline: new Date().toISOString(), workers: { local: 'stopping' } };
+    log('The page quit: stopping the worker');
+    setImmediate(onQuit);
+  };
+  const page =
+    pageOptions &&
+    createPage({
+      directory: pageOptions.directory,
+      version: pageOptions.version,
+      advertiseHost,
+      matches: (candidate) => constantTimeTokenMatch(candidate, token),
+      agentName,
+      agentLabel: agent.label ?? agentName,
+      startedAt: new Date().toISOString(),
+      status: statusSnapshot,
+      sessions: ownSessions,
+      describe,
+      workerUrl: () => listening?.url,
+      quit: {
+        plan: quitPlan,
+        begin(wrapUp) {
+          if (closing || pageQuit) return quitPlan();
+          if (!wrapUp || !wrapUpQuitTemplate || !activity.snapshot().working) {
+            quitNow();
+            return quitPlan();
+          }
+          const started = Date.now();
+          const current = {
+            started: new Date(started).toISOString(),
+            deadline: new Date(started + QUIT_MINUTES * 60_000).toISOString(),
+            workers: { local: 'wrapping up' }
+          };
+          pageQuit = current;
+          const { done } = wrapUpChats('quit', QUIT_MINUTES);
+          const timer = setTimeout(() => pageQuit === current && quitNow(), QUIT_MINUTES * 60_000);
+          void done
+            .catch((error) => log(`Could not wrap up: ${error.message}`))
+            .finally(() => {
+              clearTimeout(timer);
+              if (pageQuit === current) quitNow();
+            });
+          return quitPlan();
+        },
+        cancel() {
+          // The chats finish their wrap-up; the worker keeps running.
+          if (pageQuit?.workers.local !== 'stopping') pageQuit = undefined;
+          return quitPlan();
+        }
+      }
+    });
+
   const sockets = new WebSocketServer({ noServer: true, maxPayload: MAX_PAYLOAD });
   const server = createServer((request, response) => {
-    let pathname;
+    let url;
     try {
-      pathname = new URL(request.url, 'http://localhost').pathname;
+      url = new URL(request.url, 'http://localhost');
     } catch {}
+    const pathname = url?.pathname;
     // What the app shows about the worker: counts and chat titles only.
     if (request.method === 'GET' && pathname === STATUS_PATH) {
       if (!constantTimeTokenMatch(bearer(request), token)) {
@@ -653,8 +744,19 @@ export async function startBridge(options) {
       wrapUpRequest(request, response);
       return;
     }
-    response.writeHead(404, { connection: 'close' });
-    response.end();
+    const notFound = () => {
+      response.writeHead(404, { connection: 'close' });
+      response.end();
+    };
+    if (!page || !url) return notFound();
+    page.handle(request, response, url).then(
+      (handled) => handled || notFound(),
+      (error) => {
+        log(`The page could not answer ${pathname}: ${error.message}`);
+        if (!response.headersSent) response.writeHead(500);
+        response.end();
+      }
+    );
   });
 
   server.on('upgrade', (request, socket, head) => {
@@ -666,11 +768,21 @@ export async function startBridge(options) {
       return;
     }
 
-    if (pathname !== CONNECTION_PATH) {
+    // The page's WebSocket, authorized by its cookie.
+    const fromPage = page ? page.upgrade(request, pathname) : undefined;
+    if (fromPage === 403) {
+      rejectUpgrade(socket, 403, 'Forbidden');
+      return;
+    }
+    if (fromPage === 401) {
+      rejectUpgrade(socket, 401, 'Unauthorized');
+      return;
+    }
+    if (fromPage === undefined && pathname !== CONNECTION_PATH) {
       rejectUpgrade(socket, 404, 'Not Found');
       return;
     }
-    if (!constantTimeTokenMatch(bearer(request), token)) {
+    if (fromPage === undefined && !constantTimeTokenMatch(bearer(request), token)) {
       rejectUpgrade(socket, 401, 'Unauthorized');
       return;
     }
@@ -1824,6 +1936,7 @@ export async function startBridge(options) {
     ...(slurmJobId ? { slurm_job_id: slurmJobId } : {})
   };
   metadata.url = connectionUrl(metadata.host, metadata.port, token);
+  listening = metadata;
 
   try {
     await writeConnectionFile(connectionFile, metadata);

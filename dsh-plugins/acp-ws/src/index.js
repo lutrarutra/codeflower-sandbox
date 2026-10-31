@@ -2,12 +2,15 @@ import { readFile } from 'node:fs/promises';
 import { AGENT_NAMES, createAgents, PROVIDED_KEY_VARIABLE } from './agents.js';
 import { readActions } from './actions.js';
 import { startEgressForwarder } from './egress.js';
-import { connectionUrl, startBridge } from './server.js';
+import { PAGE_DIRECTORY } from './page.js';
+import { clientLink, connectionUrl, pageLink, startBridge } from './server.js';
 import { EXIT_CODES, runTask } from './task.js';
 
 const RUNTIME_MODULES = '/opt/codeflower/runtime/node_modules';
 const TEMPLATES = '/opt/codeflower/templates';
 const INITIAL_PROMPT_FILE = process.env.CODEFLOWER_INITIAL_PROMPT_FILE;
+// `--server`: the worker also serves the chat page on its port.
+const SERVE_PAGE = process.env.CODEFLOWER_PAGE === '1';
 
 function requiredEnvironment(name) {
   const value = process.env[name];
@@ -147,17 +150,27 @@ const bridge = await startBridge({
   writableFolders: mounts()
     .filter((mount) => mount && typeof mount.target === 'string' && mount.readOnly === false)
     .map((mount) => mount.target),
-  describe
+  describe,
+  page: SERVE_PAGE && { directory: PAGE_DIRECTORY },
+  // The page's Quit: stop as on SIGTERM, which ends the sandbox.
+  onQuit: () => void stop().then(() => process.exit(process.exitCode ?? 0))
 });
 
+const workerLine = connectionUrl(bridge.address.host, bridge.address.port, bridge.address.token);
+const opening = SERVE_PAGE
+  ? ['Open in a browser:', '', `  ${pageLink(bridge.address.host, bridge.address.port, bridge.address.token)}`]
+  : ['With the code flower app running on your computer, open:', '', `  ${clientLink(workerLine)}`];
 process.stderr.write(
   [
     '',
-    `code flower worker ready (${agents[agentName].label}). In VS Code, run "code flower: Connect to worker" and paste:`,
+    `code flower worker ready (${agents[agentName].label}). ${opening[0]}`,
+    ...opening.slice(1),
     '',
-    `  ${connectionUrl(bridge.address.host, bridge.address.port, bridge.address.token)}`,
+    'Or in VS Code, run "code flower: Connect to worker" and paste:',
     '',
-    'Anyone with this line can control the agent. Keep job logs private,',
+    `  ${workerLine}`,
+    '',
+    `Anyone with ${SERVE_PAGE ? 'these links' : 'this line'} can control the agent. Keep job logs private,`,
     'e.g. sbatch --output=$HOME/.codeflower-logs/%j.out with that directory chmod 700.',
     '',
     ''

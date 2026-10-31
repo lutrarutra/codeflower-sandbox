@@ -3,7 +3,11 @@
 # STORYTELLER_SRC=../storyteller builds with a local storyteller checkout instead of
 # the tag pinned in the Dockerfile (the workspace passes its submodule).
 STORYTELLER_SRC ?=
-BUILD_CONTEXTS := $(if $(STORYTELLER_SRC),--build-context storyteller=$(STORYTELLER_SRC))
+# PAGE_SRC=../ui/dist-web takes the chat page from a local codeflower-ui build
+# (npm run build:web) instead of building the tag pinned in the Dockerfile.
+PAGE_SRC ?=
+BUILD_CONTEXTS := $(if $(STORYTELLER_SRC),--build-context storyteller=$(STORYTELLER_SRC)) \
+	$(if $(PAGE_SRC),--build-context page=$(PAGE_SRC))
 
 sandbox-build:
 	docker build $(BUILD_CONTEXTS) -t codeflower-sandbox .
