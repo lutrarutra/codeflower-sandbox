@@ -1,5 +1,6 @@
 // Files the agent shows the user (`codeflower-show`) and the client reads to
 // display them: figures, reports and tables from the workspace or the inputs.
+// The user may edit text files in the workspace and the read-write mounts.
 import { createServer } from 'node:net';
 import { randomBytes } from 'node:crypto';
 import { readdir, readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
@@ -35,7 +36,25 @@ const MIME_TYPES = {
   '.sh': 'text/x-shellscript',
   '.yml': 'text/yaml',
   '.yaml': 'text/yaml',
-  '.toml': 'text/plain'
+  '.toml': 'text/plain',
+  '.ini': 'text/plain',
+  '.cfg': 'text/plain',
+  '.js': 'text/javascript',
+  '.mjs': 'text/javascript',
+  '.ts': 'text/x-typescript',
+  '.css': 'text/css',
+  '.xml': 'text/xml',
+  '.sql': 'text/x-sql',
+  '.go': 'text/x-go',
+  '.rs': 'text/x-rust',
+  '.java': 'text/x-java',
+  '.c': 'text/x-c',
+  '.h': 'text/x-c',
+  '.cpp': 'text/x-c++',
+  '.jl': 'text/x-julia',
+  '.nf': 'text/x-groovy',
+  '.smk': 'text/x-python',
+  '.ipynb': 'application/json'
 };
 
 export function mimeType(path) {
@@ -67,10 +86,23 @@ async function resolvePath(path, { workspace, privateDirectory, cwd = workspace 
   return { real, info: await stat(real) };
 }
 
+/** The workspace or read-write mount a resolved path is in, if any: where the user may write. */
+async function writableFolder(real, options) {
+  const candidates = [options.workspace, ...(options.writableFolders ?? [])].filter(Boolean);
+  const folders = await Promise.all(candidates.map((folder) => realpath(folder).catch(() => null)));
+  return folders.find((folder) => folder && inside(real, folder));
+}
+
 export async function resolveFile(path, options) {
   const { real, info } = await resolvePath(path, options);
   if (!info.isFile()) throw new InvalidRequest(`Not a file: ${path}`);
-  return { path: real, size: info.size, mtimeMs: info.mtimeMs, mimeType: mimeType(real) };
+  return {
+    path: real,
+    size: info.size,
+    mtimeMs: info.mtimeMs,
+    mimeType: mimeType(real),
+    writable: !!(await writableFolder(real, options))
+  };
 }
 
 /** A directory's visible entries, folders first; for browsing the workspace and inputs. */
@@ -104,15 +136,33 @@ export async function readClientFile(path, options) {
   return { ...file, data: (await readFile(file.path)).toString('base64') };
 }
 
-async function writeAtomic(path, text) {
+async function writeAtomic(path, text, mode = 0o644) {
   const temporary = join(dirname(path), `.${basename(path)}.${randomBytes(6).toString('hex')}.tmp`);
   try {
-    await writeFile(temporary, text, { mode: 0o644 });
+    await writeFile(temporary, text, { mode });
     await rename(temporary, path);
   } catch (error) {
     await unlink(temporary).catch(() => {});
     throw error;
   }
+}
+
+/**
+ * Saves a text file the user edited, in the workspace or a read-write mount
+ * only, and only over the version the user started from: when the agent wrote
+ * the file meanwhile (another mtime), nothing is written.
+ */
+export async function writeClientFile(path, text, expectedMtimeMs, options) {
+  if (typeof text !== 'string' || Buffer.byteLength(text) > MAX_FILE_BYTES) {
+    throw new InvalidRequest('The text must be a string of at most 10 MB');
+  }
+  if (typeof expectedMtimeMs !== 'number') throw new InvalidRequest('expectedMtimeMs must be a number');
+  const file = await resolveFile(path, options);
+  if (!file.writable) throw new InvalidRequest(`${path} is read-only: only files in the workspace or an output folder can be saved`);
+  if (file.mtimeMs !== expectedMtimeMs) throw new InvalidRequest(`${path} changed since you opened it`, { conflict: true });
+  // Keep the file's permissions, e.g. a script stays executable.
+  await writeAtomic(file.path, text, (await stat(file.path)).mode & 0o7777);
+  return resolveFile(file.path, options);
 }
 
 export async function writeCommentsSlot(path, slot, initialStat, initialHtml, fileOps = {}) {

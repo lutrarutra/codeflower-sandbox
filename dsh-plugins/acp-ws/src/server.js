@@ -9,7 +9,7 @@ import { WebSocket, WebSocketServer } from 'ws';
 import { createActivity } from './activity.js';
 import { CREDENTIAL_VARIABLES, InvalidRequest, terminalAuthCommand } from './agents.js';
 import { readCodexLimits } from './codex-limits.js';
-import { listDirectory, readClientFile, resolveFile, saveReportComments, startShowServer } from './files.js';
+import { listDirectory, readClientFile, resolveFile, saveReportComments, startShowServer, writeClientFile } from './files.js';
 import { createPage } from './page.js';
 import {
   LeaseError,
@@ -1785,6 +1785,9 @@ export async function startBridge(options) {
           case '_codeflower/files/upload':
             respond(await uploads.handle(params, self));
             break;
+          case '_codeflower/files/write':
+            respond(await writeClientFile(params.path, params.text, params.expectedMtimeMs, fileOptions));
+            break;
           case '_codeflower/reports/comments':
             respond(await saveReportComments(params.path, params.comments, fileOptions));
             break;
@@ -1818,7 +1821,7 @@ export async function startBridge(options) {
         self.send({
           jsonrpc: '2.0',
           id: message.id,
-          error: { code: -32602, message: error instanceof InvalidRequest ? error.message : error.message }
+          error: { code: -32602, message: error.message, ...(error instanceof InvalidRequest && error.data ? { data: error.data } : {}) }
         });
       }
     };

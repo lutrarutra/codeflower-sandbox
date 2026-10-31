@@ -762,6 +762,52 @@ test("saves the user's comments on a report into its store and its page, and now
   await closeSocket(socket);
 });
 
+test('saves text files the user edited in the workspace and output folders, over the version they opened', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'codeflower-workspace-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, 'workspace');
+  const output = join(root, 'output');
+  const input = join(root, 'input');
+  const { bridge, sessionsDirectory } = await startTestBridge(t, { workspace, writableFolders: [output] });
+  for (const folder of [workspace, output, input]) await mkdir(folder, { recursive: true });
+  await writeFile(join(workspace, 'run.sh'), 'echo one\n', { mode: 0o755 });
+  await writeFile(join(output, 'notes.md'), '# Notes\n');
+  await writeFile(join(input, 'meta.csv'), 'id\n1\n');
+
+  const socket = await openSocket(bridge.address);
+  await initialize(socket);
+  const stat_ = async (path) => (await call(socket, '_codeflower/files/stat', { path })).result;
+  const write = (path, text, expectedMtimeMs) => call(socket, '_codeflower/files/write', { path, text, expectedMtimeMs });
+
+  const script = await stat_(join(workspace, 'run.sh'));
+  assert.equal(script.writable, true);
+  assert.equal((await stat_(join(output, 'notes.md'))).writable, true);
+  assert.equal((await stat_(join(input, 'meta.csv'))).writable, false);
+
+  const saved = (await write(script.path, 'echo two\n', script.mtimeMs)).result;
+  assert.equal(await readFile(join(workspace, 'run.sh'), 'utf8'), 'echo two\n');
+  assert.equal(saved.size, 9);
+  // The script stays executable.
+  assert.equal((await stat(join(workspace, 'run.sh'))).mode & 0o777, 0o755);
+
+  // The agent wrote the file since: the user's older version is not saved over it.
+  const conflict = await write(script.path, 'echo three\n', script.mtimeMs);
+  assert.match(conflict.error.message, /changed since you opened it/);
+  assert.deepEqual(conflict.error.data, { conflict: true });
+  assert.equal(await readFile(join(workspace, 'run.sh'), 'utf8'), 'echo two\n');
+
+  const notes = await stat_(join(output, 'notes.md'));
+  assert.ok((await write(notes.path, '# Notes\n\nMore.\n', notes.mtimeMs)).result);
+  const meta = await stat_(join(input, 'meta.csv'));
+  assert.match((await write(meta.path, 'id\n2\n', meta.mtimeMs)).error.message, /read-only/);
+  assert.equal(await readFile(join(input, 'meta.csv'), 'utf8'), 'id\n1\n');
+  assert.match((await write(notes.path, 'x'.repeat(10 * 1024 * 1024 + 1), notes.mtimeMs)).error.message, /at most 10 MB/);
+  await mkdir(sessionsDirectory, { recursive: true });
+  await writeFile(join(sessionsDirectory, 'secret.txt'), 'private');
+  assert.match((await write(join(sessionsDirectory, 'secret.txt'), 'x', 0)).error.message, /cannot be shown/);
+  await closeSocket(socket);
+});
+
 test('does not report success when the report changes during every comment save attempt', async () => {
   const html = '<html><script type="application/json" id="cf-comments">[]</script></html>';
   let version = 0;

@@ -3,7 +3,13 @@ import { access, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { dirname } from 'node:path';
 
-export class InvalidRequest extends Error {}
+export class InvalidRequest extends Error {
+  /** `data` goes to the client with the error, e.g. `{ conflict: true }`. */
+  constructor(message, data) {
+    super(message);
+    if (data) this.data = data;
+  }
+}
 
 export async function exists(path) {
   try {
