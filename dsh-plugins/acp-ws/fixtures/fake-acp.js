@@ -20,6 +20,8 @@ let nextRequest = 1;
 let pendingPrompt;
 // Turns that run until the test lets them finish, by session.
 const longTasks = new Map();
+// Steering requests, as the agent got them.
+const steers = [];
 const waiting = new Map();
 
 function send(message) {
@@ -403,6 +405,25 @@ input.on('line', async (line) => {
         send({ jsonrpc: '2.0', id: pendingPrompt, result: { stopReason: 'cancelled' } });
         pendingPrompt = undefined;
       }
+      break;
+    // ACP steering, as Claude Code does it: into the running turn, or back to the client without one.
+    case '_session/steering': {
+      const { sessionId, prompt } = message.params;
+      steers.push(message.params);
+      if (!longTasks.has(sessionId)) {
+        send({ jsonrpc: '2.0', id: message.id, result: { outcome: 'promptRequired', reason: 'noRunningTurn' } });
+        break;
+      }
+      send({ jsonrpc: '2.0', id: message.id, result: { outcome: 'injected' } });
+      send({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: { sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `steered by ${prompt[0].text}` } } }
+      });
+      break;
+    }
+    case 'fake/steers':
+      send({ jsonrpc: '2.0', id: message.id, result: { steers } });
       break;
     case 'fake/finish': {
       const { sessionId } = message.params;

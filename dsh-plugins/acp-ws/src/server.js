@@ -26,13 +26,11 @@ const CONNECTION_PATH = '/acp';
 const STATUS_PATH = '/status';
 // The app's client asks chats to wrap up here before it stops the sandbox.
 const WRAP_UP_PATH = '/wrap-up';
-// The app lists the chats here without opening a window, which would take
-// the worker over from the one connected.
+// The app lists the chats here without opening a window.
 const SESSIONS_PATH = '/sessions';
 const MAX_WRAP_UP_BODY = 4096;
 // A window that misses two pings in a row is gone, e.g. a laptop that went to sleep.
 const PING_MS = 30_000;
-const TAKEN_OVER = 4001;
 const MAX_PAYLOAD = 16 * 1024 * 1024;
 const CONTROL_PREFIX = '_codeflower/';
 const LEASE_CONFLICT = -32010;
@@ -49,9 +47,13 @@ const LIMITS_INTERVAL_MS = 60_000;
 const WRAP_UP_LEAD_MS = 15 * 60_000;
 // How long a cancelled turn may take to end before the wrap-up gives up on it.
 const WRAP_UP_CANCEL_MS = 30_000;
+// How often a run's prompt, waiting for the agent's sign-in, checks for it.
+const SIGN_IN_POLL_MS = 2000;
 // setTimeout waits at most about 24 days; longer waits are made of several.
 const MAX_TIMER_MS = 2 ** 31 - 1;
 const SESSION_STARTS = ['session/new', 'session/resume', 'session/load'];
+// ACP steering: a message for the turn the agent is working on (Claude Code, Codex).
+const STEER_METHOD = '_session/steering';
 
 /** The line users paste into VS Code; the token travels in it like Jupyter's. */
 export function connectionUrl(host, port, token) {
@@ -260,6 +262,9 @@ export function createRecorder(store, log) {
           if (typeof sessionId === 'string') {
             run(() => store.open(sessionId, { cwd: request.params?.cwd }));
           }
+        } else if (request.method === STEER_METHOD && message.result?.outcome === 'injected') {
+          const sessionId = request.params?.sessionId;
+          run(() => store.record(sessionId, { kind: 'prompt', prompt: request.params?.prompt ?? [] }));
         } else if (request.method === 'session/prompt') {
           const sessionId = request.params?.sessionId;
           run(() =>
@@ -372,6 +377,7 @@ export async function startBridge(options) {
     actions = [],
     wrapUpTemplate,
     wrapUpLeadMs = WRAP_UP_LEAD_MS,
+    signInPollMs = SIGN_IN_POLL_MS,
     // What chats are told when the client that started the sandbox quits
     // ({{minutes}}: at most how long it waits for them).
     wrapUpQuitTemplate,
@@ -415,11 +421,15 @@ export async function startBridge(options) {
     : undefined;
   const recorder = store ? createRecorder(store, log) : undefined;
 
-  // The agent runs from the first connection until the worker stops; VS Code
-  // windows attach to it one at a time and may come and go.
+  // The agent runs from the first connection until the worker stops; windows
+  // (VS Code, the app's page) attach to it side by side and may come and go.
   let agentHost;
   let agentStarting;
-  let client;
+  // Connected windows, oldest first.
+  const clients = new Set();
+  let nextClient = 1;
+  // The window that sent the latest prompt, which gets the files the agent shows.
+  let lastPrompter;
   let closing = false;
   const shells = new Map();
   // The latest wrap-up's reason, how many chats it and earlier ones asked,
@@ -428,9 +438,21 @@ export async function startBridge(options) {
   let wrapUpAsked = 0;
   const wrappingUp = new Set();
 
-  const sendToClient = (message) => client?.send(message);
+  const broadcast = (message) => {
+    for (const target of clients) target.send(message);
+  };
+  // To the windows that opened the chat.
+  const toSession = (sessionId, message, except) => {
+    for (const target of clients) {
+      if (target !== except && target.sessions.has(sessionId)) target.send(message);
+    }
+  };
+  const newestClient = () => [...clients].at(-1);
+  const closeClients = (host, code, reason) => {
+    for (const target of clients) if (!host || target.agent === host) target.close(code, reason);
+  };
   const activity = createActivity(() =>
-    sendToClient({ jsonrpc: '2.0', method: '_codeflower/activity', params: activitySnapshot() })
+    broadcast({ jsonrpc: '2.0', method: '_codeflower/activity', params: activitySnapshot() })
   );
 
   function activitySnapshot() {
@@ -464,7 +486,7 @@ export async function startBridge(options) {
     onChange() {
       usageTimer ??= setTimeout(() => {
         usageTimer = undefined;
-        sendToClient({ jsonrpc: '2.0', method: '_codeflower/usage', params: usageSnapshot() });
+        broadcast({ jsonrpc: '2.0', method: '_codeflower/usage', params: usageSnapshot() });
       }, USAGE_NOTIFY_MS);
     },
     onAccountChange() {
@@ -515,7 +537,10 @@ export async function startBridge(options) {
     return {
       agent: agentName,
       agentLabel: agent.label ?? agentName,
-      connected: Boolean(client),
+      connected: clients.size > 0,
+      clients: clients.size,
+      // Windows attach side by side instead of taking the worker over.
+      multiClient: true,
       running: Boolean(agentHost),
       working: snapshot.working,
       waiting: snapshot.waiting,
@@ -659,6 +684,8 @@ export async function startBridge(options) {
   const childRunning = (child) => child.exitCode === null && child.signalCode === null;
 
   const startAgent = async () => {
+    // Agents signed in with keys read them only at start.
+    const withoutKeys = Boolean(agent.setCredentials) && !(await agent.signedIn());
     const command = await agent.command();
     // dsh's usage plugin reports token counts on a pipe of their own.
     const usageFd = agent.usageFd;
@@ -676,14 +703,19 @@ export async function startBridge(options) {
       // go, so their ids could collide.
       requests: new Map(),
       nextRequest: 1,
-      // Permission requests and questions nobody answered yet.
+      // Permission requests and questions nobody answered yet; the first
+      // window to answer wins.
       waiting: new Map(),
+      // Other requests of the agent's, by the window that has to answer.
+      forwarded: new Map(),
       // Each loaded session's modes and settings, for windows that reattach.
       sessions: new Map(),
-      // Requests the bridge answered itself (the wrap-up cancels them); the
-      // window's late answers are dropped.
-      answered: new Set(),
-      retiring: false
+      // Per session: the prompts waiting for the running turn, and the window
+      // that sent the latest one.
+      prompts: new Map(),
+      prompters: new Map(),
+      retiring: false,
+      withoutKeys
     };
     let stdoutBuffer = '';
     child.stdout.setEncoding('utf8');
@@ -691,7 +723,7 @@ export async function startBridge(options) {
       stdoutBuffer += chunk;
       if (Buffer.byteLength(stdoutBuffer) > MAX_PAYLOAD && !stdoutBuffer.includes('\n')) {
         log('ACP child wrote an oversized stdio frame');
-        client?.close(1009, 'ACP frame from agent is too large');
+        closeClients(started, 1009, 'ACP frame from agent is too large');
         endChild(child);
         return;
       }
@@ -706,7 +738,7 @@ export async function startBridge(options) {
           if (!protocolObject(message)) throw new Error('ACP frame must be a JSON object');
         } catch (error) {
           log(`ACP child wrote an invalid stdio frame: ${error.message}`);
-          client?.close(1011, 'Invalid ACP frame from agent');
+          closeClients(started, 1011, 'Invalid ACP frame from agent');
           endChild(child);
           return;
         }
@@ -733,16 +765,17 @@ export async function startBridge(options) {
     }
     child.once('error', (error) => {
       log(`Could not start ${agentName}: ${error.message}`);
-      if (client?.agent === started) client.close(1011, 'Could not start agent');
+      closeClients(started, 1011, 'Could not start agent');
     });
     child.stdin.on('error', (error) => {
       log(`Could not write to ${agentName}: ${error.message}`);
-      if (client?.agent === started) client.close(1011, 'Could not write to agent');
+      closeClients(started, 1011, 'Could not write to agent');
     });
     child.once('close', (code, signal) => {
       if (stdoutBuffer.trim()) log('ACP child exited with an incomplete stdio frame');
       if (code !== 0 && code !== null) log(`${agentName} exited with status ${code}`);
       else if (signal) log(`${agentName} exited on signal ${signal}`);
+      for (const sessionId of started.prompts.keys()) dropPrompts(started, sessionId);
       for (const request of started.requests.values()) {
         request.reject?.(new Error(`${agentName} exited before answering ${request.method}`));
       }
@@ -752,7 +785,7 @@ export async function startBridge(options) {
         activity.clear();
         void recorder?.closeAll();
       }
-      if (client?.agent === started) client.close(1011, 'Agent process ended');
+      closeClients(started, 1011, 'Agent process ended');
     });
     return started;
   };
@@ -785,20 +818,76 @@ export async function startBridge(options) {
       }
       const id = `cf-${host.nextRequest++}`;
       const key = requestKey(id);
-      const request = { client: null, id, key, method, params, resolve, reject };
+      const request = { client: null, id, bridgeId: id, key, method, params, resolve, reject };
       if (method === 'initialize') {
         host.initialized = new Promise((initialize) => {
           request.initialized = initialize;
         });
       }
-      host.requests.set(key, request);
-      if (method === 'session/prompt' && typeof params.sessionId === 'string') {
-        activity.turnStarted(key, params.sessionId);
-      }
-      writeToAgent(host, withSessionMeta({ jsonrpc: '2.0', id, method, params }));
+      sendRequest(host, request);
     });
 
+  // Sends a request on to the agent under the bridge's id. A chat's prompts
+  // take turns: one sent while a turn runs (two windows at once, a wrap-up)
+  // waits for its end. Every window that opened the chat is told when a
+  // prompt starts, the one that sent it too, so all show it in one order.
+  const sendRequest = (host, request, webSocket) => {
+    const { key, method, params } = request;
+    const sessionId = params?.sessionId;
+    const prompt = method === 'session/prompt' && typeof sessionId === 'string';
+    const send = () => {
+      host.requests.set(key, request);
+      if (prompt) {
+        activity.turnStarted(key, sessionId);
+        if (request.client) {
+          host.prompters.set(sessionId, request.client);
+          lastPrompter = request.client;
+        }
+        const meta = protocolObject(params._meta) ? { _meta: params._meta } : {};
+        toSession(sessionId, {
+          jsonrpc: '2.0',
+          method: '_codeflower/prompted',
+          params: { key: sessionKey(agentName, sessionId), sessionId, prompt: params.prompt ?? [], ...meta }
+        });
+      }
+      writeToAgent(host, withSessionMeta({ jsonrpc: '2.0', id: request.bridgeId, method, params }), webSocket);
+    };
+    if (!prompt) return send();
+    const queue = host.prompts.get(sessionId);
+    if (!queue) {
+      host.prompts.set(sessionId, []);
+      return send();
+    }
+    queue.push({
+      send,
+      cancel: () =>
+        request.client
+          ? request.client.send({ jsonrpc: '2.0', id: request.id, result: { stopReason: 'cancelled' } })
+          : request.reject(new Error('The prompt was cancelled before it started'))
+    });
+  };
+
+  // A chat's turn ended: its next prompt starts.
+  const promptEnded = (host, sessionId) => {
+    const next = host.prompts.get(sessionId)?.shift();
+    if (next) next.send();
+    else host.prompts.delete(sessionId);
+  };
+
+  // Prompts not started yet are cancelled with the turn.
+  const dropPrompts = (host, sessionId) => {
+    for (const { cancel } of host.prompts.get(sessionId)?.splice(0) ?? []) cancel();
+  };
+
+  // A run's prompt waits until the agent is signed in, which a window does,
+  // and, for keys, until the agent started without them is restarted.
   const startInitialSession = async () => {
+    const signedIn = async () => (agent.signedIn ? agent.signedIn() : true);
+    if (!(await signedIn())) log(`The run's task waits until ${agent.label ?? agentName} is signed in: connect and sign in`);
+    while (!closing && (!(await signedIn()) || agentHost?.withoutKeys)) {
+      await new Promise((resolve) => setTimeout(resolve, signInPollMs).unref());
+    }
+    if (closing) return;
     const host = await ensureAgent();
     if (host.initialized) {
       if (!(await host.initialized)) throw new Error('The agent could not be initialized');
@@ -873,7 +962,7 @@ export async function startBridge(options) {
     wrapUpReason = reason;
     wrapUpAsked += sessionIds.length;
     for (const sessionId of sessionIds) wrappingUp.add(sessionId);
-    sendToClient({ jsonrpc: '2.0', method: '_codeflower/wrapUp', params: { ...notice, chats: sessionIds.length } });
+    broadcast({ jsonrpc: '2.0', method: '_codeflower/wrapUp', params: { ...notice, chats: sessionIds.length } });
     const done = Promise.all(
       sessionIds.map((sessionId) =>
         wrapUpChat(host, sessionId, notice, template).finally(() => wrappingUp.delete(sessionId))
@@ -884,13 +973,12 @@ export async function startBridge(options) {
 
   const wrapUpChat = async (host, sessionId, notice, template) => {
     // As a client cancels: the turn, then the requests it waits on.
+    dropPrompts(host, sessionId);
     writeToAgent(host, { jsonrpc: '2.0', method: 'session/cancel', params: { sessionId } });
     for (const [key, { message, sessionId: owner }] of host.waiting) {
       if (owner !== sessionId) continue;
-      host.waiting.delete(key);
-      host.answered.add(key);
-      activity.answered(key);
       const result = message.method === 'session/request_permission' ? { outcome: { outcome: 'cancelled' } } : { action: 'cancel' };
+      settleWaiting(host, key, result);
       writeToAgent(host, { jsonrpc: '2.0', id: message.id, result });
     }
     const deadline = Date.now() + WRAP_UP_CANCEL_MS;
@@ -902,7 +990,7 @@ export async function startBridge(options) {
     }
     const text = template.replace(/\{\{(\w+)\}\}/g, (placeholder, name) => String(notice[name] ?? placeholder)).trim();
     // The window shows the prompt, as it did not send it.
-    sendToClient({
+    broadcast({
       jsonrpc: '2.0',
       method: '_codeflower/wrapUp',
       params: { ...notice, key: sessionKey(agentName, sessionId), prompt: text }
@@ -912,12 +1000,34 @@ export async function startBridge(options) {
     );
   };
 
-  // A permission request or question goes to the window once, after it has
+  // A permission request or question goes to each window once, after it has
   // opened that chat.
   const deliver = (target, key, message) => {
     if (target.delivered.has(key)) return;
     target.delivered.add(key);
     target.send(message);
+  };
+
+  // A permission request or question was answered, by a window or by the
+  // bridge: it stops waiting, and the other windows that were asked close it.
+  // Returns false when it was answered before, e.g. by another window.
+  const settleWaiting = (host, key, result, answeredBy) => {
+    const waiting = host.waiting.get(key);
+    if (!waiting) return false;
+    host.waiting.delete(key);
+    activity.answered(key);
+    const { sessionId } = waiting;
+    const params = {
+      ...(sessionId !== undefined ? { key: sessionKey(agentName, sessionId), sessionId } : {}),
+      requestKey: key,
+      result: result ?? null
+    };
+    for (const target of clients) {
+      if (target !== answeredBy && target.delivered.has(key)) {
+        target.send({ jsonrpc: '2.0', method: '_codeflower/requestResolved', params });
+      }
+    }
+    return true;
   };
 
   // On attach: the requests are in the transcript the window loads, so they
@@ -936,7 +1046,7 @@ export async function startBridge(options) {
   // neither overlap nor leave a gap.
   const attachSession = async (host, target, id, sessionId, result) => {
     while (recorder?.busy) await recorder.idle();
-    if (target !== client || !host.sessions.has(sessionId)) {
+    if (!clients.has(target) || !host.sessions.has(sessionId)) {
       target.send({ jsonrpc: '2.0', id, result });
       return;
     }
@@ -972,6 +1082,9 @@ export async function startBridge(options) {
     }
   };
 
+  const toSettings = (sessionId, update, except) =>
+    toSession(sessionId, { jsonrpc: '2.0', method: 'session/update', params: { sessionId, update } }, except);
+
   // The agent answered a client request.
   const settleRequest = (host, request, message) => {
     const { method, params, key } = request;
@@ -997,13 +1110,18 @@ export async function startBridge(options) {
         void (recorder?.isOpen(sessionId) ?? Promise.resolve()).then(() =>
           usage.opened(sessionId, store?.storedUsage(sessionId))
         );
-        if (request.client === client) void attachSession(host, request.client, request.id, sessionId, result);
+        if (clients.has(request.client)) void attachSession(host, request.client, request.id, sessionId, result);
         return true;
+      // The other windows with the chat open follow a change of settings.
       case 'session/set_config_option':
-        if (state && Array.isArray(result.configOptions)) state.configOptions = result.configOptions;
+        if (state && Array.isArray(result.configOptions)) {
+          state.configOptions = result.configOptions;
+          toSettings(sessionId, { sessionUpdate: 'config_option_update', configOptions: result.configOptions }, request.client);
+        }
         break;
       case 'session/set_mode':
         if (state?.modes) state.modes.currentModeId = params.modeId;
+        toSettings(sessionId, { sessionUpdate: 'current_mode_update', currentModeId: params.modeId }, request.client);
         break;
       case 'session/set_model':
       case 'session/unstable_setSessionModel':
@@ -1028,8 +1146,29 @@ export async function startBridge(options) {
       const attached = settleRequest(host, request, message);
       if (message.error) request.reject?.(new Error(message.error.message ?? `${request.method} failed`));
       else request.resolve?.(message.result);
-      if (attached) return;
-      if (request.client === client) client.send({ ...message, id: request.id });
+      // A message the turn took in shows in every window, as a prompt does.
+      const steered = request.method === STEER_METHOD && message.result?.outcome === 'injected';
+      if (steered) {
+        const sessionId = request.params.sessionId;
+        toSession(sessionId, {
+          jsonrpc: '2.0',
+          method: '_codeflower/prompted',
+          params: { key: sessionKey(agentName, sessionId), sessionId, prompt: request.params.prompt ?? [] }
+        });
+      }
+      if (!attached && clients.has(request.client)) {
+        // Windows that know of it show the others' prompts and settings live.
+        const answer =
+          request.method === 'initialize' && protocolObject(message.result)
+            ? { ...message, result: withMultiClient(message.result) }
+            : steered
+              ? { ...message, result: withPrompted(message.result) }
+              : message;
+        request.client.send({ ...answer, id: request.id });
+      }
+      if (request.method === 'session/prompt' && typeof request.params?.sessionId === 'string') {
+        promptEnded(host, request.params.sessionId);
+      }
       return;
     }
     recorder?.fromAgent(message);
@@ -1040,25 +1179,38 @@ export async function startBridge(options) {
       trackSettings(host, sessionId, update);
       if (update?.sessionUpdate === 'tool_call') activity.toolCall(sessionId, update);
       if (update?.sessionUpdate === 'usage_update' && sessionId !== undefined) usage.update(sessionId, update);
-      if (sessionId !== undefined && client?.sessions.has(sessionId)) client.sendFrame(frame);
+      if (sessionId === undefined) return;
+      for (const target of clients) if (target.sessions.has(sessionId)) target.sendFrame(frame);
       return;
     }
 
     if (message.id !== undefined) {
       const key = requestKey(message.id);
       if (message.method === 'session/request_permission' || message.method === 'elicitation/create') {
-        // It waits for the user, however long they are away.
-        host.waiting.set(key, { message, sessionId });
+        // It waits for the user, however long they are away, and goes to
+        // every window with the chat open; the key lets them tell when
+        // another one answered.
+        const params = protocolObject(message.params) ? message.params : {};
+        const meta = protocolObject(params._meta) ? params._meta : {};
+        const tagged = { ...message, params: { ...params, _meta: { ...meta, 'codeflower/requestKey': key } } };
+        host.waiting.set(key, { message: tagged, sessionId });
         if (sessionId !== undefined && message.method === 'session/request_permission') {
           activity.permission(key, sessionId, message.params?.toolCall);
         } else if (sessionId !== undefined && message.params?.mode !== 'url') {
           activity.question(key, sessionId);
         }
-        if (client && (sessionId === undefined || client.sessions.has(sessionId))) deliver(client, key, message);
+        for (const target of clients) {
+          if (sessionId === undefined || target.sessions.has(sessionId)) deliver(target, key, tagged);
+        }
         return;
       }
-      if (client) {
-        client.sendFrame(frame);
+      // Anything else the agent asks goes to one window: the one whose prompt
+      // started the turn, else the newest.
+      const prompter = sessionId !== undefined ? host.prompters.get(sessionId) : undefined;
+      const target = clients.has(prompter) ? prompter : newestClient();
+      if (target) {
+        host.forwarded.set(key, target);
+        target.sendFrame(frame);
       } else {
         writeToAgent(host, {
           jsonrpc: '2.0',
@@ -1076,7 +1228,7 @@ export async function startBridge(options) {
       usage.claudeRateLimit(message.params.message.rate_limit_info);
       return;
     }
-    client?.sendFrame(frame);
+    for (const target of clients) target.sendFrame(frame);
   };
 
   // A prompt's answer: what the turn added to the session's usage, which a
@@ -1089,6 +1241,17 @@ export async function startBridge(options) {
     refreshLimits();
     return turn;
   };
+
+  const withMultiClient = (result) => ({
+    ...result,
+    _meta: { ...(protocolObject(result._meta) ? result._meta : {}), 'codeflower/multiClient': true }
+  });
+
+  // The bridge told the windows of the message itself (`_codeflower/prompted`).
+  const withPrompted = (result) => ({
+    ...result,
+    _meta: { ...(protocolObject(result._meta) ? result._meta : {}), 'codeflower/prompted': true }
+  });
 
   // What the bridge asks of every session the agent starts, e.g. Claude Code's
   // rate limit events, next to what the window asked.
@@ -1107,6 +1270,8 @@ export async function startBridge(options) {
   const attachClient = (webSocket) => {
     const target = {
       webSocket,
+      // For the log: which window this is.
+      id: nextClient++,
       agent: undefined,
       // The chats this window opened; it gets their updates and requests.
       sessions: new Set(),
@@ -1136,19 +1301,24 @@ export async function startBridge(options) {
     return target;
   };
 
-  sockets.on('connection', (webSocket) => {
-    // The newest window wins, e.g. the same chats opened from another computer.
-    client?.close(TAKEN_OVER, 'Another VS Code window took over');
+  sockets.on('connection', (webSocket, request) => {
+    // Windows attach side by side, e.g. VS Code and the app's page.
     const self = attachClient(webSocket);
-    client = self;
+    clients.add(self);
+    // The app's page comes through the app, so its address is the app's.
+    const from = request?.socket?.remoteAddress ?? 'unknown address';
+    const userAgent = typeof request?.headers?.['user-agent'] === 'string' ? ` (${request.headers['user-agent'].slice(0, 200)})` : '';
+    log(`Client ${self.id} connected from ${from}${userAgent}; ${clients.size} connected`);
 
     let released = false;
-    const release = () => {
+    const release = (code, reason) => {
       if (released) return;
       released = true;
       for (const terminal of self.terminals.values()) terminal.kill('SIGTERM');
       self.terminals.clear();
-      if (client === self) client = undefined;
+      clients.delete(self);
+      const why = [code, reason?.toString().trim()].filter(Boolean).join(' ');
+      log(`Client ${self.id} disconnected${why ? ` (${why})` : ''}; ${clients.size} connected`);
     };
 
     const start = async () => {
@@ -1170,27 +1340,40 @@ export async function startBridge(options) {
 
     const handleClientMessage = async (message) => {
       const host = self.agent;
-      if (!host || !childRunning(host.child) || client !== self) return;
+      if (!host || !childRunning(host.child) || !clients.has(self)) return;
 
-      // An answer to the agent's request: forwarded once, then it stops waiting.
+      // An answer to the agent's request: the first window's is forwarded,
+      // later ones (another window, or after the wrap-up) are dropped.
       if (message.method === undefined) {
         if (message.id === undefined) return;
         const key = requestKey(message.id);
-        if (host.answered.delete(key)) return;
-        if (host.waiting.delete(key)) activity.answered(key);
-        writeToAgent(host, message, webSocket);
+        if (settleWaiting(host, key, message.result, self)) {
+          writeToAgent(host, message, webSocket);
+        } else if (host.forwarded.get(key) === self) {
+          host.forwarded.delete(key);
+          writeToAgent(host, message, webSocket);
+        }
         return;
       }
       if (message.id === undefined) {
+        // Stop also cancels the chat's prompts still waiting for the turn.
+        if (message.method === 'session/cancel' && typeof message.params?.sessionId === 'string') {
+          dropPrompts(host, message.params.sessionId);
+        }
         writeToAgent(host, message, webSocket);
         return;
       }
 
       const respond = (result) => self.send({ jsonrpc: '2.0', id: message.id, result });
+      if (message.method === 'initialize') {
+        const info = protocolObject(message.params?.clientInfo) ? message.params.clientInfo : {};
+        const name = [info.name, info.version].filter((part) => typeof part === 'string').join(' ');
+        if (name) log(`Client ${self.id} is ${name.slice(0, 200)}`);
+      }
       if (message.method === 'initialize' && host.initialized) {
         const result = await host.initialized;
         if (result) {
-          respond(result);
+          respond(withMultiClient(result));
           return;
         }
       }
@@ -1212,15 +1395,25 @@ export async function startBridge(options) {
         }
       }
 
+      // A message for the running turn (ACP steering). Without one the window
+      // sends it as a prompt: an agent would start a turn of its own, which
+      // the bridge would not track.
+      if (message.method === STEER_METHOD && typeof sessionId === 'string') {
+        if (!activity.busy(sessionId)) {
+          respond({ outcome: 'promptRequired', reason: 'noRunningTurn' });
+          return;
+        }
+        const meta = protocolObject(message.params._meta) ? message.params._meta : {};
+        message.params._meta = { ...meta, steering: { ...meta.steering, idleBehavior: 'promptRequired' } };
+      }
+
       const bridgeId = `cf-${host.nextRequest++}`;
       const key = requestKey(bridgeId);
-      const request = { client: self, id: message.id, key, method: message.method, params: message.params };
+      const request = { client: self, id: message.id, bridgeId, key, method: message.method, params: message.params };
       if (message.method === 'initialize') {
         host.initialized = new Promise((resolve) => (request.initialized = resolve));
       }
-      host.requests.set(key, request);
-      if (message.method === 'session/prompt' && typeof sessionId === 'string') activity.turnStarted(key, sessionId);
-      writeToAgent(host, { ...withSessionMeta(message), id: bridgeId }, webSocket);
+      sendRequest(host, request, webSocket);
     };
 
     // ---- sign-in terminals ----
@@ -1287,6 +1480,11 @@ export async function startBridge(options) {
         throw error;
       }
       recorder?.record(sessionId, { kind: 'shell', runId, command });
+      // The other windows with the chat open show the command as it runs.
+      const shellParams = typeof sessionId === 'string' ? { key: sessionKey(agentName, sessionId), sessionId, runId } : undefined;
+      if (shellParams) {
+        toSession(sessionId, { jsonrpc: '2.0', method: '_codeflower/shell/started', params: { ...shellParams, command } }, self);
+      }
       return new Promise((resolve) => {
         const shell = spawn('/bin/sh', ['-c', command], {
           cwd: workspace,
@@ -1310,7 +1508,9 @@ export async function startBridge(options) {
         if (stopRequested) stop();
         const forward = (data) => {
           if (output.length < MAX_SHELL_RECORD) output += data.slice(0, MAX_SHELL_RECORD - output.length);
-          sendToClient({ jsonrpc: '2.0', method: '_codeflower/shell/output', params: { runId, data } });
+          const notice = { jsonrpc: '2.0', method: '_codeflower/shell/output', params: { runId, data } };
+          self.send(notice);
+          if (shellParams) toSession(sessionId, notice, self);
         };
         shell.stdout.setEncoding('utf8');
         shell.stderr.setEncoding('utf8');
@@ -1321,6 +1521,9 @@ export async function startBridge(options) {
           shells.delete(runId);
           const result = { exitCode, timedOut, truncated: output.length >= MAX_SHELL_RECORD };
           recorder?.record(sessionId, { kind: 'shell_end', runId, output, ...result });
+          if (shellParams) {
+            toSession(sessionId, { jsonrpc: '2.0', method: '_codeflower/shell/ended', params: { ...shellParams, ...result } }, self);
+          }
           resolve(result);
         };
         shell.once('error', (error) => {
@@ -1396,7 +1599,7 @@ export async function startBridge(options) {
             if (loaded !== undefined) {
               if (activity.busy(loaded)) throw new InvalidRequest('The chat is still working; stop it first');
               host.sessions.delete(loaded);
-              client?.sessions.delete(loaded);
+              for (const target of clients) target.sessions.delete(loaded);
               usage.forget(loaded);
               await recorder?.close(loaded);
             }
@@ -1538,13 +1741,14 @@ export async function startBridge(options) {
   });
 
   const pings = setInterval(() => {
-    if (!client) return;
-    if (!client.alive) {
-      client.webSocket.terminate();
-      return;
+    for (const target of clients) {
+      if (!target.alive) {
+        target.webSocket.terminate();
+        continue;
+      }
+      target.alive = false;
+      target.webSocket.ping();
     }
-    client.alive = false;
-    client.webSocket.ping();
   }, PING_MS);
   pings.unref();
 
@@ -1567,8 +1771,10 @@ export async function startBridge(options) {
       const cwd = typeof request.cwd === 'string' ? request.cwd : workspace;
       const files = [];
       for (const path of paths.slice(0, 20)) files.push(await resolveFile(path, { ...fileOptions, cwd }));
-      if (!client) return { error: 'No VS Code window is connected to this worker, so nobody can see the files now' };
-      sendToClient({
+      // One window opens them: the one that sent the latest prompt, else the newest.
+      const target = clients.has(lastPrompter) ? lastPrompter : newestClient();
+      if (!target) return { error: 'No window is connected to this worker, so nobody can see the files now' };
+      target.send({
         jsonrpc: '2.0',
         method: '_codeflower/show',
         params: {
@@ -1635,7 +1841,7 @@ export async function startBridge(options) {
         await saveUsage();
       }
       await limitsReading;
-      client?.close(1001, 'Server shutting down');
+      closeClients(undefined, 1001, 'Server shutting down');
       for (const shell of shells.values()) shell.stop();
       const host = agentHost ?? (await agentStarting?.catch(() => undefined));
       if (host) {

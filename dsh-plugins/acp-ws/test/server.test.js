@@ -12,7 +12,7 @@ import { readActions } from '../src/actions.js';
 import { createAgents, loadRegistry } from '../src/agents.js';
 import { writeCommentsSlot } from '../src/files.js';
 import { agentEnvironment, startBridge } from '../src/server.js';
-import { readTranscript, sessionKey } from '../src/sessions.js';
+import { listSessions, readTranscript, sessionKey } from '../src/sessions.js';
 
 const fakeAgent = fileURLToPath(new URL('../fixtures/fake-acp.js', import.meta.url));
 const token = 'k'.repeat(43);
@@ -205,19 +205,27 @@ test('rejects missing or invalid bearer tokens without starting an agent', async
 });
 
 test('starts the worker agent on connect without passing it any credentials', async (t) => {
-  const { bridge, directory } = await startTestBridge(t, { agentName: 'codex' });
+  const logs = [];
+  const { bridge, directory } = await startTestBridge(t, { agentName: 'codex', log: (message) => logs.push(message) });
   const connection = JSON.parse(await readFile(join(directory, 'instance.json'), 'utf8'));
   assert.equal((await stat(join(directory, 'instance.json'))).mode & 0o777, 0o600);
   assert.equal(connection.agent, 'codex');
   assert.equal(connection.url, `codeflower://localhost:${bridge.address.port}?token=${token}`);
 
-  // The newest window takes the worker over.
-  const replaced = await openSocket(bridge.address);
-  const replacedClosed = once(replaced, 'close');
+  // Windows attach side by side, and each one is logged.
+  const other = await openSocket(bridge.address);
   const socket = await openSocket(bridge.address);
-  assert.equal((await replacedClosed)[0], 4001);
+  await call(other, 'initialize', { protocolVersion: 1, clientCapabilities: {}, clientInfo: { name: 'codeflower-web', version: '1.2.3' } });
+  assert.equal(other.readyState, WebSocket.OPEN);
+  assert.match(logs.find((line) => line.startsWith('Client 1 connected')), /^Client 1 connected from \S+; 1 connected$/);
+  assert.ok(logs.includes('Client 1 is codeflower-web 1.2.3'));
+  assert.match(logs.find((line) => line.startsWith('Client 2 connected')), /; 2 connected$/);
+  await closeSocket(other);
+  await waitFor(() => logs.some((line) => line.startsWith('Client 1 disconnected')));
+  assert.match(logs.find((line) => line.startsWith('Client 1 disconnected')), /\(\d+\); 1 connected$/);
 
   const initialized = await initialize(socket);
+  assert.equal(initialized._meta['codeflower/multiClient'], true);
   assert.deepEqual(initialized.credentialVariables, []);
   assert.equal(initialized.leakedAppToken, null);
   assert.equal(initialized.noBrowser, '1');
@@ -273,12 +281,18 @@ test('describes every built-in agent completely', async () => {
 });
 
 test('starts and records an initial prompt in a session that VS Code can resume', async (t) => {
-  const { bridge, directory, sessionsDirectory } = await startTestBridge(t, {
-    initialPrompt: 'Analyse the input and generate a report'
+  const { bridge, directory, sessionsDirectory, environment } = await startTestBridge(t, {
+    initialPrompt: 'Analyse the input and generate a report',
+    signInPollMs: 10
   });
   assert.equal(JSON.parse(await readFile(join(directory, 'instance.json'), 'utf8')).initialPrompt, true);
   const nativeSessionId = 'session-1';
   const key = sessionKey('claude', nativeSessionId);
+
+  // Not signed in: the prompt waits for the sign-in instead of failing.
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.deepEqual(await listSessions(sessionsDirectory), []);
+  await writeFile(join(environment.CLAUDE_CONFIG_DIR, '.credentials.json'), '{}');
   await waitFor(async () => (await readTranscript(sessionsDirectory, key)).some((entry) => entry.kind === 'turn_end'));
 
   const transcript = await readTranscript(sessionsDirectory, key);
@@ -566,6 +580,28 @@ test('stores dsh keys in its own files and adds the endpoint on the next start',
   await closeSocket(again);
 });
 
+test('starts a run\'s prompt once dsh has restarted with its keys', async (t) => {
+  const { bridge, sessionsDirectory } = await startTestBridge(t, {
+    agentName: 'dsh',
+    initialPrompt: 'Analyse the input',
+    signInPollMs: 10
+  });
+  const socket = await openSocket(bridge.address);
+  await initialize(socket);
+  await call(socket, '_codeflower/credentials/set', { deepseekApiKey: 'sk-deepseek-secret' });
+  // Signed in, but the agent running has no keys yet.
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.deepEqual(await listSessions(sessionsDirectory), []);
+
+  const ended = once(socket, 'close');
+  await call(socket, '_codeflower/agent/restart');
+  await ended;
+  await waitFor(async () => (await listSessions(sessionsDirectory)).length === 1);
+  const [session] = await listSessions(sessionsDirectory);
+  await waitFor(async () => (await readTranscript(sessionsDirectory, session.key)).some((entry) => entry.kind === 'turn_end'));
+  assert.equal((await readTranscript(sessionsDirectory, session.key))[0].prompt[0].text, 'Analyse the input');
+});
+
 test('shows the files the agent asks for and lets the client read them', async (t) => {
   const workspaceDirectory = await mkdtemp(join(tmpdir(), 'codeflower-workspace-'));
   t.after(() => rm(workspaceDirectory, { recursive: true, force: true }));
@@ -587,7 +623,7 @@ test('shows the files the agent asks for and lets the client read them', async (
   await writeFile(join(workspaceDirectory, 'figures', 'umap.svg'), '<svg xmlns="http://www.w3.org/2000/svg"/>');
 
   // Nobody is connected yet.
-  assert.match((await show('figures/umap.svg')).stderr, /No VS Code window is connected/);
+  assert.match((await show('figures/umap.svg')).stderr, /No window is connected/);
 
   const socket = await openSocket(bridge.address);
   await initialize(socket);
@@ -724,6 +760,8 @@ test('keeps the agent and its chats working while no window is connected', async
     agent: 'claude',
     agentLabel: 'Claude Code',
     connected: false,
+    clients: 0,
+    multiClient: true,
     running: true,
     working: 1,
     waiting: 0,
@@ -774,6 +812,138 @@ test('keeps the agent and its chats working while no window is connected', async
   await closeSocket(third);
 });
 
+test('takes a message into the running turn and shows it in every window', async (t) => {
+  const { bridge } = await startTestBridge(t);
+  const first = await openSocket(bridge.address);
+  const second = await openSocket(bridge.address);
+  t.after(() => Promise.all([first, second].map(closeSocket)));
+  for (const socket of [first, second]) await initialize(socket);
+  const sessionId = (await call(first, 'session/new', { cwd: '/workspace', mcpServers: [] })).result.sessionId;
+  await call(second, 'session/resume', { sessionId, cwd: '/workspace', mcpServers: [] });
+  const steer = (text) => call(first, '_session/steering', { sessionId, prompt: [{ type: 'text', text }] });
+
+  // Without a turn the window sends it as a prompt; the agent never starts one of its own.
+  assert.deepEqual((await steer('too early')).result, { outcome: 'promptRequired', reason: 'noRunningTurn' });
+  assert.deepEqual((await call(first, 'fake/steers', {})).result.steers, []);
+
+  const longTask = nextId++;
+  send(first, { jsonrpc: '2.0', id: longTask, method: 'session/prompt', params: { sessionId, prompt: [{ type: 'text', text: 'long task' }] } });
+  await receive(first, (message) => text(message) === 'started');
+  const steered = await steer('also this');
+  assert.equal(steered.result.outcome, 'injected');
+  assert.equal(steered.result._meta['codeflower/prompted'], true);
+  // The agent is asked to leave a message it cannot take in to the window.
+  assert.deepEqual((await call(first, 'fake/steers', {})).result.steers[0]._meta, { steering: { idleBehavior: 'promptRequired' } });
+  for (const socket of [first, second]) {
+    const prompted = await receive(socket, (message) => message.method === '_codeflower/prompted' && message.params.prompt[0].text === 'also this');
+    assert.equal(prompted.params.sessionId, sessionId);
+    assert.equal(text(await receive(socket, (message) => text(message)?.startsWith('steered'))), 'steered by also this');
+  }
+  send(first, { jsonrpc: '2.0', method: 'fake/finish', params: { sessionId } });
+  await receive(first, (message) => message.id === longTask);
+
+  // The transcript has it where it came, inside the turn.
+  const entries = (await call(second, '_codeflower/sessions/transcript', { key: sessionKey('claude', sessionId) })).result.entries;
+  const prompts = entries.filter((entry) => entry.kind === 'prompt').map((entry) => entry.prompt[0].text);
+  assert.deepEqual(prompts, ['long task', 'also this']);
+  assert.equal(entries.at(-1).kind, 'turn_end');
+});
+
+test('keeps several windows on one chat in sync', async (t) => {
+  const { bridge } = await startTestBridge(t);
+  const first = await openSocket(bridge.address);
+  const second = await openSocket(bridge.address);
+  const bystander = await openSocket(bridge.address);
+  t.after(() => Promise.all([first, second, bystander].map(closeSocket)));
+  for (const socket of [first, second, bystander]) await initialize(socket);
+  const sessionId = (await call(first, 'session/new', { cwd: '/workspace', mcpServers: [] })).result.sessionId;
+  await call(second, 'session/resume', { sessionId, cwd: '/workspace', mcpServers: [] });
+  const key = sessionKey('claude', sessionId);
+  const prompt = (socket, text, meta) => {
+    const id = nextId++;
+    send(socket, { jsonrpc: '2.0', id, method: 'session/prompt', params: { sessionId, prompt: [{ type: 'text', text }], ...meta } });
+    return id;
+  };
+  const got = (socket, predicate) => inboxes.get(socket).messages.some(predicate);
+
+  // A prompt from one window: both show it, then the agent's reply.
+  const longTask = prompt(first, 'long task', { _meta: { 'codeflower/action': 'checkpoint' } });
+  for (const socket of [first, second]) {
+    const prompted = await receive(socket, (message) => message.method === '_codeflower/prompted');
+    assert.deepEqual(prompted.params, {
+      key,
+      sessionId,
+      prompt: [{ type: 'text', text: 'long task' }],
+      _meta: { 'codeflower/action': 'checkpoint' }
+    });
+    assert.equal(text(await receive(socket, (message) => message.method === 'session/update')), 'started');
+  }
+
+  // One sent while the turn runs waits for its end.
+  const queued = prompt(second, 'hello');
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(got(first, (message) => message.method === '_codeflower/prompted'), false);
+  send(first, { jsonrpc: '2.0', method: 'fake/finish', params: { sessionId } });
+  assert.equal((await receive(first, (message) => message.id === longTask)).result.stopReason, 'end_turn');
+  for (const socket of [first, second]) {
+    assert.equal((await receive(socket, (message) => message.method === '_codeflower/prompted')).params.prompt[0].text, 'hello');
+  }
+  assert.equal(text(await receive(first, (message) => text(message)?.startsWith('reply'))), `reply to hello in ${sessionId}`);
+  await receive(second, (message) => message.id === queued);
+  assert.equal(got(first, (message) => message.id === queued), false);
+
+  // Stop cancels the turn and the prompts waiting for it.
+  const cancelled = prompt(first, 'cancel me');
+  const waiting = prompt(second, 'never sent');
+  await receive(second, (message) => message.method === '_codeflower/prompted' && message.params.prompt[0].text === 'cancel me');
+  send(second, { jsonrpc: '2.0', method: 'session/cancel', params: { sessionId } });
+  assert.equal((await receive(second, (message) => message.id === waiting)).result.stopReason, 'cancelled');
+  assert.equal((await receive(first, (message) => message.id === cancelled)).result.stopReason, 'cancelled');
+
+  // A change of settings in one window shows in the other.
+  await call(first, 'session/set_config_option', { sessionId, configId: 'mode', value: 'plan' });
+  const followed = await receive(second, (message) => message.params?.update?.sessionUpdate === 'config_option_update');
+  assert.equal(followed.params.update.configOptions[0].currentValue, 'plan');
+
+  // A permission request goes to both; the first answer wins and the other window closes it.
+  const asking = prompt(first, 'ask permission');
+  const asked = await receive(first, (message) => message.method === 'session/request_permission');
+  const alsoAsked = await receive(second, (message) => message.method === 'session/request_permission');
+  const requestKey = asked.params._meta['codeflower/requestKey'];
+  assert.equal(alsoAsked.id, asked.id);
+  assert.equal(alsoAsked.params._meta['codeflower/requestKey'], requestKey);
+  const allow = { outcome: { outcome: 'selected', optionId: 'allow' } };
+  send(second, { jsonrpc: '2.0', id: asked.id, result: allow });
+  send(first, { jsonrpc: '2.0', id: asked.id, result: { outcome: { outcome: 'cancelled' } } });
+  const resolved = await receive(first, (message) => message.method === '_codeflower/requestResolved');
+  assert.deepEqual(resolved.params, { key, sessionId, requestKey, result: allow });
+  assert.equal(text(await receive(first, (message) => text(message)?.startsWith('outcome'))), 'outcome allow');
+  await receive(first, (message) => message.id === asking);
+  assert.equal(got(second, (message) => message.method === '_codeflower/requestResolved'), false);
+
+  // A shell command from one window runs live in the other.
+  const ran = call(first, '_codeflower/shell/run', { sessionId, runId: 'run-1', command: 'echo hi' });
+  const started = await receive(second, (message) => message.method === '_codeflower/shell/started');
+  assert.deepEqual(started.params, { key, sessionId, runId: 'run-1', command: 'echo hi' });
+  assert.equal((await receive(second, (message) => message.method === '_codeflower/shell/output')).params.data, 'hi\n');
+  assert.equal((await receive(first, (message) => message.method === '_codeflower/shell/output')).params.data, 'hi\n');
+  assert.equal((await ran).result.exitCode, 0);
+  assert.equal((await receive(second, (message) => message.method === '_codeflower/shell/ended')).params.exitCode, 0);
+  assert.equal(got(first, (message) => message.method?.startsWith('_codeflower/shell/') && message.method !== '_codeflower/shell/output'), false);
+
+  // A window that did not open the chat gets none of it.
+  const chatMethods = ['session/update', 'session/request_permission', '_codeflower/prompted', '_codeflower/shell/output'];
+  assert.equal(got(bystander, (message) => chatMethods.includes(message.method)), false);
+  assert.equal((await status(bridge.address)).body.clients, 3);
+
+  // The transcript has each prompt once.
+  const entries = (await call(second, '_codeflower/sessions/transcript', { key })).result.entries;
+  assert.deepEqual(
+    entries.filter((entry) => entry.kind === 'prompt').map((entry) => entry.prompt[0].text),
+    ['long task', 'hello', 'cancel me', 'ask permission']
+  );
+});
+
 test('keeps questions for the user until a window opens their chat', async (t) => {
   const { bridge } = await startTestBridge(t);
   const first = await openSocket(bridge.address);
@@ -817,6 +987,8 @@ test('reports its activity only to holders of the token', async (t) => {
     agent: 'claude',
     agentLabel: 'Claude Code',
     connected: false,
+    clients: 0,
+    multiClient: true,
     running: false,
     working: 0,
     waiting: 0,
