@@ -130,6 +130,13 @@ if [ -n "${CODEFLOWER_INSTANCE_ID:-}" ]; then
   fi
 fi
 
+# Which agent and model each chat runs, written by the bridge as
+# <session id>.json, so storyteller can name them in a report's header.
+if [ -n "${CODEFLOWER_INSTANCE_ID:-}" ]; then
+  CODEFLOWER_SESSION_INFO_DIR="${CODEFLOWER_RUN_DIR:-$state/run}/sessions-$CODEFLOWER_INSTANCE_ID"
+  export CODEFLOWER_SESSION_INFO_DIR
+fi
+
 # What the user's data holds (formats, shapes, columns), so the agent knows it
 # before listing anything. Workers of a project may mount different data, so
 # each writes its own. A short time limit keeps big folders from delaying the

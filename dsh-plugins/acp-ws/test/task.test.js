@@ -374,6 +374,18 @@ test('a task sets the model before the effort and reports what it ran with', asy
   assert.ok((await transcript(root, result.sessionKey)).length > 0);
 });
 
+test("a task tells the agent's commands which agent and model run it", async (t) => {
+  const context = await setup(t, { task: 'task: cluster', model: 'small' });
+  const directory = join(context.root, 'session-info');
+  const environment = { ...process.env, CLAUDE_CONFIG_DIR: join(context.root, 'claude-home'), VIRTUAL_ENV: context.venv };
+  const { result } = await attempt(context, { args: ['--models'] }, {
+    environment: { ...environment, CODEFLOWER_SESSION_INFO_DIR: directory }
+  });
+  const [file] = await readdir(directory);
+  assert.equal(`claude-${file.replace(/\.json$/, '')}`, result.sessionKey);
+  assert.deepEqual(JSON.parse(await readFile(join(directory, file), 'utf8')), { agent: 'Fake', model: 'Acme Small', turn: false });
+});
+
 test('a setting the agent does not offer stops the task before any prompt', async (t) => {
   // The small model has no high effort.
   const { result } = await run(t, { task: 'task: x', model: 'small', effort: 'high' }, { args: ['--models'] });

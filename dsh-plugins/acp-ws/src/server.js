@@ -7,6 +7,7 @@ import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { WebSocket, WebSocketServer } from 'ws';
 import { createActivity } from './activity.js';
+import { createSessionInfo } from './session-info.js';
 import { CREDENTIAL_VARIABLES, InvalidRequest, terminalAuthCommand } from './agents.js';
 import { readCodexLimits } from './codex-limits.js';
 import { listDirectory, readClientFile, resolveFile, saveReportComments, startShowServer, writeClientFile } from './files.js';
@@ -447,6 +448,7 @@ export async function startBridge(options) {
     ? createSessionStore({ directory: sessionsDirectory, instanceId, harness: agentName, log })
     : undefined;
   const recorder = store ? createRecorder(store, log) : undefined;
+  const sessionInfo = createSessionInfo({ directory: workerEnvironment.CODEFLOWER_SESSION_INFO_DIR, agent: agent.label, log });
 
   // The agent runs from the first connection until the worker stops; windows
   // (VS Code, the app's page) attach to it side by side and may come and go.
@@ -968,6 +970,7 @@ export async function startBridge(options) {
       host.requests.set(key, request);
       if (prompt) {
         activity.turnStarted(key, sessionId);
+        sessionInfo.turn(sessionId, true);
         if (request.client) {
           host.prompters.set(sessionId, request.client);
           lastPrompter = request.client;
@@ -1198,6 +1201,7 @@ export async function startBridge(options) {
   const rememberSession = (host, sessionId, result) => {
     const { sessionId: _, _meta, ...state } = result;
     host.sessions.set(sessionId, structuredClone(state));
+    sessionInfo.settings(sessionId, state);
   };
 
   // Keeps a loaded session's settings current, so a reattach reports them.
@@ -1209,6 +1213,7 @@ export async function startBridge(options) {
     } else if (update.sessionUpdate === 'current_mode_update' && state.modes) {
       state.modes.currentModeId = update.currentModeId;
     }
+    sessionInfo.settings(sessionId, state);
   };
 
   const toSettings = (sessionId, update, except) =>
@@ -1217,12 +1222,16 @@ export async function startBridge(options) {
   // The agent answered a client request.
   const settleRequest = (host, request, message) => {
     const { method, params, key } = request;
-    if (method === 'session/prompt') activity.turnEnded(key, message.error ? 'error' : (message.result?.stopReason ?? null));
+    if (method === 'session/prompt') {
+      activity.turnEnded(key, message.error ? 'error' : (message.result?.stopReason ?? null));
+      sessionInfo.turn(params?.sessionId, false);
+    }
     const result = message.result;
     if (method === 'initialize') {
       // Remember the sign-in methods the agent offers, so terminal sign-ins
       // can only run commands the agent itself announced.
       if (!message.error) host.authMethods = Array.isArray(result?.authMethods) ? result.authMethods : [];
+      if (!message.error) sessionInfo.reported(result?.agentInfo);
       request.initialized(message.error ? undefined : result);
       if (message.error) host.initialized = undefined;
     }
@@ -1245,6 +1254,7 @@ export async function startBridge(options) {
       case 'session/set_config_option':
         if (state && Array.isArray(result.configOptions)) {
           state.configOptions = result.configOptions;
+          sessionInfo.settings(sessionId, state);
           toSettings(sessionId, { sessionUpdate: 'config_option_update', configOptions: result.configOptions }, request.client);
         }
         break;
@@ -1255,6 +1265,7 @@ export async function startBridge(options) {
       case 'session/set_model':
       case 'session/unstable_setSessionModel':
         if (state?.models) state.models.currentModelId = params.modelId;
+        if (state) sessionInfo.settings(sessionId, state);
         break;
     }
     return false;

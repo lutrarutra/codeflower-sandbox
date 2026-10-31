@@ -5,6 +5,7 @@ import { createInterface } from 'node:readline';
 import { terminalAuthCommand } from './agents.js';
 import { readCodexLimits } from './codex-limits.js';
 import { agentEnvironment, createRecorder, endChild } from './server.js';
+import { createSessionInfo } from './session-info.js';
 import { createSessionStore, readJson, sessionKey, writeJsonAtomically } from './sessions.js';
 import { createUsage, dshTokens } from './usage.js';
 
@@ -496,6 +497,7 @@ export async function runTask({
   const instructions = renderInstructions(templates.instructions, task);
   const store = createSessionStore({ directory: sessionsDirectory, instanceId, harness: agentName, log });
   const recorder = createRecorder(store, log);
+  const sessionInfo = createSessionInfo({ directory: environment.CODEFLOWER_SESSION_INFO_DIR, agent: agent.label, log });
   const command = await agent.command();
   const usageFd = agent.usageFd;
   const child = spawn(command[0], command.slice(1), {
@@ -602,6 +604,9 @@ export async function runTask({
       if (update?.sessionUpdate === 'agent_message_chunk' && update.content?.type === 'text') {
         turnText += update.content.text;
       }
+      if (update?.sessionUpdate === 'config_option_update' && Array.isArray(update.configOptions)) {
+        sessionInfo.settings(sessionId, { configOptions: update.configOptions });
+      }
       if (update?.sessionUpdate === 'usage_update') {
         usage.update(sessionId, update);
         reportUsage();
@@ -664,6 +669,7 @@ export async function runTask({
     } else {
       out.write(`\n━━ ${text.split('\n')[0].slice(0, 120)}\n`);
     }
+    sessionInfo.turn(sessionId, true);
     const turn = call('session/prompt', { sessionId, prompt: [{ type: 'text', text }] });
     let timer;
     const stopped = new Promise((resolve) => {
@@ -685,6 +691,7 @@ export async function runTask({
       return { stopReason: done?.stopReason ?? null, text: turnText };
     } finally {
       interruptTurn = undefined;
+      sessionInfo.turn(sessionId, false);
       clearTimeout(timer);
       signal?.removeEventListener('abort', onAbort);
       writeProgress('\n');
@@ -737,6 +744,7 @@ export async function runTask({
     await recorder.flush().catch(() => {});
     await recorder.closeAll();
     await recorder.flush().catch(() => {});
+    await sessionInfo.flush();
     endChild(child);
     if (sessionId) fields.sessionKey = sessionKey(agentName, sessionId);
     if (wrapUp) fields.wrapUp = wrapUp;
@@ -794,6 +802,7 @@ export async function runTask({
       clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
       clientInfo: { name: 'codeflower-task', version: '1' }
     });
+    sessionInfo.reported(initialized?.agentInfo);
     const systemPrompt = Boolean(initialized?.agentCapabilities?.sessionCapabilities?.systemPrompt);
     const authKind = await agent.authKind?.();
     usage.guessAuth(authKind);
@@ -883,6 +892,7 @@ export async function runTask({
       const updated = await call('session/set_config_option', { sessionId, configId: option.id, value: choice.value });
       configOptions = updated?.configOptions ?? configOptions;
     }
+    sessionInfo.settings(sessionId, { configOptions, models: session.models });
     result.settings = currentSettings(
       configOptions,
       wanted.filter((want) => want.id).map((want) => want.id)
