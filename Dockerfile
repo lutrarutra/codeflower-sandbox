@@ -10,7 +10,7 @@ FROM node:22-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3
 ARG CLAUDE_AGENT_SDK_VERSION
 
 # Harness runtimes: DeepSeek Harness, the Claude Code and Codex ACP adapters,
-# and the codex CLI used for sign-in. Exact versions are pinned in package.json.
+# the codex CLI used for sign-in, and OpenCode. Exact versions are pinned in package.json.
 WORKDIR /opt/codeflower/runtime
 COPY package.json package-lock.json ./
 RUN locked=$(node -p 'require("./package-lock.json").packages["node_modules/@anthropic-ai/claude-agent-sdk"].version') \
@@ -18,8 +18,12 @@ RUN locked=$(node -p 'require("./package-lock.json").packages["node_modules/@ant
          echo "package-lock.json has @anthropic-ai/claude-agent-sdk $locked: set CLAUDE_AGENT_SDK_VERSION to it" >&2; exit 1; \
        fi
 # Not Claude Code: the empty folder is where the app binds the SDK.
+# OpenCode comes as one native binary per CPU (the x86_64 build without AVX2, as
+# cluster nodes vary); npm installs this machine's, linked as .bin/opencode.
 RUN npm ci --omit=dev --no-audit --no-fund \
     && cd node_modules \
+    && ln -s "../$(ls -d opencode-linux-*)/bin/opencode" .bin/opencode \
+    && .bin/opencode --version \
     && rm -rf @anthropic-ai/claude-agent-sdk @anthropic-ai/claude-agent-sdk-* \
     && mkdir @anthropic-ai/claude-agent-sdk
 
@@ -91,6 +95,8 @@ COPY entrypoint.sh /opt/codeflower/entrypoint.sh
 COPY bin /opt/codeflower/bin
 COPY templates /opt/codeflower/templates
 COPY skills /opt/codeflower/skills
+# Licenses of what the image includes without them (OpenCode's npm builds).
+COPY licenses /opt/codeflower/licenses
 # Reports dsh's token counts to the bridge (agents.js adds it with --patch).
 COPY dsh-plugins/usage /opt/codeflower/dsh-usage
 

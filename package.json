@@ -8,6 +8,10 @@
     "@agentclientprotocol/codex-acp": "2.3.0",
     "@openai/codex": "0.164.0"
   },
+  "optionalDependencies": {
+    "opencode-linux-arm64": "1.19.5",
+    "opencode-linux-x64-baseline": "1.19.5"
+  },
   "overrides": {
     "@modelcontextprotocol/client": "2.2.0",
     "fflate": "0.8.3"

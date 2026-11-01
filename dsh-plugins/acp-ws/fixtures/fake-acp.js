@@ -159,6 +159,7 @@ input.on('line', async (line) => {
           leakedAppToken: process.env.CODEFLOWER_TOKEN ?? null,
           credentialVariables: CREDENTIAL_VARIABLES.filter((name) => process.env[name] !== undefined),
           noBrowser: process.env.NO_BROWSER ?? null,
+          opencodeDatabase: process.env.OPENCODE_DB ?? null,
           argv: process.argv.slice(2),
           pid: process.pid
         }

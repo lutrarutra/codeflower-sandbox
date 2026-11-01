@@ -97,6 +97,8 @@ jobs:
             ! ls -d /opt/codeflower/runtime/node_modules/@anthropic-ai/claude-agent-sdk-* 2>/dev/null
             codex --version
             dsh --version
+            opencode --version
+            test -f /opt/codeflower/licenses/opencode.txt
             test -x /opt/codeflower/entrypoint.sh
             CODEFLOWER_AGENT=codex CODEFLOWER_MOUNTS="[]" codeflower-doctor --write-startup /tmp/environment.md
             CODEFLOWER_ENVIRONMENT_FILE=/tmp/environment.md codeflower-doctor
