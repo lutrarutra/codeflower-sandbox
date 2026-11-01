@@ -17,7 +17,7 @@
   &nbsp;·&nbsp;
   <a href="https://github.com/lutrarutra/codeflower-tunnel"><img src="https://raw.githubusercontent.com/lutrarutra/codeflower-tunnel/main/assets/icon.png" width="20" height="20" alt=""> tunnel</a>
   &nbsp;·&nbsp;
-  <a href="https://codeflower.dev">codeflower.dev</a>
+  <a href="https://docs.codeflower.app">docs.codeflower.app</a>
 </p>
 
 The container image a code flower worker runs: Claude Code, Codex, DeepSeek Harness and OpenCode, the tools
