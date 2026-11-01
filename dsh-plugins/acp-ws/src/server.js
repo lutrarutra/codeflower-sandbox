@@ -23,6 +23,7 @@ import {
   writeJsonAtomically
 } from './sessions.js';
 import { createDownloads } from './downloads.js';
+import { DID_NOT_START, addedMcpServers, describeLeftOut, failedMcpServers, mcpServersFor, withMcpServers } from './mcp.js';
 import { DEFAULT_UPLOAD_MAX_BYTES, createUploads } from './uploads.js';
 import { createUsage, dshTokens } from './usage.js';
 
@@ -150,6 +151,7 @@ export function agentEnvironment(environment, harnessEnvironment = {}) {
   delete result.CODEFLOWER_TASK_ATTEMPT_FILE;
   delete result.CODEFLOWER_TASK_INTERACTIVE;
   delete result.CODEFLOWER_INITIAL_PROMPT_FILE;
+  delete result.CODEFLOWER_MCP_SERVERS;
   for (const name of CREDENTIAL_VARIABLES) {
     delete result[name];
   }
@@ -402,6 +404,8 @@ export async function startBridge(options) {
     wrapUpQuitTemplate,
     describe = async () => ({}),
     ptyHelper,
+    // MCP servers from the app's config, given to every session (mcp.js).
+    mcpServers = [],
     environment: workerEnvironment = process.env,
     workspace = workerEnvironment.CODEFLOWER_WORKSPACE ?? process.cwd(),
     // `codeflower-show` reaches the bridge here; a local path, as sockets on
@@ -841,6 +845,8 @@ export async function startBridge(options) {
       forwarded: new Map(),
       // Each loaded session's modes and settings, for windows that reattach.
       sessions: new Map(),
+      // Per loaded session: the configured MCP servers that did not start in it.
+      mcpFailed: new Map(),
       // Per session: the prompts waiting for the running turn, and the window
       // that sent the latest one.
       prompts: new Map(),
@@ -982,7 +988,7 @@ export async function startBridge(options) {
           params: { key: sessionKey(agentName, sessionId), sessionId, prompt: params.prompt ?? [], ...meta }
         });
       }
-      writeToAgent(host, withSessionMeta({ jsonrpc: '2.0', id: request.bridgeId, method, params }), webSocket);
+      writeToAgent(host, withSessionMeta(withMcp(host, request, { jsonrpc: '2.0', id: request.bridgeId, method, params })), webSocket);
     };
     if (!prompt) return send();
     const queue = host.prompts.get(sessionId);
@@ -1183,6 +1189,7 @@ export async function startBridge(options) {
       return;
     }
     target.sessions.add(sessionId);
+    const leftOut = mcpLeftOut(host, sessionId);
     target.send({
       jsonrpc: '2.0',
       id,
@@ -1191,7 +1198,8 @@ export async function startBridge(options) {
         _meta: {
           ...(protocolObject(result._meta) ? result._meta : {}),
           'codeflower/transcriptEntries': recorder?.entryCount(sessionId) ?? 0,
-          'codeflower/busy': activity.busy(sessionId)
+          'codeflower/busy': activity.busy(sessionId),
+          ...(leftOut.length ? { 'codeflower/mcpLeftOut': leftOut } : {})
         }
       }
     });
@@ -1232,6 +1240,12 @@ export async function startBridge(options) {
       // can only run commands the agent itself announced.
       if (!message.error) host.authMethods = Array.isArray(result?.authMethods) ? result.authMethods : [];
       if (!message.error) sessionInfo.reported(result?.agentInfo);
+      if (!message.error && mcpServers.length) {
+        const chosen = mcpServersFor(mcpServers, result, { path: agentEnvironment(environment, agent.env).PATH, workspace });
+        host.mcpServers = chosen.servers;
+        host.mcpSkipped = chosen.skipped;
+        if (chosen.skipped.length) log(`MCP servers left out for ${agent.label ?? agentName}: ${describeLeftOut(chosen.skipped)}`);
+      }
       request.initialized(message.error ? undefined : result);
       if (message.error) host.initialized = undefined;
     }
@@ -1243,6 +1257,8 @@ export async function startBridge(options) {
       case 'session/new':
       case 'session/resume':
       case 'session/load':
+        if (request.mcpFailed?.length) host.mcpFailed.set(sessionId, request.mcpFailed);
+        else host.mcpFailed.delete(sessionId);
         rememberSession(host, sessionId, result);
         // The session's totals start from those its transcript recorded.
         void (recorder?.isOpen(sessionId) ?? Promise.resolve()).then(() =>
@@ -1280,6 +1296,7 @@ export async function startBridge(options) {
         return;
       }
       host.requests.delete(requestKey(message.id));
+      if (message.error && retryWithoutMcp(host, request, message.error)) return;
       const turn = request.method === 'session/prompt' ? endTurn(request, message) : undefined;
       recorder?.fromAgent(message, turn);
       // Attaches answer once the recorder caught up.
@@ -1411,6 +1428,34 @@ export async function startBridge(options) {
     }
     return { ...message, params: { ...message.params, _meta: merged } };
   };
+
+  // The configured MCP servers the agent takes, in every session it starts,
+  // next to the window's own; without those that already failed this request.
+  const mcpServersOf = (host, request) =>
+    (host.mcpServers ?? []).filter((server) => !request.mcpFailed?.includes(server.name));
+  const withMcp = (host, request, message) => {
+    if (!mcpServers.length || !SESSION_STARTS.includes(message.method) || !protocolObject(message.params)) return message;
+    return { ...message, params: withMcpServers(message.params, mcpServersOf(host, request)) };
+  };
+
+  // A session start that failed on a configured MCP server (dsh) is sent
+  // again without it, so one broken server does not stop every chat. The
+  // windows hear which servers the chat is without (mcpLeftOut).
+  const retryWithoutMcp = (host, request, error) => {
+    if (!SESSION_STARTS.includes(request.method) || !protocolObject(request.params)) return false;
+    const failed = failedMcpServers(error, addedMcpServers(request.params, mcpServersOf(host, request)));
+    if (!failed.length) return false;
+    request.mcpFailed = [...(request.mcpFailed ?? []), ...failed];
+    log(`MCP server${failed.length > 1 ? 's' : ''} ${failed.join(', ')} did not start in ${agent.label ?? agentName}; ${request.method} again without`);
+    sendRequest(host, request);
+    return true;
+  };
+
+  // The configured servers a session is without, and why.
+  const mcpLeftOut = (host, sessionId) => [
+    ...(host.mcpSkipped ?? []),
+    ...(host.mcpFailed.get(sessionId) ?? []).map((name) => ({ name, reason: DID_NOT_START }))
+  ];
 
   // ---- windows ----
 
@@ -1748,6 +1793,7 @@ export async function startBridge(options) {
             if (loaded !== undefined) {
               if (activity.busy(loaded)) throw new InvalidRequest('The chat is still working; stop it first');
               host.sessions.delete(loaded);
+              host.mcpFailed.delete(loaded);
               for (const target of clients) target.sessions.delete(loaded);
               usage.forget(loaded);
               await recorder?.close(loaded);

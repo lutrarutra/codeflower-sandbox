@@ -51,6 +51,11 @@ exceed what the job may use. The startup snapshot is also at
 `codeflower-env-export` records installed environments, and
 `codeflower-network` checks the isolated network's allowlist and hosts.
 
+MCP servers come only from the code flower config on the user's computer
+(`mcp_servers:` in `~/.codeflower/config.yaml`), and apply when the sandbox
+restarts. You cannot add one yourself. When the user wants to connect one, or
+its tools are missing, follow the codeflower-mcp skill.
+
 ## Installing software
 
 You manage the environment yourself: install what the analysis needs, without asking.

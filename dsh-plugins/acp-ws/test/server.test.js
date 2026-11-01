@@ -14,6 +14,7 @@ import { readActions } from '../src/actions.js';
 import { createAgents, loadRegistry } from '../src/agents.js';
 import { writeCommentsSlot } from '../src/files.js';
 import { agentEnvironment, clientLink, connectionUrl, pageLink, startBridge } from '../src/server.js';
+import { parseMcpServers } from '../src/mcp.js';
 import { listSessions, readTranscript, sessionKey } from '../src/sessions.js';
 
 const fakeAgent = fileURLToPath(new URL('../fixtures/fake-acp.js', import.meta.url));
@@ -269,6 +270,98 @@ test('runs an agent added as a folder with only its descriptor', async (t) => {
   assert.equal(update.params.update.content.text, `reply to hello pi in ${sessionId}`);
   assert.equal((await answer).result.stopReason, 'end_turn');
   await closeSocket(socket);
+});
+
+test("gives every session the config's MCP servers the agent supports, next to the window's", async (t) => {
+  const logs = [];
+  const { bridge } = await startTestBridge(t, {
+    agentName: 'codex',
+    log: (message) => logs.push(message),
+    mcpServers: parseMcpServers(
+      JSON.stringify([
+        { name: 'node', command: 'node', args: ['server.js'] },
+        { type: 'http', name: 'docs', url: 'https://mcp.example.org/mcp', headers: [{ name: 'Authorization', value: 'Bearer x' }] },
+        { type: 'sse', name: 'events', url: 'https://mcp.example.org/sse' }
+      ])
+    )
+  });
+  const socket = await openSocket(bridge.address);
+  await initialize(socket);
+  assert.ok(logs.includes('MCP servers left out for Codex: events (the agent does not support sse servers)'));
+  const own = { name: 'mine', command: '/bin/true', args: [], env: [] };
+  const session = (await call(socket, 'session/new', { cwd: '/workspace', mcpServers: [own] })).result;
+  assert.deepEqual(
+    session.mcpServers.map((server) => server.name),
+    ['mine', 'node', 'docs']
+  );
+  // dsh takes only absolute commands.
+  assert.match(session.mcpServers[1].command, /^\/.*\/node$/);
+  assert.deepEqual(session.mcpServers[2].headers, [{ name: 'Authorization', value: 'Bearer x' }]);
+  await closeSocket(socket);
+});
+
+test('starts a chat without a configured MCP server that fails it, and tells every window', async (t) => {
+  const logs = [];
+  const { bridge } = await startTestBridge(t, {
+    agentName: 'dsh',
+    log: (message) => logs.push(message),
+    mcpServers: parseMcpServers(
+      JSON.stringify([
+        { name: 'broken', command: '/opt/failing-mcp' },
+        { type: 'http', name: 'docs', url: 'https://mcp.example.org/mcp' },
+        { type: 'sse', name: 'events', url: 'https://mcp.example.org/sse' }
+      ])
+    )
+  });
+  const socket = await openSocket(bridge.address);
+  await initialize(socket);
+  const leftOut = [
+    { name: 'events', reason: 'the agent does not support sse servers' },
+    { name: 'broken', reason: 'it did not start' }
+  ];
+  const session = (await call(socket, 'session/new', { cwd: '/workspace', mcpServers: [] })).result;
+  assert.deepEqual(
+    session.mcpServers.map((server) => server.name),
+    ['docs']
+  );
+  assert.deepEqual(session._meta['codeflower/mcpLeftOut'], leftOut);
+  assert.ok(logs.some((line) => /^MCP server broken did not start in .*; session\/new again without$/.test(line)));
+
+  // Another window opening the chat hears it too.
+  const other = await openSocket(bridge.address);
+  await initialize(other);
+  const resumed = (await call(other, 'session/resume', { sessionId: session.sessionId, cwd: '/workspace', mcpServers: [] })).result;
+  assert.deepEqual(resumed._meta['codeflower/mcpLeftOut'], leftOut);
+
+  // A window's own failing server is its own error.
+  const refused = await call(socket, 'session/new', {
+    cwd: '/workspace',
+    mcpServers: [{ name: 'mine', command: '/opt/failing-mcp', args: [], env: [] }]
+  });
+  assert.match(refused.error.data.details, /^mcp-client\(mine\)/);
+  await closeSocket(other);
+  await closeSocket(socket);
+});
+
+test('runs OpenCode with its database in its home until it is signed in', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'codeflower-opencode-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const agents = createAgents({
+    nodePath: process.execPath,
+    launch: { opencode: fakeAgent },
+    environment: { OPENCODE_CONFIG_DIR: home },
+    agents: (await loadRegistry()).filter(({ descriptor }) => descriptor.id === 'opencode')
+  });
+  const { bridge } = await startTestBridge(t, { agentName: 'opencode', agent: agents.opencode });
+  const socket = await openSocket(bridge.address);
+  t.after(() => closeSocket(socket));
+  const initialized = await initialize(socket);
+  assert.deepEqual(initialized.argv, ['acp']);
+  assert.equal(initialized.opencodeDatabase, join(home, 'opencode.db'));
+  assert.deepEqual(initialized.credentialVariables, []);
+  const status = (await call(socket, '_codeflower/status')).result;
+  assert.deepEqual(status.agentInfo, { id: 'opencode', name: 'OpenCode', color: 'violet' });
+  assert.equal(status.signedIn, false);
 });
 
 test('describes every built-in agent completely', async () => {

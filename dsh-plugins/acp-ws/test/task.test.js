@@ -193,6 +193,23 @@ test('attached task progress includes dsh token reports from its usage pipe', as
   assert.equal(result.usage.totals.tokens.totalTokens, 19);
 });
 
+test("a task's session gets the config's MCP servers the agent supports and that start", async (t) => {
+  const logged = [];
+  const { root, result } = await run(t, { task: 'task: cluster' }, {}, {
+    mcpServers: [
+      { name: 'broken', command: '/opt/failing-mcp', args: [], env: [] },
+      { name: 'node', command: 'node', args: [], env: [] },
+      { type: 'sse', name: 'events', url: 'https://mcp.example.org/sse', headers: [] }
+    ],
+    log: (message) => logged.push(message)
+  });
+  assert.equal(result.status, 'completed');
+  assert.match(agentText(await transcript(root, result.sessionKey)), /, mcp \/\S*\/node\)/);
+  assert.ok(logged.includes('MCP servers left out for Fake: events (the agent does not support sse servers)'));
+  // A server that fails the session start is left out, and the task goes on.
+  assert.ok(logged.includes('MCP server broken did not start in Fake; the task goes on without'));
+});
+
 test('an agent without a system prompt gets the instructions in its first prompt', async (t) => {
   const { root, result } = await run(t, { task: 'task: cluster', report: false }, { goal: undefined, args: ['--no-system-prompt'] });
   assert.equal(result.status, 'completed');

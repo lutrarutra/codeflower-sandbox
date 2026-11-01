@@ -4,6 +4,7 @@ import { dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { terminalAuthCommand } from './agents.js';
 import { readCodexLimits } from './codex-limits.js';
+import { describeLeftOut, failedMcpServers, mcpServersFor } from './mcp.js';
 import { agentEnvironment, createRecorder, endChild } from './server.js';
 import { createSessionInfo } from './session-info.js';
 import { createSessionStore, readJson, sessionKey, writeJsonAtomically } from './sessions.js';
@@ -402,6 +403,8 @@ export async function runTask({
   input = process.stdin,
   interactive = false,
   ptyHelper,
+  // MCP servers from the app's config (mcp.js).
+  mcpServers = [],
   log = (message) => process.stderr.write(`${message}\n`)
 }) {
   const { task, attempt, sessionFile, session: saved, previous, resultFile } = await readAttempt(attemptFile);
@@ -595,7 +598,9 @@ export async function runTask({
       const pending = calls.get(message.id);
       if (!pending) return;
       calls.delete(message.id);
-      if (message.error) pending.reject(Object.assign(new Error(message.error.message ?? 'ACP error'), { code: message.error.code }));
+      if (message.error) {
+        pending.reject(Object.assign(new Error(message.error.message ?? 'ACP error'), { code: message.error.code, data: message.error.data }));
+      }
       else pending.resolve(message.result);
       return;
     }
@@ -804,6 +809,23 @@ export async function runTask({
     });
     sessionInfo.reported(initialized?.agentInfo);
     const systemPrompt = Boolean(initialized?.agentCapabilities?.sessionCapabilities?.systemPrompt);
+    const mcp = mcpServersFor(mcpServers, initialized, { path: agentEnvironment(environment, agent.env).PATH, workspace });
+    if (mcp.skipped.length) log(`MCP servers left out for ${agent.label}: ${describeLeftOut(mcp.skipped)}`);
+    // A session start that fails on an MCP server (dsh) is tried again without
+    // it, as the bridge does for chats.
+    const startSession = async (method, params) => {
+      for (;;) {
+        try {
+          return await call(method, { ...params, mcpServers: mcp.servers });
+        } catch (error) {
+          const failed = failedMcpServers(error, mcp.servers);
+          if (!failed.length) throw error;
+          mcp.servers = mcp.servers.filter((server) => !failed.includes(server.name));
+          log(`MCP server${failed.length > 1 ? 's' : ''} ${failed.join(', ')} did not start in ${agent.label}; the task goes on without`);
+          writeProgress(`  (MCP server ${failed.join(', ')} did not start; going on without it)\n`);
+        }
+      }
+    };
     const authKind = await agent.authKind?.();
     usage.guessAuth(authKind);
 
@@ -824,16 +846,15 @@ export async function runTask({
       const params = {
         sessionId,
         cwd: saved.cwd ?? workspace,
-        mcpServers: [],
         ...(agent.sessionMeta ? { _meta: agent.sessionMeta } : {})
       };
       replaying = true;
       try {
         try {
-          session = await call('session/resume', params);
+          session = await startSession('session/resume', params);
         } catch (error) {
           if (error.code !== METHOD_NOT_FOUND) throw error;
-          session = await call('session/load', params);
+          session = await startSession('session/load', params);
         }
       } catch (error) {
         return await settle({ status: 'failed', message: `${agent.label} could not continue the task's session: ${error.message}` });
@@ -842,9 +863,8 @@ export async function runTask({
       }
       session ??= {};
     } else {
-      session = await call('session/new', {
+      session = await startSession('session/new', {
         cwd: workspace,
-        mcpServers: [],
         ...(agent.sessionMeta ? { _meta: agent.sessionMeta } : {}),
         ...(systemPrompt ? { systemPrompt: { mode: 'append', content: [{ type: 'text', text: instructions }] } } : {})
       });

@@ -111,6 +111,23 @@ input.on('line', async (line) => {
     resolve(message.result);
     return;
   }
+  // The MCP servers a session was started with, for tests; none adds nothing.
+  const mcpEcho = (message) => (message.params?.mcpServers?.length ? { mcpServers: message.params.mcpServers } : {});
+  // Like dsh, which fails a session start on an MCP server that does not
+  // start: here one whose command or URL contains failing-mcp.
+  const failingMcp = (message.params?.mcpServers ?? []).find((server) => `${server.command ?? server.url}`.includes('failing-mcp'));
+  if (failingMcp && ['session/new', 'session/resume', 'session/load'].includes(message.method)) {
+    send({
+      jsonrpc: '2.0',
+      id: message.id,
+      error: {
+        code: -32603,
+        message: 'Internal error',
+        data: { details: `mcp-client(${failingMcp.name}): initial connection or tool synchronization failed` }
+      }
+    });
+    return;
+  }
   switch (message.method) {
     case 'initialize': {
       const capabilities = message.params?.clientCapabilities ?? {};
@@ -132,9 +149,13 @@ input.on('line', async (line) => {
         result: {
           protocolVersion: 1,
           authMethods,
-          agentCapabilities: process.argv.includes('--no-system-prompt')
-            ? {}
-            : { sessionCapabilities: { systemPrompt: { mode: { append: {} } } } },
+          agentCapabilities: {
+            // Like Codex and dsh: stdio and http MCP servers, no sse.
+            mcpCapabilities: { http: true },
+            ...(process.argv.includes('--no-system-prompt')
+              ? {}
+              : { sessionCapabilities: { systemPrompt: { mode: { append: {} } } } })
+          },
           leakedAppToken: process.env.CODEFLOWER_TOKEN ?? null,
           credentialVariables: CREDENTIAL_VARIABLES.filter((name) => process.env[name] !== undefined),
           noBrowser: process.env.NO_BROWSER ?? null,
@@ -164,9 +185,12 @@ input.on('line', async (line) => {
       break;
     case 'session/new': {
       const sessionId = `session-${nextSession++}`;
-      tasks.set(sessionId, { systemPrompt: message.params?.systemPrompt?.content?.[0]?.text ?? null });
+      tasks.set(sessionId, {
+        systemPrompt: message.params?.systemPrompt?.content?.[0]?.text ?? null,
+        mcp: (message.params?.mcpServers ?? []).map((server) => server.command ?? server.url)
+      });
       sessionMeta.set(sessionId, message.params?._meta ?? null);
-      send({ jsonrpc: '2.0', id: message.id, result: { sessionId, configOptions: configOptions(sessionId) } });
+      send({ jsonrpc: '2.0', id: message.id, result: { sessionId, configOptions: configOptions(sessionId), ...mcpEcho(message) } });
       break;
     }
     case 'session/set_config_option': {
@@ -324,7 +348,8 @@ input.on('line', async (line) => {
           sessionId,
           message.id,
           `worked (${permission.outcome.optionId}, question ${question.action}, ` +
-            `system prompt ${state.systemPrompt ? 'given' : 'missing'}, turn ${state.turns})`
+            `system prompt ${state.systemPrompt ? 'given' : 'missing'}, turn ${state.turns}` +
+            `${state.mcp?.length ? `, mcp ${state.mcp.join(' ')}` : ''})`
         );
         break;
       }
@@ -444,7 +469,7 @@ input.on('line', async (line) => {
       costs.delete(message.params?.sessionId);
       sessionMeta.set(message.params?.sessionId, message.params?._meta ?? null);
       if (!tasks.has(message.params?.sessionId)) tasks.set(message.params?.sessionId, { systemPrompt: null });
-      send({ jsonrpc: '2.0', id: message.id, result: {} });
+      send({ jsonrpc: '2.0', id: message.id, result: mcpEcho(message) });
       break;
     case 'session/load': {
       // Like agents without session/resume: the history comes back first.
@@ -455,7 +480,7 @@ input.on('line', async (line) => {
         method: 'session/update',
         params: { sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'replayed history' } } }
       });
-      send({ jsonrpc: '2.0', id: message.id, result: {} });
+      send({ jsonrpc: '2.0', id: message.id, result: mcpEcho(message) });
       break;
     }
     default:

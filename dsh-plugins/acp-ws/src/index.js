@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { AGENT_NAMES, createAgents, PROVIDED_KEY_VARIABLE } from './agents.js';
 import { readActions } from './actions.js';
+import { MCP_SERVERS_VARIABLE, parseMcpServers } from './mcp.js';
 import { startEgressForwarder } from './egress.js';
 import { PAGE_DIRECTORY } from './page.js';
 import { clientLink, connectionUrl, pageLink, startBridge } from './server.js';
@@ -39,6 +40,17 @@ if (providedKey) {
     throw new Error(`Could not store the API key from the app's config: ${error.message}`);
   }
 }
+
+// MCP servers from the app's config. Their env and headers may hold secrets,
+// so the variable leaves the environment too; the bridge gives them to the
+// agent in each session.
+let mcpServers;
+try {
+  mcpServers = parseMcpServers(process.env[MCP_SERVERS_VARIABLE]);
+} catch (error) {
+  throw new Error(`Could not read the MCP servers from the app's config: ${error.message}`);
+}
+delete process.env[MCP_SERVERS_VARIABLE];
 
 // What the extension shows about this worker.
 // The folders the app mounted, e.g. /data/input/study42, with their host paths.
@@ -113,6 +125,7 @@ if (process.env.CODEFLOWER_TASK_ATTEMPT_FILE) {
     },
     interactive: process.env.CODEFLOWER_TASK_INTERACTIVE === '1',
     ptyHelper: ['/opt/conda/bin/python3', '/opt/codeflower/bin/codeflower-pty'],
+    mcpServers,
     input: process.stdin,
     authOut: process.stderr
   });
@@ -140,6 +153,7 @@ const bridge = await startBridge({
   agentName,
   agent: agents[agentName],
   initialPrompt,
+  mcpServers,
   // The batch job's end, from the app (Slurm, PBS, HTCondor or --time-limit).
   allocationEnd: Date.parse(process.env.CODEFLOWER_ALLOCATION_END ?? '') || undefined,
   actions: await readActions(`${TEMPLATES}/actions`),

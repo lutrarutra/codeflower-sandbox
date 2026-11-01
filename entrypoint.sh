@@ -106,6 +106,7 @@ if [ "${CODEFLOWER_NETWORK:-}" = isolated ]; then
   link_skill /opt/codeflower/skills/codeflower-network
 fi
 link_skill /opt/codeflower/skills/codeflower-sketch
+link_skill /opt/codeflower/skills/codeflower-mcp
 if [ -f "$storyteller/skill/SKILL.md" ]; then
   link_skill "$storyteller/skill" storyteller
 fi
