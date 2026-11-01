@@ -48,7 +48,7 @@ jobs:
           previous=$(git describe --tags --abbrev=0 --match 'v*.*.*' "$GITHUB_SHA^" 2>/dev/null || true)
           echo "previous=${previous#v}" >> "$GITHUB_OUTPUT"
           if [ "$FORCE" = true ] || [ -z "$previous" ] ||
-            ! git diff --quiet "$previous" "$GITHUB_SHA" -- Dockerfile entrypoint.sh bin templates dsh-plugins package.json package-lock.json; then
+            ! git diff --quiet "$previous" "$GITHUB_SHA" -- Dockerfile entrypoint.sh bin templates skills licenses dsh-plugins package.json package-lock.json; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"

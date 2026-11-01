@@ -9,6 +9,8 @@ on:
       - bin/**
       - test/**
       - templates/**
+      - skills/**
+      - licenses/**
       - dsh-plugins/**
       - package.json
       - package-lock.json
