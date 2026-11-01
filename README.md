@@ -45,7 +45,8 @@ Releases are published for linux/amd64 and linux/arm64, tagged `X.Y.Z`, `X.Y`, `
 - `Dockerfile`, `entrypoint.sh`: the image and its start script, which prepares the project's
   environment and starts the bridge
 - `package.json`: the agent runtimes, pinned exactly
-- `licenses/`: the licenses of what the image includes without them (OpenCode's binaries)
+- `licenses/`: the licenses of what the image includes without them (OpenCode's binaries, the
+  Single-cell best practices book in `skills/`)
 - `bin/`: commands for the agent: `codeflower-show`, `codeflower-pty`, `codeflower-env-export`,
   `codeflower-network`, `codeflower-doctor` (the worker's resources and, when isolated, its
   allowlist) and `codeflower-inventory` (describes the mounted data: formats, shapes, columns)
