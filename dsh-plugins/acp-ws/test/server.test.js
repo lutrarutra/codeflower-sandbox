@@ -15,6 +15,7 @@ import { createAgents, loadRegistry } from '../src/agents.js';
 import { writeCommentsSlot } from '../src/files.js';
 import { agentEnvironment, clientLink, connectionUrl, pageLink, startBridge } from '../src/server.js';
 import { parseMcpServers } from '../src/mcp.js';
+import { createPlugins } from '../src/plugins.js';
 import { listSessions, readTranscript, sessionKey } from '../src/sessions.js';
 
 const fakeAgent = fileURLToPath(new URL('../fixtures/fake-acp.js', import.meta.url));
@@ -695,6 +696,61 @@ test('starts a run\'s prompt once dsh has restarted with its keys', async (t) =>
   const [session] = await listSessions(sessionsDirectory);
   await waitFor(async () => (await readTranscript(sessionsDirectory, session.key)).some((entry) => entry.kind === 'turn_end'));
   assert.equal((await readTranscript(sessionsDirectory, session.key))[0].prompt[0].text, 'Analyse the input');
+});
+
+test("manages the agent's plugins and starts the agent with them", async (t) => {
+  const pluginsDirectory = await mkdtemp(join(tmpdir(), 'codeflower-plugins-'));
+  t.after(() => rm(pluginsDirectory, { recursive: true, force: true }));
+  const calls = [];
+  const plugins = createPlugins({
+    agentName: 'claude',
+    hooks: {
+      async fetch(entries) {
+        calls.push('fetch');
+        return entries.map((entry) => ({ id: entry.id, version: '2.0.0' }));
+      },
+      async activate(entries) {
+        calls.push(`activate ${entries.length}`);
+        return { env: { CLAUDE_CODE_PLUGIN_SEED_DIR: entries.length ? '/seed' : '/empty' } };
+      }
+    },
+    descriptor: { kinds: ['github'] },
+    directory: pluginsDirectory,
+    canFetch: true
+  });
+  const { bridge } = await startTestBridge(t, { plugins });
+  const socket = await openSocket(bridge.address);
+  assert.equal((await initialize(socket)).pluginSeed, '/empty');
+  assert.deepEqual((await call(socket, '_codeflower/status')).result.capabilities, { plugins: true });
+
+  assert.match((await call(socket, '_codeflower/plugins/add', { source: 'npm:x@1' })).error.message, /github:, not npm:/);
+  const added = (await call(socket, '_codeflower/plugins/add', { source: 'github:org/mine' })).result;
+  assert.deepEqual(added, { id: 'claude:github:org/mine', pendingFetch: false });
+  await receive(socket, (message) => message.method === '_codeflower/plugins/changed');
+  await waitFor(async () => (await call(socket, '_codeflower/plugins/list')).result.entries[0].state === 'fetched');
+  const listed = (await call(socket, '_codeflower/plugins/list')).result;
+  assert.equal(listed.restartPending, true);
+  assert.equal(listed.entries[0].version, '2.0.0');
+
+  // Applied with the restart the windows already offer.
+  const ended = once(socket, 'close');
+  await call(socket, '_codeflower/agent/restart');
+  await ended;
+  const again = await openSocket(bridge.address);
+  t.after(() => closeSocket(again));
+  assert.equal((await initialize(again)).pluginSeed, '/seed');
+  assert.equal((await call(again, '_codeflower/plugins/list')).result.restartPending, false);
+  assert.deepEqual(calls, ['activate 0', 'fetch', 'activate 1']);
+});
+
+test('an agent without plugins says so and refuses the plugin methods', async (t) => {
+  const { bridge } = await startTestBridge(t);
+  const socket = await openSocket(bridge.address);
+  t.after(() => closeSocket(socket));
+  await initialize(socket);
+  assert.deepEqual((await call(socket, '_codeflower/status')).result.capabilities, { plugins: false });
+  assert.deepEqual((await call(socket, '_codeflower/plugins/list')).result, { available: false });
+  assert.match((await call(socket, '_codeflower/plugins/add', { source: 'github:a/b' })).error.message, /no plugins/);
 });
 
 test('shows the files the agent asks for and lets the client read them', async (t) => {

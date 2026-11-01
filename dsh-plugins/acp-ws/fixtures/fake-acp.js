@@ -160,6 +160,7 @@ input.on('line', async (line) => {
           credentialVariables: CREDENTIAL_VARIABLES.filter((name) => process.env[name] !== undefined),
           noBrowser: process.env.NO_BROWSER ?? null,
           opencodeDatabase: process.env.OPENCODE_DB ?? null,
+          pluginSeed: process.env.CLAUDE_CODE_PLUGIN_SEED_DIR ?? null,
           argv: process.argv.slice(2),
           pid: process.pid
         }

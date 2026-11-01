@@ -152,6 +152,8 @@ export function agentEnvironment(environment, harnessEnvironment = {}) {
   delete result.CODEFLOWER_TASK_INTERACTIVE;
   delete result.CODEFLOWER_INITIAL_PROMPT_FILE;
   delete result.CODEFLOWER_MCP_SERVERS;
+  delete result.CODEFLOWER_PLUGINS;
+  delete result.CODEFLOWER_PLUGINS_FETCH;
   for (const name of CREDENTIAL_VARIABLES) {
     delete result[name];
   }
@@ -406,6 +408,8 @@ export async function startBridge(options) {
     ptyHelper,
     // MCP servers from the app's config, given to every session (mcp.js).
     mcpServers = [],
+    // The agent's own plugins (plugins.js), turned on before every agent start.
+    plugins,
     environment: workerEnvironment = process.env,
     workspace = workerEnvironment.CODEFLOWER_WORKSPACE ?? process.cwd(),
     // `codeflower-show` reaches the bridge here; a local path, as sockets on
@@ -474,6 +478,10 @@ export async function startBridge(options) {
   const broadcast = (message) => {
     for (const target of clients) target.send(message);
   };
+  // The windows list the plugins again (_codeflower/plugins/list).
+  const stopPluginNotices = plugins?.onChange?.(() =>
+    broadcast({ jsonrpc: '2.0', method: '_codeflower/plugins/changed', params: {} })
+  );
   // To the windows that opened the chat.
   const toSession = (sessionId, message, except) => {
     for (const target of clients) {
@@ -824,8 +832,13 @@ export async function startBridge(options) {
     const command = await agent.command();
     // dsh's usage plugin reports token counts on a pipe of their own.
     const usageFd = agent.usageFd;
+    const pluginEnvironment = (await plugins?.activate()) ?? {};
     const child = spawn(command[0], command.slice(1), {
-      env: agentEnvironment(environment, { ...agent.env, ...(usageFd ? { CODEFLOWER_USAGE_FD: String(usageFd) } : {}) }),
+      env: agentEnvironment(environment, {
+        ...agent.env,
+        ...pluginEnvironment,
+        ...(usageFd ? { CODEFLOWER_USAGE_FD: String(usageFd) } : {})
+      }),
       stdio: usageFd ? ['pipe', 'pipe', 'inherit', ...Array(usageFd - 3).fill('ignore'), 'pipe'] : ['pipe', 'pipe', 'inherit']
     });
     const started = {
@@ -1739,6 +1752,10 @@ export async function startBridge(options) {
         if (!sessionsDirectory) throw new InvalidRequest('This worker does not record sessions');
         return sessionsDirectory;
       };
+      const requirePlugins = () => {
+        if (!plugins?.available) throw new InvalidRequest(`${agent.label ?? agentName} has no plugins in code flower`);
+        return plugins;
+      };
       const requireOwnSession = () => {
         if (!sessionKeyAllowed(params.key)) throw new InvalidRequest('Invalid session key');
         return params.key;
@@ -1755,6 +1772,7 @@ export async function startBridge(options) {
               ...(agent.presentation ? { agentInfo: agent.presentation } : {}),
               signedIn: agent.signedIn ? await agent.signedIn() : true,
               credentials: agent.setCredentials ? 'keys' : 'agent',
+              capabilities: { plugins: Boolean(plugins?.available) },
               ...(slurmJobId ? { slurmJobId } : {})
             });
             break;
@@ -1877,6 +1895,35 @@ export async function startBridge(options) {
             // The agent reads its keys at start: restart it to apply them.
             respond({ restartRequired: true });
             break;
+          case '_codeflower/plugins/list':
+            respond(plugins ? await plugins.list() : { available: false });
+            break;
+          case '_codeflower/plugins/catalog':
+            respond(await requirePlugins().catalog(params.catalog));
+            break;
+          case '_codeflower/plugins/add':
+            respond(await requirePlugins().add(params.source));
+            break;
+          case '_codeflower/plugins/remove':
+            respond(await requirePlugins().remove(params.id));
+            break;
+          case '_codeflower/plugins/setEnabled':
+            respond(await requirePlugins().setEnabled(params.id, params.enabled));
+            break;
+          case '_codeflower/plugins/catalogs/add':
+            respond(await requirePlugins().addCatalog(params.source));
+            break;
+          case '_codeflower/plugins/catalogs/remove':
+            respond(await requirePlugins().removeCatalog(params.source));
+            break;
+          case '_codeflower/plugins/fetch': {
+            const manager = requirePlugins();
+            // Without the network the app's fetch run does it (codeflower plugins fetch).
+            if (!manager.canFetch) throw new InvalidRequest('This sandbox has no network to fetch plugins', { pendingFetch: true });
+            respond({ started: true });
+            void manager.fetch().catch((error) => log(`Could not fetch plugins: ${error.message}`));
+            break;
+          }
           case '_codeflower/agent/restart': {
             // Ends the agent; the window's next connection starts a fresh one.
             const host = agentHost;
@@ -2041,6 +2088,7 @@ export async function startBridge(options) {
       if (closing) return;
       closing = true;
       clearInterval(pings);
+      stopPluginNotices?.();
       clearTimeout(wrapUpTimer);
       clearTimeout(usageTimer);
       clearTimeout(limitsTimer);

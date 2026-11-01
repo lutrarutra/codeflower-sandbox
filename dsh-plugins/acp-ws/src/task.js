@@ -405,6 +405,8 @@ export async function runTask({
   ptyHelper,
   // MCP servers from the app's config (mcp.js).
   mcpServers = [],
+  // The agent's own plugins (plugins.js).
+  plugins,
   log = (message) => process.stderr.write(`${message}\n`)
 }) {
   const { task, attempt, sessionFile, session: saved, previous, resultFile } = await readAttempt(attemptFile);
@@ -503,9 +505,11 @@ export async function runTask({
   const sessionInfo = createSessionInfo({ directory: environment.CODEFLOWER_SESSION_INFO_DIR, agent: agent.label, log });
   const command = await agent.command();
   const usageFd = agent.usageFd;
+  const pluginEnvironment = (await plugins?.activate()) ?? {};
   const child = spawn(command[0], command.slice(1), {
     env: agentEnvironment(environment, {
       ...agent.env,
+      ...pluginEnvironment,
       ...(usageFd ? { CODEFLOWER_USAGE_FD: String(usageFd) } : {})
     }),
     cwd: workspace,

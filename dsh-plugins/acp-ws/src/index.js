@@ -1,13 +1,16 @@
 import { readFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import { AGENT_NAMES, createAgents, PROVIDED_KEY_VARIABLE } from './agents.js';
 import { readActions } from './actions.js';
 import { MCP_SERVERS_VARIABLE, parseMcpServers } from './mcp.js';
+import { PLUGINS_FETCH_VARIABLE, PLUGINS_VARIABLE, createPlugins, parsePlugins, runFetch } from './plugins.js';
 import { startEgressForwarder } from './egress.js';
 import { PAGE_DIRECTORY } from './page.js';
 import { clientLink, connectionUrl, pageLink, startBridge } from './server.js';
 import { EXIT_CODES, runTask } from './task.js';
 
 const RUNTIME_MODULES = '/opt/codeflower/runtime/node_modules';
+const STATE = '/codeflower-state';
 const TEMPLATES = '/opt/codeflower/templates';
 const INITIAL_PROMPT_FILE = process.env.CODEFLOWER_INITIAL_PROMPT_FILE;
 // `--server`: the worker also serves the chat page on its port.
@@ -52,9 +55,33 @@ try {
 }
 delete process.env[MCP_SERVERS_VARIABLE];
 
+// The agents' own plugins from the app's config, and whether this is the app's
+// fetch run, which fetches them and exits.
+let configuredPlugins;
+try {
+  configuredPlugins = parsePlugins(process.env[PLUGINS_VARIABLE]);
+} catch (error) {
+  throw new Error(`Could not read the plugins from the app's config: ${error.message}`);
+}
+delete process.env[PLUGINS_VARIABLE];
+const FETCH_PLUGINS = process.env[PLUGINS_FETCH_VARIABLE] === '1';
+delete process.env[PLUGINS_FETCH_VARIABLE];
+
 // An agent installed outside the image (Claude Code) says when it is missing.
 const missing = await agents[agentName].missing?.();
 if (missing) throw new Error(missing);
+
+// The project's plugins/. An isolated sandbox reaches only the providers, so
+// its plugins are fetched by the app's fetch run.
+const plugins = createPlugins({
+  agentName,
+  hooks: agents[agentName].plugins,
+  descriptor: agents[agentName].pluginsDescriptor,
+  directory: join(process.env.CODEFLOWER_SESSIONS_DIR ? dirname(process.env.CODEFLOWER_SESSIONS_DIR) : STATE, 'plugins'),
+  configured: configuredPlugins[agentName] ?? [],
+  canFetch: FETCH_PLUGINS || !process.env.CODEFLOWER_EGRESS_SOCKET,
+  log: (message) => process.stderr.write(`${message}\n`)
+});
 
 // What the extension shows about this worker.
 // The folders the app mounted, e.g. /data/input/study42, with their host paths.
@@ -81,6 +108,13 @@ const egress = process.env.CODEFLOWER_EGRESS_SOCKET
       process.stderr.write(`The sandbox has no network: ${error.message}\n`);
     })
   : undefined;
+
+// `codeflower plugins fetch` and before a start: the app's fetch run.
+if (FETCH_PLUGINS) {
+  const errors = await runFetch(plugins);
+  egress?.close();
+  process.exit(errors ? 1 : 0);
+}
 
 // `codeflower task`: the agent works on its task by itself, without VS Code.
 if (process.env.CODEFLOWER_TASK_ATTEMPT_FILE) {
@@ -130,6 +164,7 @@ if (process.env.CODEFLOWER_TASK_ATTEMPT_FILE) {
     interactive: process.env.CODEFLOWER_TASK_INTERACTIVE === '1',
     ptyHelper: ['/opt/conda/bin/python3', '/opt/codeflower/bin/codeflower-pty'],
     mcpServers,
+    plugins,
     input: process.stdin,
     authOut: process.stderr
   });
@@ -158,6 +193,7 @@ const bridge = await startBridge({
   agent: agents[agentName],
   initialPrompt,
   mcpServers,
+  plugins,
   // The batch job's end, from the app (Slurm, PBS, HTCondor or --time-limit).
   allocationEnd: Date.parse(process.env.CODEFLOWER_ALLOCATION_END ?? '') || undefined,
   actions: await readActions(`${TEMPLATES}/actions`),

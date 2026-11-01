@@ -3,7 +3,7 @@
 // start it, its home in the project, its credential variables and provider
 // hosts, files to write once), and an optional `index.js` adds what only code
 // can say (whether the project holds a login, where a configured key goes, a
-// launch command with arguments). An agent that needs nothing but ACP needs no
+// launch command with arguments, its plugins adapter). An agent that needs nothing but ACP needs no
 // index.js. Adding an agent is adding a folder, its package to the image's
 // package.json, and the descriptor to the app (`make agents` there).
 import { readdirSync, readFileSync, existsSync } from 'node:fs';
@@ -85,6 +85,8 @@ export function createAgents({ nodePath, modules, launch = {}, environment = pro
         env: descriptor.env ?? {},
         goal: descriptor.goal,
         costEstimate: descriptor.costEstimate === true,
+        // Which plugin sources and catalogs it takes; its hook's `plugins` fetches them (plugins.js).
+        pluginsDescriptor: descriptor.plugins,
         ...hooks?.({ descriptor, home, launch: script, nodePath, modules, environment })
       };
       return [descriptor.id, agent];

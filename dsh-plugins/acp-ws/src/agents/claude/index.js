@@ -1,11 +1,12 @@
 // Claude Code through its ACP adapter.
 import { join } from 'node:path';
 import { exists, InvalidRequest, readJson, readText, writePrivate } from '../support.js';
+import { claudePlugins } from './plugins.js';
 
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 const USAGE_TIMEOUT_MS = 15_000;
 
-export default function claude({ descriptor, home, modules }) {
+export default function claude({ descriptor, home, modules, environment }) {
   return {
     // Claude Code is not in the image, whose license does not allow passing it
     // on: the app downloads it and binds the SDK into `modules` and the CLI at
@@ -63,6 +64,8 @@ export default function claude({ descriptor, home, modules }) {
     },
     // Asks for the rate limit events, which the adapter otherwise passes on
     // only once a turn's first answer has started.
-    sessionMeta: { claudeCode: { emitRawSDKMessages: [{ type: 'rate_limit_event' }] } }
+    sessionMeta: { claudeCode: { emitRawSDKMessages: [{ type: 'rate_limit_event' }] } },
+    // Plugins from Claude Code's marketplaces, fetched into a seed (plugins.js).
+    plugins: claudePlugins({ descriptor, home, environment })
   };
 }
