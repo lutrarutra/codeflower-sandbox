@@ -3,6 +3,7 @@ import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { request as httpRequest } from 'node:http';
+import { request as httpsRequest } from 'node:https';
 import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -13,7 +14,7 @@ import { createActivity } from '../src/activity.js';
 import { readActions } from '../src/actions.js';
 import { createAgents, loadRegistry } from '../src/agents.js';
 import { writeCommentsSlot } from '../src/files.js';
-import { agentEnvironment, clientLink, connectionUrl, pageLink, startBridge } from '../src/server.js';
+import { agentEnvironment, certificateFingerprint, clientLink, connectionUrl, pageLink, startBridge } from '../src/server.js';
 import { parseMcpServers } from '../src/mcp.js';
 import { createPlugins } from '../src/plugins.js';
 import { listSessions, readTranscript, sessionKey } from '../src/sessions.js';
@@ -1523,6 +1524,44 @@ test('prints a link that adds the worker in the code flower app', () => {
   // The line, token included, travels only in the fragment, which the browser never sends.
   assert.equal(link.search, '');
   assert.equal(decodeURIComponent(link.hash.slice('#add='.length)), line);
+});
+
+test('serves TLS with the run\'s certificate, whose fingerprint its line carries', async (t) => {
+  const fixtures = join(fileURLToPath(new URL('.', import.meta.url)), 'fixtures');
+  const cert = await readFile(join(fixtures, 'tls-cert.pem'), 'utf8');
+  const key = await readFile(join(fixtures, 'tls-key.pem'), 'utf8');
+  const fingerprint = certificateFingerprint(cert);
+  assert.match(fingerprint, /^[A-Za-z0-9_-]{43}$/);
+  const { bridge, directory } = await startTestBridge(t, { tls: { cert, key } });
+  const { address } = bridge;
+
+  // The line and the connection file name the fingerprint.
+  assert.equal(address.fingerprint, fingerprint);
+  assert.equal(address.url, connectionUrl('localhost', address.port, token, fingerprint));
+  assert.match(address.url, /&fp=[A-Za-z0-9_-]{43}$/);
+  assert.equal(JSON.parse(await readFile(join(directory, 'instance.json'), 'utf8')).fingerprint, fingerprint);
+
+  // Plain HTTP gets no answer; TLS with the pinned certificate does.
+  const plain = await get(address, '/status', { authorization: `Bearer ${token}` }).catch((error) => error);
+  assert.ok(plain instanceof Error || plain.code !== 200, 'answered plain HTTP');
+  const pinned = await new Promise((resolve, reject) => {
+    const request = httpsRequest(
+      { host: '127.0.0.1', port: address.port, path: '/status', headers: { authorization: `Bearer ${token}` }, rejectUnauthorized: false },
+      (response) => {
+        const seen = certificateFingerprint(`-----BEGIN CERTIFICATE-----\n${response.socket.getPeerCertificate().raw.toString('base64')}\n-----END CERTIFICATE-----\n`);
+        response.resume();
+        resolve({ code: response.statusCode, seen });
+      }
+    );
+    request.on('error', reject);
+    request.end();
+  });
+  assert.deepEqual(pinned, { code: 200, seen: fingerprint });
+
+  // The agent's environment never holds the key.
+  const environment = agentEnvironment({ CODEFLOWER_TLS_CERT: cert, CODEFLOWER_TLS_KEY: key, PATH: '/usr/bin' });
+  assert.equal(environment.CODEFLOWER_TLS_KEY, undefined);
+  assert.equal(environment.CODEFLOWER_TLS_CERT, undefined);
 });
 
 // A request with any Host header, which fetch does not let a test set.

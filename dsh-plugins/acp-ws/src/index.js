@@ -178,12 +178,21 @@ if (INITIAL_PROMPT_FILE && !initialPrompt) {
   throw new Error('The initial task prompt file is empty');
 }
 
+// The run's TLS certificate (internal/sandbox/tls.go in the app): only the
+// bridge needs it, not the agent or anything it starts.
+const tlsCertificate = process.env.CODEFLOWER_TLS_CERT && process.env.CODEFLOWER_TLS_KEY
+  ? { cert: process.env.CODEFLOWER_TLS_CERT, key: process.env.CODEFLOWER_TLS_KEY }
+  : undefined;
+delete process.env.CODEFLOWER_TLS_CERT;
+delete process.env.CODEFLOWER_TLS_KEY;
+
 const bridge = await startBridge({
   host: process.env.CODEFLOWER_LISTEN_HOST ?? '0.0.0.0',
   port: Number(process.env.CODEFLOWER_PORT ?? 0),
   listenSocket: process.env.CODEFLOWER_LISTEN_SOCKET || undefined,
   advertiseHost: requiredEnvironment('CODEFLOWER_ADVERTISE_HOST'),
   token: requiredEnvironment('CODEFLOWER_TOKEN'),
+  tls: tlsCertificate,
   connectionFile: requiredEnvironment('CODEFLOWER_CONNECTION_FILE'),
   appPid: Number(process.env.CODEFLOWER_APP_PID ?? process.pid),
   instanceId: requiredEnvironment('CODEFLOWER_INSTANCE_ID'),
@@ -210,7 +219,7 @@ const bridge = await startBridge({
   onQuit: () => void stop().then(() => process.exit(process.exitCode ?? 0))
 });
 
-const workerLine = connectionUrl(bridge.address.host, bridge.address.port, bridge.address.token);
+const workerLine = connectionUrl(bridge.address.host, bridge.address.port, bridge.address.token, bridge.address.fingerprint);
 const opening = SERVE_PAGE
   ? [
       'Open in a browser:',

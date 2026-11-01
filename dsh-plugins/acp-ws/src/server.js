@@ -1,5 +1,6 @@
 import { createServer } from 'node:http';
-import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { createServer as createTlsServer } from 'node:https';
+import { X509Certificate, createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
@@ -60,10 +61,21 @@ const SESSION_STARTS = ['session/new', 'session/resume', 'session/load'];
 // ACP steering: a message for the turn the agent is working on (Claude Code, Codex).
 const STEER_METHOD = '_session/steering';
 
-/** The line users paste into VS Code; the token travels in it like Jupyter's. */
-export function connectionUrl(host, port, token) {
+/**
+ * The line users paste into VS Code; the token travels in it like Jupyter's,
+ * and with TLS the certificate's fingerprint, which clients pin.
+ */
+export function connectionUrl(host, port, token, fingerprint) {
   const address = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
-  return `codeflower://${address}:${port}?token=${encodeURIComponent(token)}`;
+  return `codeflower://${address}:${port}?token=${encodeURIComponent(token)}${fingerprint ? `&fp=${fingerprint}` : ''}`;
+}
+
+/**
+ * A certificate's fingerprint (PEM in): SHA-256 of its DER, unpadded
+ * base64url, as the app (internal/sandbox/tls.go) and every client write it.
+ */
+export function certificateFingerprint(certificate) {
+  return createHash('sha256').update(new X509Certificate(certificate).raw).digest('base64url');
 }
 
 // The code flower app's usual port on the user's computer (DefaultPort in
@@ -132,6 +144,8 @@ async function writeConnectionFile(connectionFile, metadata) {
 export function agentEnvironment(environment, harnessEnvironment = {}) {
   const result = { ...environment };
   delete result.CODEFLOWER_TOKEN;
+  delete result.CODEFLOWER_TLS_CERT;
+  delete result.CODEFLOWER_TLS_KEY;
   delete result.CODEFLOWER_CONNECTION_FILE;
   delete result.CODEFLOWER_LISTEN_HOST;
   delete result.CODEFLOWER_ADVERTISE_HOST;
@@ -386,6 +400,10 @@ export async function startBridge(options) {
     listenSocket,
     advertiseHost = host,
     token,
+    // { cert, key } (PEM): the bridge serves TLS with the certificate the app
+    // made for this run, whose fingerprint its line carries. Without it
+    // (the page, served with --server, is plain HTTP) it serves HTTP.
+    tls,
     connectionFile,
     appPid = process.pid,
     instanceId = randomUUID(),
@@ -723,7 +741,9 @@ export async function startBridge(options) {
     });
 
   const sockets = new WebSocketServer({ noServer: true, maxPayload: MAX_PAYLOAD });
-  const server = createServer((request, response) => {
+  const fingerprint = tls ? certificateFingerprint(tls.cert) : undefined;
+  const serve = (handler) => (tls ? createTlsServer({ cert: tls.cert, key: tls.key, minVersion: 'TLSv1.3' }, handler) : createServer(handler));
+  const server = serve((request, response) => {
     let url;
     try {
       url = new URL(request.url, 'http://localhost');
@@ -2063,7 +2083,8 @@ export async function startBridge(options) {
     ...(initialPrompt !== undefined ? { initialPrompt: true } : {}),
     ...(slurmJobId ? { slurm_job_id: slurmJobId } : {})
   };
-  metadata.url = connectionUrl(metadata.host, metadata.port, token);
+  if (fingerprint) metadata.fingerprint = fingerprint;
+  metadata.url = connectionUrl(metadata.host, metadata.port, token, fingerprint);
   listening = metadata;
 
   try {
