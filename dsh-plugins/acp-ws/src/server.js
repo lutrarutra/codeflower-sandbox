@@ -794,7 +794,7 @@ export async function startBridge(options) {
       return;
     }
 
-    // The page's WebSocket, authorized by its cookie.
+    // The page's WebSocket, authorized by its ticket.
     const fromPage = page ? page.upgrade(request, pathname) : undefined;
     if (fromPage === 403) {
       rejectUpgrade(socket, 403, 'Forbidden');

@@ -5,18 +5,26 @@
 // shapes (codeflower-ui's src/web/lib/api.ts), so the page works the same as
 // in the app, in its single-sandbox mode.
 //
-// The link carries the worker's token as `?key=`, which becomes a cookie, as
-// the app's client does it. Whoever has it controls the agent, as with the
-// codeflower:// line. Requests must name this worker's host (no DNS
-// rebinding), and WebSockets authorized by the cookie must come from the page.
+// The link carries the worker's token as `?key=`, which the page keeps in its
+// own storage and sends as a bearer token, as with the app's client; the
+// chat's WebSocket, which cannot send headers, opens with a one-time ticket
+// from POST /api/ticket. Not a cookie: browsers send cookies to every port of
+// a host, so any other server on it would receive the token. Whoever has it
+// controls the agent, as with the codeflower:// line. Requests must name this
+// worker's host (no DNS rebinding), and the WebSocket must come from the page.
+//
+// It is plain HTTP: on a shared network, put it behind a TLS reverse proxy
+// (or ssh -L), with --host 127.0.0.1.
 
+import { randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { basename, extname, join, normalize, sep } from 'node:path';
 
 export const PAGE_DIRECTORY = '/opt/codeflower/page';
 // The page's one sandbox.
 export const WORKER_ID = 'local';
-const COOKIE = 'codeflower-worker';
+// How long a WebSocket ticket works; it works once.
+const TICKET_MS = 30_000;
 
 const TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -61,14 +69,11 @@ function hostName(header) {
   return header.replace(/:\d+$/, '').toLowerCase();
 }
 
-function cookieValue(request, name) {
-  const header = request.headers.cookie;
-  if (typeof header !== 'string') return undefined;
-  for (const part of header.split(';')) {
-    const at = part.indexOf('=');
-    if (at > 0 && part.slice(0, at).trim() === name) return part.slice(at + 1).trim();
-  }
-  return undefined;
+function bearer(request) {
+  const authorization = request.headers.authorization;
+  return typeof authorization === 'string' && authorization.startsWith('Bearer ')
+    ? authorization.slice('Bearer '.length)
+    : undefined;
 }
 
 function sendJson(response, code, body) {
@@ -113,7 +118,22 @@ export function createPage({
     const name = hostName(request.headers.host);
     return name !== undefined && (name === hostName(advertiseHost) || name === advertiseHost.toLowerCase() || LOOPBACK.has(name));
   };
-  const signedIn = (request) => matches(cookieValue(request, COOKIE));
+  const signedIn = (request) => matches(bearer(request));
+  /** The chat WebSocket's tickets not used yet, by expiry. */
+  const tickets = new Map();
+  const newTicket = () => {
+    const now = Date.now();
+    for (const [ticket, expires] of tickets) if (expires <= now) tickets.delete(ticket);
+    const ticket = randomBytes(24).toString('base64url');
+    tickets.set(ticket, now + TICKET_MS);
+    return ticket;
+  };
+  const takeTicket = (ticket) => {
+    const expires = typeof ticket === 'string' ? tickets.get(ticket) : undefined;
+    if (expires === undefined) return false;
+    tickets.delete(ticket);
+    return expires > Date.now();
+  };
 
   const worker = async () => {
     const [activity, described = {}] = await Promise.all([status(), describe()]);
@@ -202,25 +222,17 @@ export function createPage({
         response.end(FRAME_DOCUMENT);
         return true;
       }
-      // The link: its key becomes the cookie, and the address bar loses it.
+      // The link: the page takes its key out of the address itself. Another
+      // sandbox's (or an old) link says so at once.
       const key = url.searchParams.get('key');
-      if (pathname === '/' && key) {
-        if (!matches(key)) {
-          response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
-          response.end('This link is not this sandbox\'s: open the one it printed.\n');
-          return true;
-        }
-        response.writeHead(303, {
-          location: '/',
-          'set-cookie': `${COOKIE}=${key}; Path=/; HttpOnly; SameSite=Strict`,
-          'cache-control': 'no-store'
-        });
-        response.end();
+      if (pathname === '/' && key && !matches(key)) {
+        response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
+        response.end('This link is not this sandbox\'s: open the one it printed.\n');
         return true;
       }
-      if (!signedIn(request)) {
-        response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
-        response.end('Open this sandbox with the link it printed when it started.\n');
+      // The page's own files hold nothing: only the API needs the key.
+      if (api && !signedIn(request)) {
+        sendJson(response, 403, { error: 'Open this sandbox with the link it printed when it started.' });
         return true;
       }
       if (!api) {
@@ -234,6 +246,7 @@ export function createPage({
         return true;
       }
       try {
+        if (request.method === 'POST' && pathname === '/api/ticket') return sendJson(response, 200, { ticket: newTicket() }), true;
         if (request.method === 'GET' && pathname === '/api/system') return sendJson(response, 200, system()), true;
         if (request.method === 'GET' && pathname === '/api/workers') return sendJson(response, 200, [await worker()]), true;
         if (request.method === 'GET' && pathname === `/api/workers/${WORKER_ID}/sessions`) {
@@ -255,7 +268,7 @@ export function createPage({
       return true;
     },
 
-    /** The page's WebSocket to the agent: the cookie, from the page itself. */
+    /** The page's WebSocket to the agent: a ticket, from the page itself. */
     upgrade(request, pathname) {
       if (pathname !== `/api/workers/${WORKER_ID}/acp`) return undefined;
       if (!allowedHost(request)) return 403;
@@ -265,7 +278,11 @@ export function createPage({
         originHost = origin ? new URL(origin).host : undefined;
       } catch {}
       if (originHost === undefined || originHost !== request.headers.host) return 403;
-      return signedIn(request) ? 200 : 401;
+      let ticket;
+      try {
+        ticket = new URL(request.url, 'http://localhost').searchParams.get('ticket');
+      } catch {}
+      return takeTicket(ticket) ? 200 : 401;
     }
   };
 }

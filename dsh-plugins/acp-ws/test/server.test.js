@@ -1551,45 +1551,57 @@ test('serves the chat page only with --server, to the link\'s holder, on its own
   const { address } = bridge;
   assert.equal(pageLink('node7.example', 8123, 'a+b'), 'http://node7.example:8123/?key=a%2Bb');
 
-  // The link's key becomes a cookie; a wrong one, or none, opens nothing.
+  // The page's files load without the key, and set no cookie (browsers send
+  // cookies to every port of a host); the API needs the key as a bearer token.
+  // A link with a wrong key says so.
   assert.equal((await get(address, '/?key=wrong')).code, 403);
-  assert.equal((await get(address, '/')).code, 403);
-  const signIn = await get(address, `/?key=${token}`);
-  assert.equal(signIn.code, 303);
-  assert.equal(signIn.headers.location, '/');
-  const cookie = signIn.headers['set-cookie'][0].split(';')[0];
-  assert.match(signIn.headers['set-cookie'][0], /HttpOnly; SameSite=Strict/);
-  const index = await get(address, '/', { cookie });
+  const opened = await get(address, `/?key=${token}`);
+  assert.equal(opened.code, 200);
+  assert.equal(opened.headers['set-cookie'], undefined);
+  const index = await get(address, '/');
   assert.equal(index.code, 200);
   assert.match(index.body, /code flower/);
   assert.match(index.headers['content-security-policy'], /frame-ancestors 'none'/);
-  assert.equal((await get(address, '/../package.json', { cookie })).code, 404);
+  assert.equal((await get(address, '/../package.json')).code, 404);
+  const authorization = `Bearer ${token}`;
+  for (const headers of [{}, { authorization: 'Bearer wrong' }, { cookie: `codeflower-worker=${token}` }]) {
+    assert.equal((await get(address, '/api/workers', headers)).code, 403);
+  }
 
-  // Another host name (DNS rebinding) is refused, even with the cookie.
-  assert.equal((await get(address, '/', { cookie, host: `evil.example:${address.port}` })).code, 403);
+  // Another host name (DNS rebinding) is refused, even with the key.
+  assert.equal((await get(address, '/api/workers', { authorization, host: `evil.example:${address.port}` })).code, 403);
+  assert.equal((await get(address, '/', { host: `evil.example:${address.port}` })).code, 403);
 
   // The page API for one sandbox.
-  const system = JSON.parse((await get(address, '/api/system', { cookie })).body);
+  const system = JSON.parse((await get(address, '/api/system', { authorization })).body);
   assert.deepEqual(system.capabilities, { connect: false, start: false, connectOnly: true, single: true });
-  const [worker, ...others] = JSON.parse((await get(address, '/api/workers', { cookie })).body);
+  const [worker, ...others] = JSON.parse((await get(address, '/api/workers', { authorization })).body);
   assert.equal(others.length, 0);
   assert.equal(worker.id, 'local');
   assert.equal(worker.status, 'ready');
   assert.equal(worker.activity.agent, 'claude');
-  assert.deepEqual(JSON.parse((await get(address, '/api/workers/local/sessions', { cookie })).body), { sessions: [] });
+  assert.deepEqual(JSON.parse((await get(address, '/api/workers/local/sessions', { authorization })).body), { sessions: [] });
   const frame = await get(address, '/frame');
   assert.equal(frame.code, 200);
   assert.match(frame.headers['content-security-policy'], /default-src 'none'.*frame-ancestors 'self'/);
 
-  // The agent, by the cookie, from the page only.
+  // The agent, with a one-time ticket, from the page only.
   const origin = `http://127.0.0.1:${address.port}`;
+  const ticket = async () =>
+    (await (await fetch(`${origin}/api/ticket`, { method: 'POST', headers: { authorization, 'content-type': 'application/json' }, body: '{}' })).json()).ticket;
   const url = `ws://127.0.0.1:${address.port}/api/workers/local/acp`;
-  const socket = trackSocket(new WebSocket(url, { headers: { cookie, origin } }));
+  const used = await ticket();
+  const socket = trackSocket(new WebSocket(`${url}?ticket=${used}`, { headers: { origin } }));
   await once(socket, 'open');
   assert.equal((await initialize(socket)).protocolVersion, 1);
   await closeSocket(socket);
-  for (const headers of [{ cookie, origin: 'http://evil.example' }, { cookie }, { origin }]) {
-    const refused = new WebSocket(url, { headers });
+  for (const [query, headers] of [
+    [`?ticket=${await ticket()}`, { origin: 'http://evil.example' }],
+    [`?ticket=${await ticket()}`, {}],
+    [`?ticket=${used}`, { origin }],
+    ['', { origin, authorization }]
+  ]) {
+    const refused = new WebSocket(`${url}${query}`, { headers });
     const [error] = await once(refused, 'error');
     assert.match(error.message, /Unexpected server response: 40[13]/);
   }
@@ -1597,9 +1609,11 @@ test('serves the chat page only with --server, to the link\'s holder, on its own
   // Quit with no chat working: the worker stops at once.
   const response = await fetch(`${origin}/api/quit`, {
     method: 'POST',
-    headers: { cookie, 'content-type': 'application/json' },
+    headers: { authorization, 'content-type': 'application/json' },
     body: JSON.stringify({ wrapUp: true })
   });
   assert.equal((await response.json()).stopping, true);
   await waitFor(() => quit === 1);
 });
+  const ticket = async () =>
+    (await (await fetch(`${origin}/api/ticket`, { method: 'POST', headers: { authorization, 'content-type': 'application/json' }, body: '{}' })).json()).ticket;

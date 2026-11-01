@@ -212,7 +212,15 @@ const bridge = await startBridge({
 
 const workerLine = connectionUrl(bridge.address.host, bridge.address.port, bridge.address.token);
 const opening = SERVE_PAGE
-  ? ['Open in a browser:', '', `  ${pageLink(bridge.address.host, bridge.address.port, bridge.address.token)}`]
+  ? [
+      'Open in a browser:',
+      '',
+      `  ${pageLink(bridge.address.host, bridge.address.port, bridge.address.token)}`,
+      '',
+      'The page is plain HTTP: its traffic and the key in the link are not encrypted.',
+      'On a shared network, listen on 127.0.0.1 (--host 127.0.0.1) behind a TLS reverse',
+      'proxy such as nginx, or reach it through ssh -L.'
+    ]
   : ['With the code flower app running on your computer, open:', '', `  ${clientLink(workerLine)}`];
 process.stderr.write(
   [
