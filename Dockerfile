@@ -17,7 +17,10 @@ RUN locked=$(node -p 'require("./package-lock.json").packages["node_modules/@ant
     && if [ "$locked" != "$CLAUDE_AGENT_SDK_VERSION" ]; then \
          echo "package-lock.json has @anthropic-ai/claude-agent-sdk $locked: set CLAUDE_AGENT_SDK_VERSION to it" >&2; exit 1; \
        fi
-# Not Claude Code: the empty folder is where the app binds the SDK.
+# Then only what the agents load on this platform stays: not Claude Code (the
+# empty folder is where the app binds the SDK), nor dsh's web app and its
+# LibreOffice (dsh runs as an ACP agent only), node-pty's and sharp's builds for
+# other systems, Codex's voice mode, source maps and type declarations.
 # OpenCode comes as one native binary per CPU (the x86_64 build without AVX2, as
 # cluster nodes vary); npm installs this machine's, linked as .bin/opencode.
 RUN npm ci --omit=dev --no-audit --no-fund \
@@ -25,7 +28,13 @@ RUN npm ci --omit=dev --no-audit --no-fund \
     && ln -s "../$(ls -d opencode-linux-*)/bin/opencode" .bin/opencode \
     && .bin/opencode --version \
     && rm -rf @anthropic-ai/claude-agent-sdk @anthropic-ai/claude-agent-sdk-* \
-    && mkdir @anthropic-ai/claude-agent-sdk
+    && mkdir @anthropic-ai/claude-agent-sdk \
+    && rm -rf @deepseek-ai/libreoffice-kit @deepseek-ai/libreoffice-kit-wasm @deepseek-ai/dsh-office-to-pdf \
+              @deepseek-ai/dsh-web-app @deepseek-ai/dsh-web-frontend @deepseek-ai/dsh-client-ui-* \
+    && find node-pty/prebuilds -mindepth 1 -maxdepth 1 ! -name "linux-$(node -p process.arch)" -exec rm -rf {} + \
+    && rm -rf @img/*musl* @img/sharp-wasm32 \
+    && rm -rf @openai/codex-linux-*/vendor/*/codex-resources/voice \
+    && find . \( -name '*.map' -o -name '*.d.ts' -o -name '*.d.mts' -o -name '*.d.cts' \) -delete
 
 WORKDIR /opt/codeflower/acp-ws
 COPY dsh-plugins/acp-ws/package.json dsh-plugins/acp-ws/package-lock.json ./
@@ -52,37 +61,64 @@ RUN npm ci --no-audit --no-fund && npm run build:web
 FROM scratch AS page
 COPY --from=page-build /ui/dist-web /
 
-FROM continuumio/miniconda3:26.7.1-1@sha256:eca594d684f495c1a02beff33a9fab53aec8c5830eaf431bb149912dc6c9e4c1
+FROM debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4
 ARG CLAUDE_AGENT_SDK_VERSION
+# Miniforge: conda and mamba on conda-forge, with Python 3.14 in the base environment.
+ARG MINIFORGE_VERSION=26.9.4-1
+ARG MINIFORGE_SHA256_X86_64=571b410272cc434f28bc6c5c49ca8ffd4a4d1bcba9f57f1b6baccdb46446cfcc
+ARG MINIFORGE_SHA256_AARCH64=1f4e2f1898c054dd35133f778b92794116c28af330e5d5936d56d5f765401db4
 
 # The Claude Agent SDK version the app downloads and binds in for Claude Code.
 LABEL codeflower.claude-agent-sdk=$CLAUDE_AGENT_SDK_VERSION
 
-ENV PYTHONUNBUFFERED=1 \
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PATH="/opt/codeflower/bin:/opt/conda/bin:/opt/codeflower/runtime/node_modules/.bin:$PATH"
 
 WORKDIR /opt/codeflower
 
-COPY --from=ghcr.io/astral-sh/uv:0.13.6@sha256:af22a52f5eafef3d78e551599d405c02df61919d18028f0cea8eda93bc9986d0 /uv /uvx /usr/local/bin/
-COPY --from=dsh-runtime /usr/local/bin/node /usr/local/bin/node
-COPY --from=dsh-runtime /opt/codeflower/runtime /opt/codeflower/runtime
-COPY --from=dsh-runtime /opt/codeflower/acp-ws /opt/codeflower/acp-ws
-
+# The system layer first: it changes least, so new releases mostly reuse it.
+# libglib2.0-0, libsm6, libxext6 and libxrender1 are for pip wheels that expect
+# them (e.g. opencv-python).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    bzip2 \
+    ca-certificates \
     curl \
     fonts-dejavu-core \
     fonts-liberation2 \
     git \
+    libglib2.0-0 \
     librsvg2-bin \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    openssh-client \
+    procps \
     ripgrep \
     && rm -rf /var/lib/apt/lists/* \
-    && conda install --yes --freeze-installed -c conda-forge \
-        python=3.14 \
-        pip \
-    && conda clean --all --yes
+    && arch=$(uname -m) \
+    && case "$arch" in \
+         x86_64) sum=$MINIFORGE_SHA256_X86_64 ;; \
+         aarch64) sum=$MINIFORGE_SHA256_AARCH64 ;; \
+         *) echo "No Miniforge checksum for $arch" >&2; exit 1 ;; \
+       esac \
+    && curl -fsSL -o /tmp/miniforge.sh \
+         "https://github.com/conda-forge/miniforge/releases/download/$MINIFORGE_VERSION/Miniforge3-$MINIFORGE_VERSION-Linux-$arch.sh" \
+    && echo "$sum  /tmp/miniforge.sh" | sha256sum -c - \
+    && bash /tmp/miniforge.sh -b -p /opt/conda \
+    && rm /tmp/miniforge.sh /opt/conda/micromamba \
+    && /opt/conda/bin/python -c 'import sys; assert sys.version_info[:2] == (3, 14), sys.version' \
+    && /opt/conda/bin/conda clean --all --force-pkgs-dirs --yes \
+    && ln -s /opt/conda/etc/profile.d/conda.sh /etc/profile.d/conda.sh
+
+COPY --from=ghcr.io/astral-sh/uv:0.13.6@sha256:af22a52f5eafef3d78e551599d405c02df61919d18028f0cea8eda93bc9986d0 /uv /uvx /usr/local/bin/
+COPY --from=dsh-runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=dsh-runtime /opt/codeflower/runtime /opt/codeflower/runtime
+COPY --from=dsh-runtime /opt/codeflower/acp-ws /opt/codeflower/acp-ws
 
 # storyteller's dependencies and build backend live in the base environment, which
 # project venvs see, so the entrypoint can install the editable copy offline.
