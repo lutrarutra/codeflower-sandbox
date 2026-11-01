@@ -1,13 +1,27 @@
 # syntax=docker/dockerfile:1
 
+# Claude Code is not in the image: its license does not allow passing it on.
+# The app downloads this version of the Claude Agent SDK and its CLI for each
+# machine and binds them in (see the label below). It must be the version the
+# Claude ACP adapter pins in package-lock.json; the build checks that.
+ARG CLAUDE_AGENT_SDK_VERSION=0.3.310
+
 FROM node:22-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS dsh-runtime
+ARG CLAUDE_AGENT_SDK_VERSION
 
 # Harness runtimes: DeepSeek Harness, the Claude Code and Codex ACP adapters,
-# and the official claude and codex CLIs used for sign-in. Exact versions are
-# pinned in package.json.
+# and the codex CLI used for sign-in. Exact versions are pinned in package.json.
 WORKDIR /opt/codeflower/runtime
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev --no-audit --no-fund
+RUN locked=$(node -p 'require("./package-lock.json").packages["node_modules/@anthropic-ai/claude-agent-sdk"].version') \
+    && if [ "$locked" != "$CLAUDE_AGENT_SDK_VERSION" ]; then \
+         echo "package-lock.json has @anthropic-ai/claude-agent-sdk $locked: set CLAUDE_AGENT_SDK_VERSION to it" >&2; exit 1; \
+       fi
+# Not Claude Code: the empty folder is where the app binds the SDK.
+RUN npm ci --omit=dev --no-audit --no-fund \
+    && cd node_modules \
+    && rm -rf @anthropic-ai/claude-agent-sdk @anthropic-ai/claude-agent-sdk-* \
+    && mkdir @anthropic-ai/claude-agent-sdk
 
 WORKDIR /opt/codeflower/acp-ws
 COPY dsh-plugins/acp-ws/package.json dsh-plugins/acp-ws/package-lock.json ./
@@ -35,6 +49,10 @@ FROM scratch AS page
 COPY --from=page-build /ui/dist-web /
 
 FROM continuumio/miniconda3:26.7.1-1@sha256:eca594d684f495c1a02beff33a9fab53aec8c5830eaf431bb149912dc6c9e4c1
+ARG CLAUDE_AGENT_SDK_VERSION
+
+# The Claude Agent SDK version the app downloads and binds in for Claude Code.
+LABEL codeflower.claude-agent-sdk=$CLAUDE_AGENT_SDK_VERSION
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -79,7 +97,11 @@ COPY dsh-plugins/usage /opt/codeflower/dsh-usage
 # Bind targets must exist in the image on Apptainer installs without underlay.
 # The user's folders are mounted one level below /data/{input,output,code,skills},
 # which such installs cannot create: they need underlay (Apptainer's default).
-# /data/icons is the user's icon gallery (codeflower-sketch).
-RUN mkdir -p /codeflower-state /codeflower-net /data/input /data/output /data/code /data/skills /data/icons
+# /data/icons is the user's icon gallery (codeflower-sketch). Claude Code goes to
+# /opt/codeflower/agents/claude and its SDK into the empty folder in node_modules;
+# `claude` on the PATH is its CLI.
+RUN mkdir -p /codeflower-state /codeflower-net /data/input /data/output /data/code /data/skills /data/icons \
+        /opt/codeflower/agents/claude \
+    && ln -s /opt/codeflower/agents/claude/claude /opt/codeflower/bin/claude
 
 ENTRYPOINT ["/opt/codeflower/entrypoint.sh"]

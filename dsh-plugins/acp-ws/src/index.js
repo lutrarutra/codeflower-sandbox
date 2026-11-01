@@ -52,6 +52,10 @@ try {
 }
 delete process.env[MCP_SERVERS_VARIABLE];
 
+// An agent installed outside the image (Claude Code) says when it is missing.
+const missing = await agents[agentName].missing?.();
+if (missing) throw new Error(missing);
+
 // What the extension shows about this worker.
 // The folders the app mounted, e.g. /data/input/study42, with their host paths.
 function mounts() {

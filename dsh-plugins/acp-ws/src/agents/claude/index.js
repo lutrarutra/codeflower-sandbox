@@ -5,8 +5,19 @@ import { exists, InvalidRequest, readJson, readText, writePrivate } from '../sup
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 const USAGE_TIMEOUT_MS = 15_000;
 
-export default function claude({ home }) {
+export default function claude({ descriptor, home, modules }) {
   return {
+    // Claude Code is not in the image, whose license does not allow passing it
+    // on: the app downloads it and binds the SDK into `modules` and the CLI at
+    // CLAUDE_CODE_EXECUTABLE. Says what is missing, if anything.
+    async missing() {
+      if (!modules) return undefined;
+      const sdk = join(modules, '@anthropic-ai/claude-agent-sdk/package.json');
+      const executable = descriptor.env.CLAUDE_CODE_EXECUTABLE;
+      if ((await exists(sdk)) && (await exists(executable))) return undefined;
+      return 'Claude Code is not installed in this sandbox. The code flower app downloads it and binds it in ' +
+        'when it starts a Claude Code worker: update the app, or run `codeflower pull` where there is internet access.';
+    },
     // No NO_BROWSER: with it the adapter offers only Claude's full-screen
     // /login instead of the `auth login` commands.
     async signedIn() {
