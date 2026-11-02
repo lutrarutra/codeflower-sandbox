@@ -452,6 +452,11 @@ test('relays chat, permissions, cancellation, and several sessions, and records 
     (await call(socket, '_codeflower/sessions/transcript', { key: firstKey })).result.entries.map((entry) => entry.kind),
     ['prompt', 'update', 'turn_end', 'prompt', 'turn_end']
   );
+  // Clients that page get the newest turns and where they start.
+  const page = (await call(socket, '_codeflower/sessions/transcript', { key: firstKey, maxBytes: 1 })).result;
+  assert.deepEqual([page.start, page.total, page.entries.map((entry) => entry.kind)], [0, 5, ['prompt', 'update', 'turn_end', 'prompt', 'turn_end']]);
+  const before = (await call(socket, '_codeflower/sessions/transcript', { key: firstKey, before: 3 })).result;
+  assert.deepEqual([before.start, before.entries.length], [0, 3]);
   assert.deepEqual((await call(socket, '_codeflower/sessions/rename', { key: firstKey, title: 'Greeting' })).result, {});
   assert.match((await call(socket, '_codeflower/sessions/rename', { key: 'codex-x', title: 'y' })).error.message, /Invalid/);
   await closeSocket(socket);

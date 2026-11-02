@@ -309,6 +309,71 @@ export async function readTranscript(directory, key) {
   return entries;
 }
 
+// A page of a transcript: about TRANSCRIPT_PAGE_BYTES of entries by default,
+// at most TRANSCRIPT_PAGE_LIMIT, well under the 16 MiB a client takes in one
+// message, so long chats open quickly and load earlier turns as needed.
+export const TRANSCRIPT_PAGE_BYTES = 1 << 20;
+const TRANSCRIPT_PAGE_SMALLEST = 64 << 10;
+const TRANSCRIPT_PAGE_LIMIT = 8 << 20;
+const ENTRY_KIND = /^\{"t":"[^"]*","kind":"([a-z_]+)"/;
+const COMMANDS_UPDATE = '"sessionUpdate":"available_commands_update"';
+
+const parsedLine = (line) => {
+  try {
+    return JSON.parse(line);
+  } catch {
+    return undefined;
+  }
+};
+
+/**
+ * The entries before `before` (all of them by default) that fit in `maxBytes`,
+ * from the start of a turn when that fits in the limit, so a page does not
+ * open in the middle of an answer. `start` is the index of its first entry;
+ * `context` holds the agent's latest slash commands from before the page,
+ * which the client needs and the page may not have.
+ */
+export async function readTranscriptPage(directory, key, { before, maxBytes } = {}) {
+  let text;
+  try {
+    text = await readFile(join(sessionDirectory(directory, key), 'transcript.jsonl'), 'utf8');
+  } catch (error) {
+    if (error.code === 'ENOENT') return { entries: [], start: 0, total: 0 };
+    throw error;
+  }
+  const lines = text.split('\n');
+  if (!lines.at(-1)) lines.pop();
+  // A torn last line from a writer that is still appending is not an entry yet.
+  if (lines.length && parsedLine(lines.at(-1)) === undefined) lines.pop();
+  const total = lines.length;
+  const end = Number.isSafeInteger(before) ? Math.min(Math.max(before, 0), total) : total;
+  const budget = Math.min(
+    Math.max(Number.isSafeInteger(maxBytes) ? maxBytes : TRANSCRIPT_PAGE_BYTES, TRANSCRIPT_PAGE_SMALLEST),
+    TRANSCRIPT_PAGE_LIMIT
+  );
+  const size = (index) => Buffer.byteLength(lines[index]) + 1;
+  let start = end;
+  let bytes = 0;
+  while (start > 0 && (start === end || bytes + size(start - 1) <= budget)) bytes += size(--start);
+  const isPrompt = (index) => ENTRY_KIND.exec(lines[index])?.[1] === 'prompt';
+  let turn = start;
+  while (turn > 0 && turn < end && !isPrompt(turn) && bytes + size(turn - 1) <= TRANSCRIPT_PAGE_LIMIT) bytes += size(--turn);
+  if (turn < end && isPrompt(turn)) start = turn;
+
+  const page = lines.slice(start, end);
+  const entries = page.map(parsedLine).filter((entry) => entry !== undefined);
+  const result = { entries, start, total };
+  if (start > 0 && !page.some((line) => line.includes(COMMANDS_UPDATE))) {
+    for (let index = start - 1; index >= 0; index--) {
+      if (!lines[index].includes(COMMANDS_UPDATE)) continue;
+      const entry = parsedLine(lines[index]);
+      if (entry) result.context = [entry];
+      break;
+    }
+  }
+  return result;
+}
+
 export async function renameSession(directory, key, title) {
   const root = sessionDirectory(directory, key);
   const trimmed = typeof title === 'string' ? title.trim() : '';

@@ -1822,7 +1822,13 @@ export async function startBridge(options) {
             const key = requireOwnSession();
             // A chat still running here: everything relayed so far is in the file.
             await recorder?.flush();
-            respond({ entries: await readTranscript(directory, key) });
+            // Clients that page ask for `before` and `maxBytes`; others get it all.
+            const paged = params.before !== undefined || params.maxBytes !== undefined;
+            respond(
+              paged
+                ? await readTranscriptPage(directory, key, { before: params.before, maxBytes: params.maxBytes })
+                : { entries: await readTranscript(directory, key) }
+            );
             break;
           }
           case '_codeflower/sessions/rename':
