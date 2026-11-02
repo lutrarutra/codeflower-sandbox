@@ -79,9 +79,13 @@ export async function resolvePath(path, { workspace, privateDirectory, cwd = wor
   } catch {
     throw new InvalidRequest(`No such file: ${path}`);
   }
+  // Compared resolved, like the file: a folder under a symlink (macOS /var) would not match otherwise.
+  const [privateReal, workspaceReal] = await Promise.all(
+    [privateDirectory, workspace].map((folder) => folder && realpath(folder).catch(() => folder))
+  );
   const denied =
     ['/proc', '/sys', '/dev'].some((directory) => inside(real, directory)) ||
-    (privateDirectory && inside(real, privateDirectory) && !(workspace && inside(real, workspace)));
+    (privateReal && inside(real, privateReal) && !(workspaceReal && inside(real, workspaceReal)));
   if (denied) throw new InvalidRequest(`This file cannot be shown: ${path}`);
   return { real, info: await stat(real) };
 }

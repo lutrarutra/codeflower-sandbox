@@ -4,9 +4,9 @@ import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
-import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, readFile, realpath, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import WebSocket from 'ws';
@@ -864,7 +864,7 @@ test('takes files attached to messages in chunks, into the workspace uploads fol
 });
 
 test('sends files and folders to writable folders only, asking before replacing, checked by hash', async (t) => {
-  const root = await mkdtemp(join(tmpdir(), 'codeflower-files-'));
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'codeflower-files-')));
   t.after(() => rm(root, { recursive: true, force: true }));
   const workspaceDirectory = join(root, 'workspace');
   const output = join(root, 'output');
@@ -935,7 +935,7 @@ test('sends files and folders to writable folders only, asking before replacing,
 });
 
 test('sends files and folders to the window in chunks, a folder as a zip', async (t) => {
-  const root = await mkdtemp(join(tmpdir(), 'codeflower-files-'));
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'codeflower-files-')));
   t.after(() => rm(root, { recursive: true, force: true }));
   const workspaceDirectory = join(root, 'workspace');
   const input = join(root, 'input');
