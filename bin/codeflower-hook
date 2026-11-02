@@ -1,0 +1,33 @@
+#!/usr/local/bin/node
+// Claude Code's hooks while a chat is open in its terminal UI (codeflower
+// attach): hands the hook's event, which Claude Code writes to stdin, to the
+// bridge, so the chat's windows follow the terminal. It decides nothing and
+// prints nothing, so Claude Code goes on as it would without it.
+import { createConnection } from 'node:net';
+
+const socketPath = process.env.CODEFLOWER_HOOK_SOCKET;
+if (!socketPath) process.exit(0);
+
+let input = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => (input += chunk));
+process.stdin.on('end', () => {
+  let event;
+  try {
+    event = JSON.parse(input);
+  } catch {
+    process.exit(0);
+  }
+  // The chat the bridge handed to this terminal UI.
+  event.codeflower_chat = process.env.CODEFLOWER_HOOK_CHAT;
+  const socket = createConnection(socketPath);
+  // Never hold the terminal UI up.
+  const timer = setTimeout(() => process.exit(0), 2000);
+  socket.on('connect', () => socket.write(`${JSON.stringify(event)}\n`));
+  socket.on('data', () => {});
+  socket.on('end', () => {
+    clearTimeout(timer);
+    process.exit(0);
+  });
+  socket.on('error', () => process.exit(0));
+});

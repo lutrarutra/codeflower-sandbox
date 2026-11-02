@@ -21,9 +21,33 @@ async function setup(t, launch) {
   return { opencode, home };
 }
 
-test('runs the binary the image links, or a test script with node', async (t) => {
-  assert.deepEqual(await (await setup(t)).opencode.command(), ['/opt/codeflower/runtime/node_modules/.bin/opencode', 'acp']);
-  assert.deepEqual(await (await setup(t, '/tmp/fake-agent.js')).opencode.command(), ['node', '/tmp/fake-agent.js', 'acp']);
+test('runs the binary the image links, or a test script with node, serving on a port of its own', async (t) => {
+  const binary = await (await setup(t)).opencode.command();
+  assert.deepEqual(binary.slice(0, 5), ['/opt/codeflower/runtime/node_modules/.bin/opencode', 'acp', '--hostname', '127.0.0.1', '--port']);
+  assert.match(binary[5], /^\d+$/);
+  const script = await (await setup(t, '/tmp/fake-agent.js')).opencode.command();
+  assert.deepEqual(script.slice(0, 3), ['node', '/tmp/fake-agent.js', 'acp']);
+});
+
+test("opens its terminal UI on a chat, attached to the server it runs, with that server's password", async (t) => {
+  const { opencode } = await setup(t);
+  await assert.rejects(opencode.tuiCommand({ sessionId: 'ses_1', cwd: '/w' }), /not running/);
+  const command = await opencode.command();
+  const port = command.at(-1);
+  assert.deepEqual(await opencode.tuiCommand({ sessionId: 'ses_1', cwd: '/codeflower-state/workspace' }), [
+    '/opt/codeflower/runtime/node_modules/.bin/opencode',
+    'attach',
+    `http://127.0.0.1:${port}`,
+    '--session',
+    'ses_1',
+    '--dir',
+    '/codeflower-state/workspace'
+  ]);
+  assert.match(opencode.env.OPENCODE_SERVER_PASSWORD, /^[\w-]{32}$/);
+  // A new password with every start.
+  const before = opencode.env.OPENCODE_SERVER_PASSWORD;
+  await opencode.command();
+  assert.notEqual(opencode.env.OPENCODE_SERVER_PASSWORD, before);
 });
 
 test('keeps its database in its home and turns off what calls out on its own', async (t) => {

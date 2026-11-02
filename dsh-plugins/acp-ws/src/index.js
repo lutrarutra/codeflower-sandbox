@@ -6,8 +6,9 @@ import { MCP_SERVERS_VARIABLE, parseMcpServers } from './mcp.js';
 import { PLUGINS_FETCH_VARIABLE, PLUGINS_VARIABLE, createPlugins, parsePlugins, runFetch } from './plugins.js';
 import { startEgressForwarder } from './egress.js';
 import { PAGE_DIRECTORY } from './page.js';
-import { clientLink, connectionUrl, pageLink, startBridge } from './server.js';
+import { clientLink, connectionUrl, pageLink, startBridge, vscodeLink } from './server.js';
 import { EXIT_CODES, runTask } from './task.js';
+import { parseResume, runTui } from './tui.js';
 
 const RUNTIME_MODULES = '/opt/codeflower/runtime/node_modules';
 const STATE = '/codeflower-state';
@@ -114,6 +115,27 @@ if (FETCH_PLUGINS) {
   const errors = await runFetch(plugins);
   egress?.close();
   process.exit(errors ? 1 : 0);
+}
+
+// `codeflower tui`: the agent's own terminal UI on the user's terminal, and
+// no bridge; the sandbox ends with it.
+if (process.env.CODEFLOWER_TUI === '1') {
+  let code = 1;
+  try {
+    code = await runTui({
+      agentName,
+      agent: agents[agentName],
+      plugins,
+      mcpServers,
+      resume: parseResume(process.env.CODEFLOWER_TUI_RESUME),
+      workspace: requiredEnvironment('CODEFLOWER_WORKSPACE'),
+      log: (message) => process.stderr.write(`${message}\n`)
+    });
+  } catch (error) {
+    process.stderr.write(`${error.message}\n`);
+  }
+  egress?.close();
+  process.exit(code);
 }
 
 // `codeflower task`: the agent works on its task by itself, without VS Code.

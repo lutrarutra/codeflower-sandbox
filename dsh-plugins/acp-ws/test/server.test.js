@@ -358,7 +358,9 @@ test('runs OpenCode with its database in its home until it is signed in', async 
   const socket = await openSocket(bridge.address);
   t.after(() => closeSocket(socket));
   const initialized = await initialize(socket);
-  assert.deepEqual(initialized.argv, ['acp']);
+  // Its server on a port the bridge picked, for its terminal UI to join.
+  assert.deepEqual(initialized.argv.slice(0, 4), ['acp', '--hostname', '127.0.0.1', '--port']);
+  assert.match(initialized.argv[4], /^\d+$/);
   assert.equal(initialized.opencodeDatabase, join(home, 'opencode.db'));
   assert.deepEqual(initialized.credentialVariables, []);
   const status = (await call(socket, '_codeflower/status')).result;
@@ -727,7 +729,7 @@ test("manages the agent's plugins and starts the agent with them", async (t) => 
   const { bridge } = await startTestBridge(t, { plugins });
   const socket = await openSocket(bridge.address);
   assert.equal((await initialize(socket)).pluginSeed, '/empty');
-  assert.deepEqual((await call(socket, '_codeflower/status')).result.capabilities, { plugins: true });
+  assert.deepEqual((await call(socket, '_codeflower/status')).result.capabilities, { plugins: true, chatTerminals: true });
 
   assert.match((await call(socket, '_codeflower/plugins/add', { source: 'npm:x@1' })).error.message, /github:, not npm:/);
   const added = (await call(socket, '_codeflower/plugins/add', { source: 'github:org/mine' })).result;
@@ -754,7 +756,7 @@ test('an agent without plugins says so and refuses the plugin methods', async (t
   const socket = await openSocket(bridge.address);
   t.after(() => closeSocket(socket));
   await initialize(socket);
-  assert.deepEqual((await call(socket, '_codeflower/status')).result.capabilities, { plugins: false });
+  assert.deepEqual((await call(socket, '_codeflower/status')).result.capabilities, { plugins: false, chatTerminals: true });
   assert.deepEqual((await call(socket, '_codeflower/plugins/list')).result, { available: false });
   assert.match((await call(socket, '_codeflower/plugins/add', { source: 'github:a/b' })).error.message, /no plugins/);
 });

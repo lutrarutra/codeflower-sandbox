@@ -1,9 +1,54 @@
 // Codex through its ACP adapter (which runs `codex app-server`).
-import { join } from 'node:path';
+import { randomBytes } from 'node:crypto';
+import { createConnection } from 'node:net';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { exists, InvalidRequest, readJson, readText, writePrivate } from '../support.js';
+import { watchEvents } from './events.js';
 
-export default function codex({ home, nodePath, modules }) {
+const PROXY = join(dirname(fileURLToPath(import.meta.url)), 'proxy.js');
+const READY_MS = 30_000;
+
+export default function codex({ descriptor, home, nodePath, modules }) {
+  const codexCommand = modules ? [nodePath, join(modules, '@openai/codex/bin/codex.js')] : undefined;
+  // One app-server for the worker, on a Unix socket in the container's own
+  // /tmp: the adapter reaches it through proxy.js (CODEX_PATH), and the
+  // terminal UI with --remote, so both follow the same chats live. Codex
+  // lets only one app-server write a chat.
+  const env = { ...descriptor?.env };
+  let socketPath;
   return {
+    env,
+    companion: codexCommand
+      ? async () => {
+          socketPath = join(tmpdir(), `codeflower-codex-${randomBytes(6).toString('hex')}.sock`);
+          env.CODEX_PATH = PROXY;
+          env.CODEFLOWER_CODEX_SOCKET = socketPath;
+          return { command: [...codexCommand, 'app-server', '--listen', `unix://${socketPath}`], ready: () => listening(socketPath) };
+        }
+      : undefined,
+    // Its terminal UI on a chat, on the shared app-server. It would offer to
+    // update itself first, which the image's copy cannot.
+    tuiCommand: codexCommand
+      ? async ({ sessionId }) => {
+          if (!socketPath) throw new Error('Codex is not running');
+          return [...codexCommand, '-c', 'check_for_update_on_startup=false', '--remote', `unix://${socketPath}`, 'resume', sessionId];
+        }
+      : undefined,
+    // `codeflower tui`: its terminal UI alone, with an app-server of its own.
+    soloCommand: codexCommand
+      ? async ({ resume }) => [
+          ...codexCommand,
+          '-c',
+          'check_for_update_on_startup=false',
+          ...(resume === 'last' ? ['resume', '--last'] : resume === 'pick' ? ['resume'] : resume ? ['resume', resume] : [])
+        ]
+      : undefined,
+    // The user's messages typed in the terminal UI, and its turns (events.js).
+    watch: codexCommand
+      ? ({ emit, log }) => (socketPath ? watchEvents({ socketPath, emit, log }) : () => {})
+      : undefined,
     async signedIn() {
       return Boolean(home) && (await exists(join(home, 'auth.json')));
     },
@@ -33,4 +78,22 @@ export default function codex({ home, nodePath, modules }) {
     // `codex` itself reads the account's rate limits, which its adapter does not pass on.
     limitsCommand: modules ? () => [nodePath, join(modules, '@openai/codex/bin/codex.js'), 'app-server'] : undefined
   };
+}
+
+// Waits until the app-server takes connections on its socket.
+async function listening(socketPath) {
+  const deadline = Date.now() + READY_MS;
+  while (Date.now() < deadline) {
+    const ok = await new Promise((resolve) => {
+      const socket = createConnection(socketPath);
+      socket.once('connect', () => {
+        socket.destroy();
+        resolve(true);
+      });
+      socket.once('error', () => resolve(false));
+    });
+    if (ok) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`Codex's app-server did not start listening on ${socketPath}`);
 }

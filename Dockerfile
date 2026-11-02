@@ -128,6 +128,7 @@ RUN pip install --no-cache-dir pillow==13.0.0 markdown-it-py==4.2.0 mdurl==0.1.2
     && python -c "import sys; sys.path.insert(0, '/opt/codeflower/src/storyteller/src'); import storyteller"
 
 COPY entrypoint.sh /opt/codeflower/entrypoint.sh
+COPY profile.d/codeflower.sh /etc/profile.d/codeflower.sh
 COPY bin /opt/codeflower/bin
 COPY templates /opt/codeflower/templates
 COPY skills /opt/codeflower/skills

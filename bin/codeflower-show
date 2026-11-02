@@ -4,7 +4,15 @@
 // each file in a tab beside the chat and keeps it up to date when it changes.
 import { createConnection } from 'node:net';
 
-const usage = `Usage: codeflower-show [--title TEXT] [--message TEXT] FILE...
+const linkOnly = process.argv[1].endsWith('codeflower-open') || process.argv.includes('--link-only');
+
+const usage = linkOnly
+  ? `Usage: codeflower-open FILE...
+
+Prints a link that opens FILE in the user's browser, in the code flower app's
+page, when the user works in the agent's terminal UI (codeflower attach).
+Unlike codeflower-show it opens nothing by itself.`
+  : `Usage: codeflower-show [--title TEXT] [--message TEXT] FILE...
 
 Opens FILE in a tab next to the user's chat, in VS Code or the code flower
 app: images (png, jpg, svg, gif, webp), Markdown and HTML reports, CSV/TSV
@@ -13,7 +21,10 @@ The tab reloads by itself when the file changes, so regenerate a figure under
 the same name to update what the user sees. The user can reply from the tab.
 
   --title TEXT     tab title (default: the file name)
-  --message TEXT   a short note shown above the file, e.g. what to look at`;
+  --message TEXT   a short note shown above the file, e.g. what to look at
+
+When the user works in the agent's terminal UI (codeflower attach), it also
+prints a link for each file that opens it in their browser.`;
 
 const args = process.argv.slice(2);
 const paths = [];
@@ -32,6 +43,8 @@ for (let index = 0; index < args.length; index++) {
     }
     if (arg === '--title') title = value;
     else message = value;
+  } else if (arg === '--link-only') {
+    continue;
   } else if (arg === '--') {
     paths.push(...args.slice(index + 1));
     break;
@@ -54,7 +67,7 @@ const socket = createConnection(socketPath);
 let reply = '';
 socket.setEncoding('utf8');
 socket.on('connect', () => {
-  socket.write(`${JSON.stringify({ paths, cwd: process.cwd(), title, message })}\n`);
+  socket.write(`${JSON.stringify({ paths, cwd: process.cwd(), title, message, ...(linkOnly ? { linkOnly: true } : {}) })}\n`);
 });
 socket.on('data', (chunk) => (reply += chunk));
 socket.on('error', (error) => {
@@ -73,5 +86,7 @@ socket.on('end', () => {
     console.error(result.error);
     process.exit(1);
   }
-  for (const path of result.shown) console.log(`Opened ${path} for the user.`);
+  for (const path of result.shown ?? []) console.log(`Opened ${path} for the user.`);
+  // Links open the files in the user's browser: they work in a terminal UI.
+  for (const link of result.links ?? []) console.log(`${linkOnly ? '' : 'Link for the user: '}${link.url}`);
 });

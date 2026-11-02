@@ -135,3 +135,21 @@ export function failedMcpServers(error, given) {
 
 // Why a server that failed a session start is not in it.
 export const DID_NOT_START = 'it did not start';
+
+/**
+ * The MCP servers in Claude Code's own form, for its terminal UI's
+ * --mcp-config: what the adapter gives its sessions from ACP's form.
+ */
+export function claudeMcpConfig(servers) {
+  const pairs = (list) => Object.fromEntries((Array.isArray(list) ? list : []).map(({ name, value }) => [name, value]));
+  return {
+    mcpServers: Object.fromEntries(
+      servers.map((server) => [
+        server.name,
+        server.url
+          ? { type: server.type === 'sse' ? 'sse' : 'http', url: server.url, headers: pairs(server.headers) }
+          : { type: 'stdio', command: server.command, args: server.args ?? [], env: pairs(server.env) }
+      ])
+    )
+  };
+}

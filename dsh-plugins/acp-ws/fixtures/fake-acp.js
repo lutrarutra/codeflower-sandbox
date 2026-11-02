@@ -461,6 +461,11 @@ input.on('line', async (line) => {
       if (id !== undefined) reply(sessionId, id, 'done');
       break;
     }
+    // As the Claude Code adapter: lets go of a session, which it can resume later.
+    case 'session/close':
+      tasks.delete(message.params?.sessionId);
+      send({ jsonrpc: '2.0', id: message.id, result: {} });
+      break;
     case 'session/resume':
       if (process.argv.includes('--no-resume')) {
         send({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'Method not found' } });

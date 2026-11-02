@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Runs a command in a pseudo-terminal and relays it over stdin/stdout.
 
-The bridge uses it for sign-in commands (e.g. `claude auth login`) that need
-a real terminal. The size comes from COLUMNS and LINES.
+The bridge uses it for sign-in commands (e.g. `claude auth login`) and for
+the agents' own terminal UIs, which need a real terminal. The size comes from
+COLUMNS and LINES; when file descriptor 3 is open, it takes JSON lines like
+{"resize": [columns, rows]} there to change it.
 """
 import fcntl
+import json
 import os
 import pty
 import select
@@ -13,22 +16,53 @@ import sys
 import termios
 
 
+def window_size(columns: int, lines: int) -> bytes:
+    return struct.pack("HHHH", lines, columns, 0, 0)
+
+
+def control_fd():
+    try:
+        os.fstat(3)
+    except OSError:
+        return None
+    return 3
+
+
+def resize(master: int, line: bytes) -> None:
+    try:
+        columns, lines = json.loads(line)["resize"]
+        columns, lines = int(columns), int(lines)
+    except (ValueError, KeyError, TypeError):
+        return
+    if 0 < columns <= 1000 and 0 < lines <= 1000:
+        # The kernel tells the program with SIGWINCH.
+        fcntl.ioctl(master, termios.TIOCSWINSZ, window_size(columns, lines))
+
+
 def main() -> int:
     if len(sys.argv) < 2:
         print("usage: codeflower-pty COMMAND [ARG...]", file=sys.stderr)
         return 2
     columns = int(os.environ.get("COLUMNS", "100"))
     lines = int(os.environ.get("LINES", "30"))
+    control = control_fd()
     pid, master = pty.fork()
     if pid == 0:
+        # Sized before the program starts, so it draws at the right size at once.
+        fcntl.ioctl(0, termios.TIOCSWINSZ, window_size(columns, lines))
+        if control is not None:
+            os.close(control)
         os.environ.setdefault("TERM", "xterm-256color")
+        os.environ.setdefault("COLORTERM", "truecolor")
         os.execvp(sys.argv[1], sys.argv[1:])
-    fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", lines, columns, 0, 0))
+    fcntl.ioctl(master, termios.TIOCSWINSZ, window_size(columns, lines))
 
     stdin_open = True
+    control_buffer = b""
     status = None
     while True:
-        readable, _, _ = select.select([master] + ([0] if stdin_open else []), [], [], 0.2)
+        watched = [master] + ([0] if stdin_open else []) + ([control] if control is not None else [])
+        readable, _, _ = select.select(watched, [], [], 0.2)
         if master in readable:
             try:
                 data = os.read(master, 65536)
@@ -43,6 +77,15 @@ def main() -> int:
                 os.write(master, data)
             else:
                 stdin_open = False
+        if control is not None and control in readable:
+            data = os.read(control, 4096)
+            if data:
+                control_buffer += data
+                while b"\n" in control_buffer:
+                    line, control_buffer = control_buffer.split(b"\n", 1)
+                    resize(master, line)
+            else:
+                control = None
         # Some systems never report end-of-file on the master side, so watch
         # the child directly once it is quiet.
         if not readable:

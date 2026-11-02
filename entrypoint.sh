@@ -7,6 +7,9 @@ if [ -n "${CODEFLOWER_PREPEND_PATH:-}" ]; then
   PATH="$CODEFLOWER_PREPEND_PATH:$PATH"
   export PATH
 fi
+# For login shells, which /etc/profile gives a PATH of its own (profile.d/codeflower.sh).
+CODEFLOWER_SANDBOX_PATH="$PATH"
+export CODEFLOWER_SANDBOX_PATH
 venv="${VIRTUAL_ENV:-$state/env/venv}"
 workspace="${CODEFLOWER_WORKSPACE:-$state/workspace}"
 

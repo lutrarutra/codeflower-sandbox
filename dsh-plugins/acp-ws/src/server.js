@@ -8,6 +8,8 @@ import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { WebSocket, WebSocketServer } from 'ws';
 import { createActivity } from './activity.js';
+import { createChatTerminals, terminalSize } from './chat-terminals.js';
+import { hookSettings, tailTranscript, transcriptPath } from './agents/claude/mirror.js';
 import { createSessionInfo } from './session-info.js';
 import { CREDENTIAL_VARIABLES, InvalidRequest, terminalAuthCommand } from './agents.js';
 import { readCodexLimits } from './codex-limits.js';
@@ -60,6 +62,11 @@ const SIGN_IN_POLL_MS = 2000;
 // setTimeout waits at most about 24 days; longer waits are made of several.
 const MAX_TIMER_MS = 2 ** 31 - 1;
 const SESSION_STARTS = ['session/new', 'session/resume', 'session/load'];
+// How long a turn the agent's terminal UI started is held open after the
+// agent says it ended, for its last updates over ACP.
+const TERMINAL_TURN_SETTLE_MS = 500;
+// Between a prompt pasted into a terminal UI and its Enter.
+const PASTE_ENTER_MS = 150;
 // ACP steering: a message for the turn the agent is working on (Claude Code, Codex).
 const STEER_METHOD = '_session/steering';
 
@@ -440,6 +447,10 @@ export async function startBridge(options) {
     // `codeflower-show` reaches the bridge here; a local path, as sockets on
     // network filesystems do not work.
     showSocket = join(tmpdir(), `codeflower-show-${instanceId}.sock`),
+    // Claude Code's hooks in its terminal UI reach the bridge here
+    // (codeflower-hook), while a chat is handed over to it.
+    hookSocket = join(tmpdir(), `codeflower-hook-${instanceId}.sock`),
+    hookCommand = '/opt/codeflower/bin/codeflower-hook',
     // The project state: only its workspace may be shown or read.
     privateDirectory = sessionsDirectory ? dirname(sessionsDirectory) : undefined,
     // Read-write mounts (/data/output/NAME, /data/code/NAME), where reports may also take comments.
@@ -508,6 +519,13 @@ export async function startBridge(options) {
   const broadcast = (message) => {
     for (const target of clients) target.send(message);
   };
+  // The agent's own terminal UI on chats (`codeflower attach`): one per chat at
+  // most, kept while no window watches it. Every window hears what runs where.
+  const chatTerminals = createChatTerminals({
+    ptyHelper,
+    log,
+    onChange: () => broadcast({ jsonrpc: '2.0', method: '_codeflower/terminal/changed', params: { terminals: chatTerminals.list() } })
+  });
   // The windows list the plugins again (_codeflower/plugins/list).
   const stopPluginNotices = plugins?.onChange?.(() =>
     broadcast({ jsonrpc: '2.0', method: '_codeflower/plugins/changed', params: {} })
@@ -518,7 +536,8 @@ export async function startBridge(options) {
       if (target !== except && target.sessions.has(sessionId)) target.send(message);
     }
   };
-  const newestClient = () => [...clients].at(-1);
+  // The newest window with chats (`codeflower attach` has only terminals).
+  const newestClient = () => [...clients].filter((target) => target.acp).at(-1);
   const closeClients = (host, code, reason) => {
     for (const target of clients) if (!host || target.agent === host) target.close(code, reason);
   };
@@ -672,7 +691,12 @@ export async function startBridge(options) {
   // This agent's recorded sessions, as _codeflower/sessions/list and GET /sessions list them.
   const ownSessions = async () => {
     const sessions = sessionsDirectory ? await listSessions(sessionsDirectory) : [];
-    return sessions.filter((session) => session.harness === agentName);
+    return sessions
+      .filter((session) => session.harness === agentName)
+      .map((session) => {
+        const terminal = chatTerminals.byKey(session.key);
+        return terminal ? { ...session, terminal: chatTerminals.describe(terminal) } : session;
+      });
   };
 
   const bearer = (request) => {
@@ -865,6 +889,9 @@ export async function startBridge(options) {
     // dsh's usage plugin reports token counts on a pipe of their own.
     const usageFd = agent.usageFd;
     const pluginEnvironment = (await plugins?.activate()) ?? {};
+    // A process the agent works with, started first and ended with it:
+    // Codex's shared app-server, which its terminal UI joins too.
+    const companion = await startCompanion(pluginEnvironment);
     const child = spawn(command[0], command.slice(1), {
       env: agentEnvironment(environment, {
         ...agent.env,
@@ -896,9 +923,24 @@ export async function startBridge(options) {
       // that sent the latest one.
       prompts: new Map(),
       prompters: new Map(),
+      // Per session: prompts the bridge sent whose user message the agent's
+      // own events (watch) have not reported yet; any other is the terminal's.
+      ownPrompts: new Map(),
+      // Per session: the activity key of a turn the terminal UI started.
+      terminalTurns: new Map(),
+      // Chats handed over to the agent's own terminal UI (Claude Code), by
+      // session: the adapter let go of them, and the bridge follows the
+      // terminal (handOver).
+      handoffs: new Map(),
       retiring: false,
       withoutKeys
     };
+    // The agent's own events, for what ACP leaves out of turns its terminal
+    // UI starts (OpenCode).
+    // Codex's follows the chats a terminal UI has (follow).
+    const watcher = agent.watch?.({ log, emit: (event) => fromBackend(started, event) });
+    started.watcher = typeof watcher === 'function' ? { stop: watcher } : watcher;
+    started.stopWatching = started.watcher ? () => started.watcher.stop() : undefined;
     let stdoutBuffer = '';
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (chunk) => {
@@ -954,6 +996,8 @@ export async function startBridge(options) {
       closeClients(started, 1011, 'Could not write to agent');
     });
     child.once('close', (code, signal) => {
+      started.stopWatching?.();
+      if (companion && companion.exitCode === null && companion.signalCode === null) companion.kill('SIGTERM');
       if (stdoutBuffer.trim()) log('ACP child exited with an incomplete stdio frame');
       if (code !== 0 && code !== null) log(`${agentName} exited with status ${code}`);
       else if (signal) log(`${agentName} exited on signal ${signal}`);
@@ -970,6 +1014,26 @@ export async function startBridge(options) {
       closeClients(started, 1011, 'Agent process ended');
     });
     return started;
+  };
+
+  const startCompanion = async (pluginEnvironment) => {
+    const spec = await agent.companion?.();
+    if (!spec) return undefined;
+    const companion = spawn(spec.command[0], spec.command.slice(1), {
+      env: agentEnvironment(environment, { ...agent.env, ...pluginEnvironment }),
+      stdio: ['ignore', 'ignore', 'inherit']
+    });
+    companion.once('error', (error) => log(`Could not start ${agent.label ?? agentName}'s server: ${error.message}`));
+    companion.once('close', (code, signal) => {
+      if (!closing && code !== 0 && signal !== 'SIGTERM') log(`${agent.label ?? agentName}'s server exited (${code ?? signal})`);
+    });
+    try {
+      await spec.ready();
+    } catch (error) {
+      companion.kill('SIGTERM');
+      throw error;
+    }
+    return companion;
   };
 
   const ensureAgent = async () => {
@@ -1019,6 +1083,9 @@ export async function startBridge(options) {
     const prompt = method === 'session/prompt' && typeof sessionId === 'string';
     const send = () => {
       host.requests.set(key, request);
+      if (watched(host, sessionId) && (prompt || method === STEER_METHOD)) {
+        host.ownPrompts.set(sessionId, (host.ownPrompts.get(sessionId) ?? 0) + 1);
+      }
       if (prompt) {
         activity.turnStarted(key, sessionId);
         sessionInfo.turn(sessionId, true);
@@ -1062,6 +1129,429 @@ export async function startBridge(options) {
     for (const { cancel } of host.prompts.get(sessionId)?.splice(0) ?? []) cancel();
   };
 
+  // ---- what the agent reports itself, beside ACP ----
+
+  // The agent's own events report this chat: all of them (OpenCode), or those
+  // its watcher follows (Codex).
+  const watched = (host, sessionId) =>
+    typeof sessionId === 'string' && Boolean(host.watcher) && (!host.watcher.follows || host.watcher.follows(sessionId));
+
+  // A prompt the bridge sent showed up as a user message.
+  const ownPromptSeen = (host, sessionId) => {
+    const count = host.ownPrompts.get(sessionId) ?? 0;
+    if (count > 1) host.ownPrompts.set(sessionId, count - 1);
+    else host.ownPrompts.delete(sessionId);
+    return count > 0;
+  };
+
+  // A turn the agent's terminal UI started (OpenCode, where it shares the
+  // agent's server): ACP relays the assistant's side, the agent's own events
+  // (agent.watch) the rest. The chat's windows show it like their own turns.
+  const fromBackend = (host, event) => {
+    const sessionId = event?.sessionId;
+    if (agentHost !== host || typeof sessionId !== 'string' || !host.sessions.has(sessionId)) return;
+    switch (event.type) {
+      case 'prompt': {
+        if (ownPromptSeen(host, sessionId)) return;
+        const prompt = Array.isArray(event.prompt) ? event.prompt : [];
+        recorder?.record(sessionId, { kind: 'prompt', prompt });
+        toSession(sessionId, {
+          jsonrpc: '2.0',
+          method: '_codeflower/prompted',
+          params: { key: sessionKey(agentName, sessionId), sessionId, prompt, _meta: { 'codeflower/from': 'terminal' } }
+        });
+        return;
+      }
+      case 'busy': {
+        // A turn the bridge started is tracked by its prompt.
+        if (activity.busy(sessionId) || host.terminalTurns.has(sessionId)) return;
+        const key = `terminal-${sessionId}`;
+        host.terminalTurns.set(sessionId, key);
+        activity.turnStarted(key, sessionId);
+        sessionInfo.turn(sessionId, true);
+        // Prompts from windows wait for its end.
+        if (!host.prompts.has(sessionId)) host.prompts.set(sessionId, []);
+        return;
+      }
+      case 'idle': {
+        const key = host.terminalTurns.get(sessionId);
+        if (key === undefined) return;
+        // The agent's events come straight from its server, ahead of the
+        // turn's last updates over ACP: the turn ends after those.
+        setTimeout(() => {
+          if (host.terminalTurns.get(sessionId) !== key) return;
+          host.terminalTurns.delete(sessionId);
+          activity.turnEnded(key, 'end_turn');
+          sessionInfo.turn(sessionId, false);
+          recorder?.record(sessionId, { kind: 'turn_end', stopReason: 'end_turn' });
+          promptEnded(host, sessionId);
+        }, TERMINAL_TURN_SETTLE_MS).unref();
+        return;
+      }
+      case 'permissionReplied':
+        settleElsewhere(host, sessionId, event.toolCallId, event.reply === 'reject' ? 'reject' : event.reply === 'always' ? 'allow_always' : 'allow_once');
+        return;
+    }
+  };
+
+  // A permission the user answered elsewhere, in the agent's terminal UI: the
+  // agent gets the same answer from the bridge (and ignores it, having it
+  // already), so its own queue of requests moves on, and the windows close
+  // theirs. `kind`: allow_once, allow_always, reject.
+  const settleElsewhere = (host, sessionId, toolCallId, kind) => {
+    if (typeof toolCallId !== 'string') return;
+    for (const [key, waiting] of host.waiting) {
+      const { message } = waiting;
+      if (waiting.sessionId !== sessionId || message.method !== 'session/request_permission') continue;
+      if (message.params?.toolCall?.toolCallId !== toolCallId) continue;
+      const options = Array.isArray(message.params.options) ? message.params.options : [];
+      const allow = kind.startsWith('allow');
+      const option =
+        options.find((candidate) => candidate?.kind === kind) ??
+        options.find((candidate) => typeof candidate?.kind === 'string' && candidate.kind.startsWith(allow ? 'allow' : 'reject'));
+      const result = option
+        ? { outcome: { outcome: 'selected', optionId: option.optionId } }
+        : { outcome: { outcome: 'cancelled' } };
+      settleWaiting(host, key, result);
+      writeToAgent(host, { jsonrpc: '2.0', id: message.id, result });
+    }
+  };
+
+  // ---- chats in the agent's terminal UI ----
+
+  const ensureInitialized = async (host) => {
+    if (host.initialized) {
+      const result = await host.initialized;
+      if (!result) throw new Error('The agent could not be initialized');
+      return result;
+    }
+    return requestAgent(host, 'initialize', {
+      protocolVersion: 1,
+      clientCapabilities: {
+        fs: { readTextFile: false, writeTextFile: false },
+        terminal: false,
+        auth: { terminal: true },
+        elicitation: { url: {}, form: {} },
+        _meta: { 'terminal-auth': true }
+      },
+      clientInfo: { name: 'codeflower-vscode', title: 'code flower', version: '0.0.0' }
+    });
+  };
+
+  // Loads a recorded chat into the agent, as a window does (ui's acp.ts):
+  // resume where the agent offers it, else load.
+  const openSession = async (host, sessionId, cwd) => {
+    if (host.sessions.has(sessionId)) return;
+    const holder = await store?.foreignLease(sessionId);
+    if (holder) throw new InvalidRequest('The chat is open on another worker');
+    const capabilities = (await ensureInitialized(host))?.agentCapabilities ?? {};
+    const params = { sessionId, cwd, mcpServers: [] };
+    const resume = Boolean(capabilities.sessionCapabilities?.resume) || !capabilities.loadSession;
+    await requestAgent(host, resume ? 'session/resume' : 'session/load', params);
+  };
+
+  // `_codeflower/terminal/start` with kind "chat": the agent's own terminal
+  // UI on a chat (sessionKey) or on a new one (new), which the window then
+  // watches. A chat that already has its terminal is attached to instead.
+  const startChatTerminal = async (params, client) => {
+    if (!agent.tuiCommand) throw new InvalidRequest(`${agent.label ?? agentName} has no terminal UI in code flower`);
+    if (!Array.isArray(ptyHelper) || ptyHelper.length === 0) throw new InvalidRequest('This worker cannot open terminals');
+    const size = terminalSize(params);
+    const watch = params.watch === true;
+    const attached = (terminal) => {
+      rememberLinkBase(terminal, params.linkBase);
+      chatTerminals.attach(terminal, client, { size, watch });
+      return { terminalId: terminal.id, sessionKey: terminal.key, sessionId: terminal.sessionId };
+    };
+    if (!params.new) {
+      const running = typeof params.sessionKey === 'string' ? chatTerminals.byKey(params.sessionKey) : undefined;
+      if (running) return attached(running);
+    }
+    const host = await ensureAgent();
+    await ensureInitialized(host);
+    let sessionId;
+    let cwd = workspace;
+    if (params.new) {
+      const session = await requestAgent(host, 'session/new', { cwd, mcpServers: [] });
+      sessionId = session?.sessionId;
+      if (typeof sessionId !== 'string') throw new Error('The agent did not return a session id');
+    } else {
+      if (typeof params.sessionKey !== 'string' || !params.sessionKey.startsWith(`${agentName}-`)) {
+        throw new InvalidRequest('Invalid session key');
+      }
+      const saved = (await ownSessions()).find((session) => session.key === params.sessionKey);
+      if (!saved) throw new InvalidRequest('This worker has no such chat');
+      sessionId = saved.nativeSessionId;
+      cwd = saved.cwd ?? workspace;
+      await openSession(host, sessionId, cwd);
+    }
+    const key = sessionKey(agentName, sessionId);
+    // Another window may have started it meanwhile.
+    const running = chatTerminals.byKey(key);
+    if (running) return attached(running);
+    if (agent.handoff) return attached(await handOver(host, sessionId, key, cwd, size, client));
+    // Its turns typed in the terminal reach the windows (Codex follows a chat
+    // on request); prompts sent before are not reported.
+    if (host.watcher?.follow && !host.watcher.follows(sessionId)) {
+      host.watcher.follow(sessionId);
+      host.ownPrompts.delete(sessionId);
+    }
+    const command = await agent.tuiCommand({ sessionId, cwd });
+    const terminal = chatTerminals.start({
+      key,
+      sessionId,
+      command,
+      env: agentEnvironment(environment, agent.env),
+      cwd,
+      size
+    });
+    return attached(terminal);
+  };
+
+  // ---- chats handed over to the agent's terminal UI (Claude Code) ----
+
+  // Claude Code cannot share a live session with its adapter: the chat is
+  // handed over. The adapter lets go of it (session/close) once its turn is
+  // over, Claude Code's terminal UI resumes it, and the bridge follows the
+  // terminal: hooks mark the turns, the transcript gives their content, and
+  // the windows show it all as before. Prompts from windows are typed into the
+  // terminal between turns; permissions are answered there. When the terminal
+  // UI quits, the adapter resumes the chat with everything in it.
+  const handOver = async (host, sessionId, key, cwd, size, client) => {
+    while (activity.busy(sessionId)) {
+      if (!clients.has(client) || closing) throw new InvalidRequest('Gone while the chat was working');
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    const state = host.sessions.get(sessionId) ?? {};
+    const handoff = { sessionId, key, cwd, busy: false, injected: 0, queue: [], current: undefined, turns: 0 };
+    host.handoffs.set(sessionId, handoff);
+    try {
+      await requestAgent(host, 'session/close', { sessionId });
+      handoff.tail = await tailTranscript(transcriptPath(agent.home ?? '', cwd, sessionId), (update) => mirror(host, sessionId, update), { log });
+      await agent.prepareTui?.({ cwd });
+      const mode = state.modes?.currentModeId;
+      const mcpConfig = await writeMcpConfig(host, key);
+      const command = await agent.tuiCommand({
+        sessionId,
+        cwd,
+        mode,
+        mcpConfig,
+        settings: hookSettings(hookCommand, agent.tuiSettings)
+      });
+      const terminal = chatTerminals.start({
+        key,
+        sessionId,
+        command,
+        env: agentEnvironment(environment, {
+          ...agent.env,
+          ...agent.tuiEnv,
+          CODEFLOWER_HOOK_SOCKET: hookSocket,
+          CODEFLOWER_HOOK_CHAT: sessionId
+        }),
+        cwd,
+        size,
+        mode: 'handoff'
+      });
+      handoff.terminal = terminal;
+      terminal.onExit = () => {
+        // Prompts from now on wait for the adapter, not for this terminal.
+        handoff.terminal = undefined;
+        void handBack(host, sessionId).catch((error) => log(`Could not take back ${key}: ${error.message}`));
+      };
+      log(`${key} is handed over to ${agent.label ?? agentName}'s terminal UI`);
+      return terminal;
+    } catch (error) {
+      await handBack(host, sessionId).catch(() => {});
+      throw error;
+    }
+  };
+
+  // The terminal UI quit (or went to another chat): the adapter takes the
+  // chat back, and prompts the windows sent meanwhile go to it.
+  const handBack = async (host, sessionId) => {
+    const handoff = host.handoffs.get(sessionId);
+    if (!handoff) return;
+    await handoff.tail?.stop();
+    host.handoffs.delete(sessionId);
+    if (handoff.busy) endTerminalTurn(handoff, 'cancelled');
+    handoff.current?.client?.send({ jsonrpc: '2.0', id: handoff.current.id, result: { stopReason: 'cancelled' } });
+    if (agentHost !== host || !childRunning(host.child) || closing) return;
+    log(`${handoff.key} is back from the terminal UI`);
+    await requestAgent(host, 'session/resume', { sessionId, cwd: handoff.cwd, mcpServers: [] });
+    for (const queued of handoff.queue) {
+      if (!queued.client || !clients.has(queued.client)) continue;
+      const bridgeId = `cf-${host.nextRequest++}`;
+      sendRequest(host, {
+        client: queued.client,
+        id: queued.id,
+        bridgeId,
+        key: requestKey(bridgeId),
+        method: 'session/prompt',
+        params: { sessionId, prompt: queued.prompt }
+      });
+    }
+  };
+
+  // An update of the terminal's chat, from its transcript: recorded and sent
+  // to the chat's windows as if the adapter had sent it.
+  const mirror = (host, sessionId, update) => {
+    if (!host.handoffs.has(sessionId)) return;
+    recorder?.record(sessionId, { kind: 'update', update });
+    if (update.sessionUpdate === 'tool_call') activity.toolCall(sessionId, update);
+    toSession(sessionId, { jsonrpc: '2.0', method: 'session/update', params: { sessionId, update } });
+  };
+
+  const endTerminalTurn = (handoff, stopReason) => {
+    handoff.busy = false;
+    if (handoff.permission) activity.answered(handoff.permission);
+    handoff.permission = undefined;
+    activity.turnEnded(handoff.turnKey, stopReason);
+    sessionInfo.turn(handoff.sessionId, false);
+    recorder?.record(handoff.sessionId, { kind: 'turn_end', stopReason });
+  };
+
+  // Types the next prompt a window sent into the terminal UI, once it is
+  // between turns: as a bracketed paste, then Enter.
+  const typeNext = (handoff) => {
+    if (handoff.busy || handoff.current || !handoff.terminal) return;
+    const next = handoff.queue.shift();
+    if (!next) return;
+    handoff.current = next;
+    handoff.injected += 1;
+    const text = next.prompt.map((block) => block.text).join('\n\n');
+    recorder?.record(handoff.sessionId, { kind: 'prompt', prompt: next.prompt });
+    toSession(handoff.sessionId, {
+      jsonrpc: '2.0',
+      method: '_codeflower/prompted',
+      params: { key: handoff.key, sessionId: handoff.sessionId, prompt: next.prompt }
+    });
+    chatTerminals.write(handoff.terminal, `\x1b[200~${text}\x1b[201~`);
+    setTimeout(() => handoff.terminal && chatTerminals.write(handoff.terminal, '\r'), PASTE_ENTER_MS).unref();
+  };
+
+  // A window's prompt for a chat in the terminal UI: text only, typed there.
+  const promptHandedOver = (host, handoff, client, message) => {
+    const prompt = Array.isArray(message.params?.prompt) ? message.params.prompt : [];
+    if (!prompt.length || prompt.some((block) => block?.type !== 'text' || typeof block.text !== 'string')) {
+      client.send({
+        jsonrpc: '2.0',
+        id: message.id,
+        error: { code: -32602, message: `The chat is open in ${agent.label ?? agentName}'s terminal UI, which takes text only; quit it there to send files` }
+      });
+      return;
+    }
+    handoff.queue.push({ client, id: message.id, prompt });
+    typeNext(handoff);
+  };
+
+  // Claude Code's hooks (codeflower-hook), for the chat its terminal UI has.
+  const fromHook = (event) => {
+    const host = agentHost;
+    const handoff = host?.handoffs.get(event?.codeflower_chat);
+    if (!handoff || handoff.left) return;
+    const { sessionId } = handoff;
+    switch (event.hook_event_name) {
+      case 'SessionStart':
+        // Another session in the same terminal (/resume, /clear): the chat
+        // goes back to the windows, the terminal stays with the other one.
+        if (event.session_id !== sessionId) {
+          handoff.left = true;
+          chatTerminals.notify(handoff.terminal, '_codeflower/terminal/left', { sessionKey: handoff.key });
+          void handBack(host, sessionId).catch((error) => log(`Could not take back ${handoff.key}: ${error.message}`));
+        }
+        return;
+      case 'UserPromptSubmit': {
+        if (handoff.injected > 0) {
+          handoff.injected -= 1;
+        } else if (typeof event.prompt === 'string') {
+          const prompt = [{ type: 'text', text: event.prompt }];
+          recorder?.record(sessionId, { kind: 'prompt', prompt });
+          toSession(sessionId, {
+            jsonrpc: '2.0',
+            method: '_codeflower/prompted',
+            params: { key: handoff.key, sessionId, prompt, _meta: { 'codeflower/from': 'terminal' } }
+          });
+        }
+        if (!handoff.busy) {
+          handoff.busy = true;
+          handoff.turnKey = `terminal-${sessionId}-${++handoff.turns}`;
+          activity.turnStarted(handoff.turnKey, sessionId);
+          sessionInfo.turn(sessionId, true);
+        }
+        return;
+      }
+      case 'PermissionRequest':
+        // Answered in the terminal; the windows see the chat waits.
+        handoff.permission = `terminal-permission-${sessionId}`;
+        activity.permission(handoff.permission, sessionId, { kind: event.tool_name === 'ExitPlanMode' ? 'switch_mode' : 'other' });
+        return;
+      case 'PostToolUse':
+      case 'PostToolUseFailure':
+        if (handoff.permission) activity.answered(handoff.permission);
+        handoff.permission = undefined;
+        return;
+      case 'Stop':
+      case 'StopFailure':
+        // Claude Code writes the turn's last lines just after the hook: the
+        // turn ends once they are in, unless another started meanwhile.
+        {
+          const turn = handoff.turns;
+          void new Promise((resolve) => setTimeout(resolve, TERMINAL_TURN_SETTLE_MS).unref())
+            .then(() => handoff.tail?.flush())
+            .then(() => {
+              if (!handoff.busy || handoff.turns !== turn) return;
+              endTerminalTurn(handoff, event.hook_event_name === 'Stop' ? 'end_turn' : 'error');
+              const answered = handoff.current;
+              handoff.current = undefined;
+              answered?.client?.send({ jsonrpc: '2.0', id: answered.id, result: { stopReason: 'end_turn' } });
+              answered?.done?.();
+              typeNext(handoff);
+            });
+        }
+        return;
+    }
+  };
+
+  // The configured MCP servers in Claude Code's own form (--mcp-config), as
+  // the adapter gives them to its sessions.
+  const writeMcpConfig = async (host, key) => {
+    const servers = host.mcpServers ?? [];
+    if (!servers.length) return undefined;
+    const file = join(tmpdir(), `codeflower-mcp-${instanceId}-${key}.json`);
+    await writeFile(file, `${JSON.stringify(claudeMcpConfig(servers))}\n`, { mode: 0o600 });
+    return file;
+  };
+
+  // ---- links to what the agent shows, for terminals ----
+
+  // Where the user's browser opens a file of this worker, as `codeflower
+  // attach` found it: the app's page with the sandbox's file route, e.g.
+  // http://127.0.0.1:7720/#/file/local-1a2b3c4d/, to which the bridge adds
+  // the file's path. Per chat terminal, and the latest for the worker.
+  let latestLinkBase;
+  const rememberLinkBase = (terminal, linkBase) => {
+    if (typeof linkBase !== 'string' || linkBase.length > 2000 || !/^https?:\/\//.test(linkBase)) return;
+    terminal.linkBase = linkBase;
+    latestLinkBase = linkBase;
+  };
+
+  // The chat a show is for: the only one working (the agent calls
+  // codeflower-show in a turn), if exactly one is.
+  const showingChat = () => {
+    const working = activity.snapshot().chats.filter((chat) => chat.state === 'working');
+    return working.length === 1 ? sessionKey(agentName, working[0].sessionId) : undefined;
+  };
+
+  // Links that open the files in the user's browser, none without a base.
+  // They hold no secret: the agent sees them in its tool's output.
+  const fileLinks = (files) => {
+    const chat = showingChat();
+    const base = (chat && chatTerminals.byKey(chat)?.linkBase) || latestLinkBase;
+    if (!base) return [];
+    const query = chat ? `?chat=${encodeURIComponent(chat)}` : '';
+    return files.map((file) => ({ path: file.path, url: `${base}${encodeURIComponent(file.path)}${query}` }));
+  };
+
   // A run's prompt waits until the agent is signed in, which a window does,
   // and, for keys, until the agent started without them is restarted.
   const startInitialSession = async () => {
@@ -1072,21 +1562,7 @@ export async function startBridge(options) {
     }
     if (closing) return;
     const host = await ensureAgent();
-    if (host.initialized) {
-      if (!(await host.initialized)) throw new Error('The agent could not be initialized');
-    } else {
-      await requestAgent(host, 'initialize', {
-        protocolVersion: 1,
-        clientCapabilities: {
-          fs: { readTextFile: false, writeTextFile: false },
-          terminal: false,
-          auth: { terminal: true },
-          elicitation: { url: {}, form: {} },
-          _meta: { 'terminal-auth': true }
-        },
-        clientInfo: { name: 'codeflower-vscode', title: 'code flower', version: '0.0.0' }
-      });
-    }
+    await ensureInitialized(host);
     const session = await requestAgent(host, 'session/new', { cwd: workspace, mcpServers: [] });
     if (typeof session?.sessionId !== 'string') {
       throw new Error('The agent did not return a session id');
@@ -1155,6 +1631,8 @@ export async function startBridge(options) {
   };
 
   const wrapUpChat = async (host, sessionId, notice, template) => {
+    const handoff = host.handoffs.get(sessionId);
+    if (handoff) return wrapUpInTerminal(handoff, notice, template);
     // As a client cancels: the turn, then the requests it waits on.
     dropPrompts(host, sessionId);
     writeToAgent(host, { jsonrpc: '2.0', method: 'session/cancel', params: { sessionId } });
@@ -1181,6 +1659,27 @@ export async function startBridge(options) {
     await requestAgent(host, 'session/prompt', { sessionId, prompt: [{ type: 'text', text }] }).catch((error) =>
       log(`A chat could not wrap up: ${error.message}`)
     );
+  };
+
+  // A chat the terminal UI has wraps up there: Esc stops its turn, and the
+  // wrap-up is typed in, as a window's prompt would be.
+  const wrapUpInTerminal = async (handoff, notice, template) => {
+    for (const queued of handoff.queue.splice(0)) {
+      queued.client?.send({ jsonrpc: '2.0', id: queued.id, result: { stopReason: 'cancelled' } });
+    }
+    if (handoff.terminal) chatTerminals.write(handoff.terminal, '\x1b');
+    const deadline = Date.now() + WRAP_UP_CANCEL_MS;
+    while (handoff.busy && Date.now() < deadline && !closing) await new Promise((resolve) => setTimeout(resolve, 200));
+    if (closing || handoff.busy) {
+      if (handoff.busy) log(`A chat did not stop within ${WRAP_UP_CANCEL_MS / 1000} s; it was not asked to wrap up`);
+      return;
+    }
+    const text = template.replace(/\{\{(\w+)\}\}/g, (placeholder, name) => String(notice[name] ?? placeholder)).trim();
+    broadcast({ jsonrpc: '2.0', method: '_codeflower/wrapUp', params: { ...notice, key: handoff.key, prompt: text } });
+    await new Promise((done) => {
+      handoff.queue.push({ prompt: [{ type: 'text', text }], done });
+      typeNext(handoff);
+    });
   };
 
   // A permission request or question goes to each window once, after it has
@@ -1311,6 +1810,17 @@ export async function startBridge(options) {
         );
         if (clients.has(request.client)) void attachSession(host, request.client, request.id, sessionId, result);
         return true;
+      // The agent let go of the chat: the next window or terminal to open it
+      // loads it again, instead of attaching to what the agent no longer has.
+      case 'session/close':
+        // Handed over to the terminal UI: the windows keep the chat open,
+        // and the bridge its settings and record, until it comes back.
+        if (host.handoffs.has(sessionId)) break;
+        host.sessions.delete(sessionId);
+        host.mcpFailed.delete(sessionId);
+        for (const target of clients) target.sessions.delete(sessionId);
+        void recorder?.close(sessionId);
+        break;
       // The other windows with the chat open follow a change of settings.
       case 'session/set_config_option':
         if (state && Array.isArray(result.configOptions)) {
@@ -1350,6 +1860,7 @@ export async function startBridge(options) {
       else request.resolve?.(message.result);
       // A message the turn took in shows in every window, as a prompt does.
       const steered = request.method === STEER_METHOD && message.result?.outcome === 'injected';
+      if (request.method === STEER_METHOD && !steered) ownPromptSeen(host, request.params?.sessionId);
       if (steered) {
         const sessionId = request.params.sessionId;
         toSession(sessionId, {
@@ -1381,6 +1892,11 @@ export async function startBridge(options) {
       trackSettings(host, sessionId, update);
       if (update?.sessionUpdate === 'tool_call') activity.toolCall(sessionId, update);
       if (update?.sessionUpdate === 'usage_update' && sessionId !== undefined) usage.update(sessionId, update);
+      // A tool that ran (or failed) while its permission still waited here
+      // was answered elsewhere, in the agent's terminal UI.
+      if (update?.sessionUpdate === 'tool_call_update' && (update.status === 'completed' || update.status === 'failed')) {
+        settleElsewhere(host, sessionId, update.toolCallId, update.status === 'completed' ? 'allow_once' : 'reject');
+      }
       if (sessionId === undefined) return;
       for (const target of clients) if (target.sessions.has(sessionId)) target.sendFrame(frame);
       return;
@@ -1556,6 +2072,8 @@ export async function startBridge(options) {
       released = true;
       for (const terminal of self.terminals.values()) terminal.kill('SIGTERM');
       self.terminals.clear();
+      // The chats' terminals keep running without it.
+      chatTerminals.detachClient(self);
       void uploads.release(self);
       void downloads.release(self);
       clients.delete(self);
@@ -1598,6 +2116,17 @@ export async function startBridge(options) {
         return;
       }
       if (message.id === undefined) {
+        // Stop in a chat the terminal UI has: Esc there, and the prompts typed
+        // next are dropped.
+        const handoff = host.handoffs.get(message.params?.sessionId);
+        if (handoff && message.method === 'session/cancel') {
+          for (const queued of handoff.queue.splice(0)) {
+            queued.client?.send({ jsonrpc: '2.0', id: queued.id, result: { stopReason: 'cancelled' } });
+          }
+          if (handoff.terminal) chatTerminals.write(handoff.terminal, '\x1b');
+          return;
+        }
+        if (handoff) return;
         // Stop also cancels the chat's prompts still waiting for the turn.
         if (message.method === 'session/cancel' && typeof message.params?.sessionId === 'string') {
           dropPrompts(host, message.params.sessionId);
@@ -1611,6 +2140,8 @@ export async function startBridge(options) {
         const info = protocolObject(message.params?.clientInfo) ? message.params.clientInfo : {};
         const name = [info.name, info.version].filter((part) => typeof part === 'string').join(' ');
         if (name) log(`Client ${self.id} is ${name.slice(0, 200)}`);
+        // A window with chats; `codeflower attach` speaks only the control methods.
+        self.acp = true;
       }
       if (message.method === 'initialize' && host.initialized) {
         const result = await host.initialized;
@@ -1627,6 +2158,20 @@ export async function startBridge(options) {
       ) {
         // Still loaded in this agent: reattach instead of loading it again.
         await attachSession(host, self, message.id, sessionId, host.sessions.get(sessionId));
+        return;
+      }
+      // A chat the terminal UI has: prompts are typed there, nothing else goes.
+      const handoff = host.handoffs.get(sessionId);
+      if (handoff) {
+        if (message.method === 'session/prompt') {
+          promptHandedOver(host, handoff, self, message);
+        } else {
+          self.send({
+            jsonrpc: '2.0',
+            id: message.id,
+            error: { code: -32602, message: `The chat is open in ${agent.label ?? agentName}'s terminal UI: change it there, or quit it (~q) to go on here` }
+          });
+        }
         return;
       }
       if (recorder) {
@@ -1807,7 +2352,11 @@ export async function startBridge(options) {
               ...(agent.presentation ? { agentInfo: agent.presentation } : {}),
               signedIn: agent.signedIn ? await agent.signedIn() : true,
               credentials: agent.setCredentials ? 'keys' : 'agent',
-              capabilities: { plugins: Boolean(plugins?.available) },
+              capabilities: {
+                plugins: Boolean(plugins?.available),
+                // The agent's own terminal UI on chats (`_codeflower/terminal/start` kind "chat").
+                chatTerminals: Boolean(agent.tuiCommand && Array.isArray(ptyHelper) && ptyHelper.length)
+              },
               ...(slurmJobId ? { slurmJobId } : {})
             });
             break;
@@ -1862,21 +2411,56 @@ export async function startBridge(options) {
             break;
           }
           case '_codeflower/terminal/start':
-            respond(await startTerminal(params));
+            respond(params.kind === 'chat' ? await startChatTerminal(params, self) : await startTerminal(params));
             break;
           case '_codeflower/terminal/input': {
-            const terminal = self.terminals.get(params.terminalId);
-            if (!terminal) throw new InvalidRequest('Unknown terminal');
             if (typeof params.data !== 'string' || params.data.length > MAX_TERMINAL_INPUT) {
               throw new InvalidRequest('Terminal input must be a string');
             }
-            terminal.stdin.write(params.data);
+            const terminal = self.terminals.get(params.terminalId);
+            if (terminal) {
+              terminal.stdin.write(params.data);
+            } else {
+              const chat = chatTerminals.byId(params.terminalId);
+              if (!chat) throw new InvalidRequest('Unknown terminal');
+              chatTerminals.input(chat, self, params.data);
+            }
             respond({});
             break;
           }
           case '_codeflower/terminal/close':
-            self.terminals.get(params.terminalId)?.kill('SIGTERM');
+            if (self.terminals.has(params.terminalId)) {
+              self.terminals.get(params.terminalId).kill('SIGTERM');
+            } else {
+              const chat = chatTerminals.byId(params.terminalId);
+              if (chat) await chatTerminals.close(chat);
+            }
             respond({});
+            break;
+          // A chat's terminal: watch it (again), follow the window's size, stop watching.
+          case '_codeflower/terminal/attach': {
+            const chat = chatTerminals.byId(params.terminalId);
+            if (!chat) throw new InvalidRequest('Unknown terminal');
+            rememberLinkBase(chat, params.linkBase);
+            chatTerminals.attach(chat, self, { size: terminalSize(params), watch: params.watch === true });
+            respond({ terminalId: chat.id, sessionKey: chat.key, sessionId: chat.sessionId });
+            break;
+          }
+          case '_codeflower/terminal/resize': {
+            const chat = chatTerminals.byId(params.terminalId);
+            if (!chat) throw new InvalidRequest('Unknown terminal');
+            chatTerminals.resize(chat, self, terminalSize(params, chat));
+            respond({});
+            break;
+          }
+          case '_codeflower/terminal/detach': {
+            const chat = chatTerminals.byId(params.terminalId);
+            if (chat) chatTerminals.detach(chat, self);
+            respond({});
+            break;
+          }
+          case '_codeflower/terminal/list':
+            respond({ terminals: chatTerminals.list() });
             break;
           case '_codeflower/shell/run':
             // Answered when the command ends; other requests keep flowing meanwhile.
@@ -2102,22 +2686,45 @@ export async function startBridge(options) {
       const cwd = typeof request.cwd === 'string' ? request.cwd : workspace;
       const files = [];
       for (const path of paths.slice(0, 20)) files.push(await resolveFile(path, { ...fileOptions, cwd }));
-      // One window opens them: the one that sent the latest prompt, else the newest.
-      const target = clients.has(lastPrompter) ? lastPrompter : newestClient();
-      if (!target) return { error: 'No window is connected to this worker, so nobody can see the files now' };
-      target.send({
-        jsonrpc: '2.0',
-        method: '_codeflower/show',
-        params: {
-          files,
+      // Links for the user's browser, from a terminal attached here
+      // (`codeflower attach`): the agent's tool prints them, which its
+      // terminal UI shows. `codeflower-open` asks for the links only.
+      const links = fileLinks(files);
+      if (request.linkOnly === true) {
+        if (!links.length) return { error: 'No terminal with links is attached to this worker (codeflower attach); the files are in the sandbox' };
+        return { links };
+      }
+      if (links.length) {
+        chatTerminals.notifyViewers('_codeflower/terminal/show', {
+          files: links,
           ...(typeof request.title === 'string' ? { title: request.title.slice(0, 200) } : {}),
           ...(typeof request.message === 'string' ? { message: request.message.slice(0, 2000) } : {})
-        }
-      });
-      return { shown: files.map((file) => file.path) };
+        });
+      }
+      // One window opens them: the one that sent the latest prompt, else the newest.
+      const target = clients.has(lastPrompter) ? lastPrompter : newestClient();
+      if (!target) {
+        if (links.length) return { shown: [], links };
+        return { error: 'No window is connected to this worker, so nobody can see the files now' };
+      }
+      sendShow(target, files, request);
+      return { shown: files.map((file) => file.path), ...(links.length ? { links } : {}) };
     });
   } catch (error) {
     log(`codeflower-show is unavailable: ${error.message}`);
+  }
+
+  // Claude Code's hooks, for chats handed over to its terminal UI.
+  let hookServer;
+  if (agent.handoff) {
+    try {
+      hookServer = await startShowServer(hookSocket, async (event) => {
+        fromHook(event);
+        return {};
+      });
+    } catch (error) {
+      log(`The terminal UI's hooks are unavailable: ${error.message}`);
+    }
   }
 
   const address = listenSocket ? { port } : server.address();
@@ -2177,6 +2784,7 @@ export async function startBridge(options) {
       await limitsReading;
       closeClients(undefined, 1001, 'Server shutting down');
       for (const shell of shells.values()) shell.stop();
+      await chatTerminals.closeAll();
       const host = agentHost ?? (await agentStarting?.catch(() => undefined));
       if (host) {
         endChild(host.child);
@@ -2186,6 +2794,7 @@ export async function startBridge(options) {
       await new Promise((resolve) => server.close(resolve));
       sockets.close();
       await showServer?.close();
+      await hookServer?.close();
       await uploads.close();
       await downloads.close();
       await unlink(connectionFile).catch((error) => {
