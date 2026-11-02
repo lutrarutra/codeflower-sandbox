@@ -39,6 +39,10 @@ export default function opencode({ descriptor, home, launch, nodePath }) {
     async soloCommand({ resume }) {
       return run(...(resume === 'last' ? ['--continue'] : resume && resume !== 'pick' ? ['--session', resume] : []));
     },
+    // The chat its terminal UI changed last, in its database.
+    async lastSession({ cwd, since }) {
+      return home ? latestSession(join(home, DATABASE), cwd, since) : undefined;
+    },
     // What ACP leaves out of turns started in the terminal UI: the user's
     // message, busy and idle, and permissions answered there (events.js).
     watch({ emit, log }) {
@@ -82,6 +86,24 @@ async function storedCredential(file) {
   } catch {
     // Not migrated yet, or a schema of another version: no login to go by.
     return false;
+  }
+}
+
+async function latestSession(file, cwd, since) {
+  if (!(await exists(file))) return undefined;
+  const { DatabaseSync } = await importSqlite();
+  try {
+    const database = new DatabaseSync(file, { readOnly: true });
+    try {
+      const row = database
+        .prepare('SELECT id FROM session WHERE directory = ? AND parent_id IS NULL AND time_updated >= ? ORDER BY time_updated DESC LIMIT 1')
+        .get(cwd, since);
+      return row?.id;
+    } finally {
+      database.close();
+    }
+  } catch {
+    return undefined;
   }
 }
 

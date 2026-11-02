@@ -22,7 +22,7 @@ export function parseResume(value) {
  * environment are those of the chats the bridge hands over (agent.tuiSettings,
  * agent.tuiEnv), so the UI starts at once: no first-run screens, no updates.
  */
-export async function runTui({ agentName, agent, plugins, mcpServers = [], resume, workspace, environment = process.env, log = () => {} }) {
+export async function runTui({ agentName, agent, plugins, mcpServers = [], resume, workspace, environment = process.env, log = () => {}, say = (text) => process.stdout.write(text) }) {
   const label = agent.label ?? agentName;
   if (!agent.soloCommand) throw new Error(`${label} has no terminal UI in code flower`);
   const pluginEnvironment = (await plugins?.activate()) ?? {};
@@ -35,6 +35,8 @@ export async function runTui({ agentName, agent, plugins, mcpServers = [], resum
     log(`The MCP servers from the app's config are not given to ${label}'s terminal UI; add them in its own config`);
   }
   const command = await agent.soloCommand({ resume, settings: { ...agent.tuiSettings }, mcpConfig });
+  // Session files keep whole seconds on some file systems.
+  const started = Date.now() - 2000;
   const child = spawn(command[0], command.slice(1), {
     cwd: workspace,
     stdio: 'inherit',
@@ -45,5 +47,11 @@ export async function runTui({ agentName, agent, plugins, mcpServers = [], resum
   process.on('SIGINT', () => {});
   for (const signal of ['SIGTERM', 'SIGHUP']) process.on(signal, () => child.kill(signal));
   const [code, signal] = await once(child, 'close');
+  // The agent says how to open the chat again with its own command, which
+  // the user's terminal does not have: the app gives its own (CODEFLOWER_TUI_AGAIN,
+  // up to the id).
+  const again = environment.CODEFLOWER_TUI_AGAIN;
+  const session = again && (await agent.lastSession?.({ cwd: workspace, since: started }).catch(() => undefined));
+  if (session) say(`\nContinue this chat in code flower with:\n${again}${session}\n`);
   return code ?? 128 + (constants.signals[signal] ?? 1);
 }

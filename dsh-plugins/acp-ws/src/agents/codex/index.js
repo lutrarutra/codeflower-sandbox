@@ -4,7 +4,7 @@ import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { exists, InvalidRequest, readJson, readText, writePrivate } from '../support.js';
+import { exists, InvalidRequest, newestFile, readJson, readText, writePrivate } from '../support.js';
 import { watchEvents } from './events.js';
 
 const PROXY = join(dirname(fileURLToPath(import.meta.url)), 'proxy.js');
@@ -45,6 +45,12 @@ export default function codex({ descriptor, home, nodePath, modules }) {
           ...(resume === 'last' ? ['resume', '--last'] : resume === 'pick' ? ['resume'] : resume ? ['resume', resume] : [])
         ]
       : undefined,
+    // The chat its terminal UI wrote last: sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl.
+    async lastSession({ since }) {
+      if (!home) return undefined;
+      const file = await newestFile(join(home, 'sessions'), /^rollout-.*\.jsonl$/, { since, deep: true });
+      return file?.name.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/)?.[1];
+    },
     // The user's messages typed in the terminal UI, and its turns (events.js).
     watch: codexCommand
       ? ({ emit, log }) => (socketPath ? watchEvents({ socketPath, emit, log }) : () => {})

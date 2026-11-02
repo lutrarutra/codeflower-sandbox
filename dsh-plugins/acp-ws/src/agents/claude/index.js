@@ -1,6 +1,7 @@
 // Claude Code through its ACP adapter.
-import { join } from 'node:path';
-import { exists, InvalidRequest, readJson, readText, writePrivate } from '../support.js';
+import { dirname, join } from 'node:path';
+import { exists, InvalidRequest, newestFile, readJson, readText, writePrivate } from '../support.js';
+import { transcriptPath } from './mirror.js';
 import { claudePlugins } from './plugins.js';
 
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
@@ -102,6 +103,13 @@ export default function claude({ descriptor, home, modules, environment }) {
         ...(mcpConfig ? ['--mcp-config', mcpConfig] : []),
         ...(resume === 'last' ? ['--continue'] : resume === 'pick' ? ['--resume'] : resume ? ['--resume', resume] : [])
       ];
+    },
+    // The chat its terminal UI wrote last, for `codeflower tui` to say how to
+    // open it again: its transcripts are named by session id.
+    async lastSession({ cwd, since }) {
+      if (!home) return undefined;
+      const file = await newestFile(dirname(transcriptPath(home, cwd, 'x')), /\.jsonl$/, { since });
+      return file?.name.slice(0, -'.jsonl'.length);
     },
     // It takes the config's MCP servers in its own form (mcp.js claudeMcpConfig).
     mcpConfigFile: true,

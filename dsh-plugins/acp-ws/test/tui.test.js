@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -65,4 +65,65 @@ test('opens a new chat, the last, the list, or one by id, in each agent', async 
   assert.deepEqual(await agents.opencode.soloCommand({ resume: 'pick' }), ['/m/.bin/opencode']);
   assert.deepEqual(await agents.opencode.soloCommand({ resume: 'ses_1' }), ['/m/.bin/opencode', '--session', 'ses_1']);
   assert.equal(agents.dsh.soloCommand, undefined);
+});
+
+test('says how to open the chat again with codeflower, once the terminal UI ends', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'codeflower-tui-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const said = [];
+  const asked = [];
+  const agent = {
+    soloCommand: async () => [process.execPath, '-e', 'process.exit(0)'],
+    lastSession: async (options) => (asked.push(options), 'abc-1')
+  };
+  const run = (environment) => runTui({ agentName: 'x', agent, workspace: directory, environment, say: (text) => said.push(text) });
+  assert.equal(await run({ PATH: process.env.PATH }), 0);
+  assert.deepEqual(said, []);
+  assert.equal(await run({ PATH: process.env.PATH, CODEFLOWER_TUI_AGAIN: 'codeflower --agent x tui --resume=' }), 0);
+  assert.equal(asked[0].cwd, directory);
+  assert.match(said.join(''), /\ncodeflower --agent x tui --resume=abc-1\n/);
+});
+
+test("finds the chat each agent's terminal UI wrote last", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'codeflower-tui-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const cwd = '/codeflower-state/workspace';
+  const old = new Date(Date.now() - 60_000);
+  const since = Date.now() - 10_000;
+  const registry = await loadRegistry();
+  const home = (name) => join(directory, name);
+  const agents = createAgents({
+    nodePath: 'node',
+    modules: '/m',
+    environment: { CLAUDE_CONFIG_DIR: home('claude'), CODEX_HOME: home('codex'), OPENCODE_CONFIG_DIR: home('opencode') },
+    agents: registry
+  });
+
+  const transcripts = join(home('claude'), 'projects', '-codeflower-state-workspace');
+  await mkdir(transcripts, { recursive: true });
+  await writeFile(join(transcripts, 'old-1.jsonl'), '{}\n');
+  await utimes(join(transcripts, 'old-1.jsonl'), old, old);
+  assert.equal(await agents.claude.lastSession({ cwd, since }), undefined);
+  await writeFile(join(transcripts, 'new-2.jsonl'), '{}\n');
+  assert.equal(await agents.claude.lastSession({ cwd, since }), 'new-2');
+
+  const day = join(home('codex'), 'sessions', '2026', '11', '02');
+  await mkdir(day, { recursive: true });
+  const id = '019a4b2c-1d2e-7f30-8a41-b2c3d4e5f607';
+  await writeFile(join(day, `rollout-2026-11-02T20-29-00-${id}.jsonl`), '{}\n');
+  assert.equal(await agents.codex.lastSession({ cwd, since }), id);
+
+  if (agents.opencode.lastSession && (await import('node:sqlite').catch(() => undefined))) {
+    const { DatabaseSync } = await import('node:sqlite');
+    await mkdir(home('opencode'), { recursive: true });
+    const database = new DatabaseSync(join(home('opencode'), 'opencode.db'));
+    database.exec('CREATE TABLE session (id text PRIMARY KEY, parent_id text, directory text NOT NULL, time_updated integer NOT NULL)');
+    const add = database.prepare('INSERT INTO session VALUES (?, ?, ?, ?)');
+    add.run('ses_old', null, cwd, since - 1);
+    add.run('ses_main', null, cwd, since + 1);
+    add.run('ses_sub', 'ses_main', cwd, since + 2);
+    add.run('ses_other', null, '/elsewhere', since + 3);
+    database.close();
+    assert.equal(await agents.opencode.lastSession({ cwd, since }), 'ses_main');
+  }
 });

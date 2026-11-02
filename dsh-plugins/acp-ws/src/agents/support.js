@@ -1,7 +1,7 @@
 // Helpers for agents' hooks: reading and writing the files in their homes.
-import { access, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { access, mkdir, readdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 
 export class InvalidRequest extends Error {
   /** `data` goes to the client with the error, e.g. `{ conflict: true }`. */
@@ -62,4 +62,23 @@ export function requireString(value, label) {
     throw new InvalidRequest(`${label} is required`);
   }
   return value.trim();
+}
+
+// The file under `folder` (and its subfolders, with `deep`) whose name matches
+// `pattern` and that changed last, after `since` (ms); undefined if none did.
+export async function newestFile(folder, pattern, { since = 0, deep = false } = {}) {
+  let entries;
+  try {
+    entries = await readdir(folder, { recursive: deep, withFileTypes: true });
+  } catch {
+    return undefined;
+  }
+  let newest;
+  for (const entry of entries) {
+    if (!entry.isFile() || !pattern.test(entry.name)) continue;
+    const path = join(entry.parentPath ?? entry.path, entry.name);
+    const { mtimeMs } = await stat(path).catch(() => ({ mtimeMs: 0 }));
+    if (mtimeMs >= since && (!newest || mtimeMs > newest.mtimeMs)) newest = { path, name: entry.name, mtimeMs };
+  }
+  return newest;
 }
