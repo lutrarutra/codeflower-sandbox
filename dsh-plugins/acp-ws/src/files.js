@@ -21,6 +21,16 @@ const MIME_TYPES = {
   '.gif': 'image/gif',
   '.webp': 'image/webp',
   '.svg': 'image/svg+xml',
+  // TIFF and the microscopy formats built on it: BigTIFF, Zeiss LSM, MetaMorph
+  // stacks, Aperio and Leica slides, Akoya QPTIFF (OME-TIFF is .ome.tif).
+  '.tif': 'image/tiff',
+  '.tiff': 'image/tiff',
+  '.btf': 'image/tiff',
+  '.lsm': 'image/tiff',
+  '.stk': 'image/tiff',
+  '.svs': 'image/tiff',
+  '.scn': 'image/tiff',
+  '.qptiff': 'image/tiff',
   '.pdf': 'application/pdf',
   '.html': 'text/html',
   '.htm': 'text/html',

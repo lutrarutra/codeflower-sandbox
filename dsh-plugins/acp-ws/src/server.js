@@ -19,12 +19,14 @@ import {
   deleteSession,
   listSessions,
   readTranscript,
+  readTranscriptPage,
   renameSession,
   sessionKey,
   writeJsonAtomically
 } from './sessions.js';
 import { createDownloads } from './downloads.js';
-import { DID_NOT_START, addedMcpServers, describeLeftOut, failedMcpServers, mcpServersFor, withMcpServers } from './mcp.js';
+import { createThumbnails } from './thumbnails.js';
+import { DID_NOT_START, addedMcpServers, claudeMcpConfig, describeLeftOut, failedMcpServers, mcpServersFor, withMcpServers } from './mcp.js';
 import { DEFAULT_UPLOAD_MAX_BYTES, createUploads } from './uploads.js';
 import { createUsage, dshTokens } from './usage.js';
 
@@ -466,6 +468,11 @@ export async function startBridge(options) {
   const fileOptions = { workspace, privateDirectory, writableFolders };
   const uploads = createUploads({ workspace, fileOptions, maxBytes: uploadMaxBytes, log });
   const downloads = createDownloads({ fileOptions, log });
+  const thumbnails = createThumbnails({
+    directory: sessionsDirectory ? join(dirname(sessionsDirectory), 'thumbnails') : undefined,
+    fileOptions,
+    log
+  });
   await uploads.removeLeftovers();
 
   // One store and recorder for the worker: sessions stay open, and their
@@ -1885,6 +1892,9 @@ export async function startBridge(options) {
           }
           case '_codeflower/files/read':
             respond(await readClientFile(params.path, fileOptions));
+            break;
+          case '_codeflower/files/thumbnail':
+            respond(await thumbnails.thumbnail(params.path, params.height));
             break;
           case '_codeflower/files/stat':
             respond(await resolveFile(params.path, fileOptions));
