@@ -89,6 +89,11 @@ export function clientLink(workerLine) {
   return `http://127.0.0.1:${CLIENT_PORT}/#add=${encodeURIComponent(workerLine)}`;
 }
 
+/** A link that opens the worker in VS Code's extension, as the app's VSCodeLink does. */
+export function vscodeLink(workerLine) {
+  return `vscode://codeflower.codeflower/connect?address=${encodeURIComponent(workerLine)}`;
+}
+
 /** The chat page the worker serves (`--server`), with its key; like Jupyter's link. */
 export function pageLink(host, port, token) {
   const address = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;

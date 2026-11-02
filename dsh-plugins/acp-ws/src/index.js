@@ -186,8 +186,9 @@ const tlsCertificate = process.env.CODEFLOWER_TLS_CERT && process.env.CODEFLOWER
 delete process.env.CODEFLOWER_TLS_CERT;
 delete process.env.CODEFLOWER_TLS_KEY;
 
+const listenHost = process.env.CODEFLOWER_LISTEN_HOST ?? '0.0.0.0';
 const bridge = await startBridge({
-  host: process.env.CODEFLOWER_LISTEN_HOST ?? '0.0.0.0',
+  host: listenHost,
   port: Number(process.env.CODEFLOWER_PORT ?? 0),
   listenSocket: process.env.CODEFLOWER_LISTEN_SOCKET || undefined,
   advertiseHost: requiredEnvironment('CODEFLOWER_ADVERTISE_HOST'),
@@ -231,13 +232,32 @@ const opening = SERVE_PAGE
       'proxy such as nginx, or reach it through ssh -L.'
     ]
   : ['With the code flower app running on your computer, open:', '', `  ${clientLink(workerLine)}`];
+// VS Code on this node, or connected to it over Remote-SSH, reaches the
+// worker on loopback, which its network address may not be from the node itself.
+const LOOPBACK = ['127.0.0.1', 'localhost', '::1'];
+const localLine = LOOPBACK.includes(bridge.address.host)
+  ? workerLine
+  : !process.env.CODEFLOWER_LISTEN_SOCKET && ['0.0.0.0', '::', '127.0.0.1', 'localhost'].includes(listenHost)
+    ? connectionUrl('127.0.0.1', bridge.address.port, bridge.address.token, bridge.address.fingerprint)
+    : undefined;
+const vscodeLines = localLine
+  ? [
+      'Or in VS Code on this computer, or connected to it over Remote-SSH, open:',
+      '',
+      `  ${vscodeLink(localLine)}`,
+      '',
+      localLine === workerLine
+        ? 'Or run "code flower: Connect to worker" and paste:'
+        : 'From VS Code elsewhere, run "code flower: Connect to worker" and paste:'
+    ]
+  : ['Or in VS Code, run "code flower: Connect to worker" and paste:'];
 process.stderr.write(
   [
     '',
     `code flower worker ready (${agents[agentName].label}). ${opening[0]}`,
     ...opening.slice(1),
     '',
-    'Or in VS Code, run "code flower: Connect to worker" and paste:',
+    ...vscodeLines,
     '',
     `  ${workerLine}`,
     '',

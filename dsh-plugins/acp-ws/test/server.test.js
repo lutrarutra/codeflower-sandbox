@@ -14,7 +14,7 @@ import { createActivity } from '../src/activity.js';
 import { readActions } from '../src/actions.js';
 import { createAgents, loadRegistry } from '../src/agents.js';
 import { writeCommentsSlot } from '../src/files.js';
-import { agentEnvironment, certificateFingerprint, clientLink, connectionUrl, pageLink, startBridge } from '../src/server.js';
+import { agentEnvironment, certificateFingerprint, clientLink, connectionUrl, pageLink, startBridge, vscodeLink } from '../src/server.js';
 import { parseMcpServers } from '../src/mcp.js';
 import { createPlugins } from '../src/plugins.js';
 import { listSessions, readTranscript, sessionKey } from '../src/sessions.js';
@@ -1571,6 +1571,15 @@ test('prints a link that adds the worker in the code flower app', () => {
   // The line, token included, travels only in the fragment, which the browser never sends.
   assert.equal(link.search, '');
   assert.equal(decodeURIComponent(link.hash.slice('#add='.length)), line);
+});
+
+test('prints a link that connects VS Code to the worker', () => {
+  const line = connectionUrl('127.0.0.1', 41234, 'a+b/c=', 'x'.repeat(43));
+  const link = new URL(vscodeLink(line));
+  assert.equal(link.protocol, 'vscode:');
+  assert.equal(link.host, 'codeflower.codeflower');
+  assert.equal(link.pathname, '/connect');
+  assert.equal(link.searchParams.get('address'), line);
 });
 
 test('serves TLS with the run\'s certificate, whose fingerprint its line carries', async (t) => {
