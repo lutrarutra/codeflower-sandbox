@@ -22,7 +22,7 @@ test('startup facts and live diagnostics are specific to the worker', (t) => {
     CODEFLOWER_NETWORK: 'isolated',
     CODEFLOWER_MOUNTS: JSON.stringify([
       { target: '/data/input/example', source: '/private/host/path', readOnly: true },
-      { target: '/data/output/results', source: '/private/results', readOnly: false }
+      { target: '/data/output/results', source: '/private/results', given: '/home/results', readOnly: false }
     ]),
     CODEFLOWER_ENVIRONMENT_FILE: snapshot
   };
@@ -30,9 +30,9 @@ test('startup facts and live diagnostics are specific to the worker', (t) => {
   const facts = readFileSync(snapshot, 'utf8');
   assert.match(facts, /Agent: codex/);
   assert.match(facts, /Engine: docker/);
-  assert.match(facts, /"\/data\/input\/example": read-only/);
-  assert.match(facts, /"\/data\/output\/results": read-write/);
-  assert.doesNotMatch(facts, /\/private\//);
+  assert.match(facts, /"\/data\/input\/example": read-only, "\/private\/host\/path" on the user's computer/);
+  assert.match(facts, /"\/data\/output\/results": read-write, "\/private\/results" \(given as "\/home\/results"\)/);
+  assert.match(facts, /codeflower-path PATH/);
   assert.match(facts, /NVIDIA GPU query: Example GPU, 1024 MiB/);
   const live = execFileSync(process.execPath, [doctor], { env, encoding: 'utf8' });
   assert.match(live, /## Current resources/);

@@ -132,6 +132,17 @@ if [ -n "${CODEFLOWER_INSTANCE_ID:-}" ]; then
   fi
 fi
 
+# Where each mounted folder is on the user's computer, for codeflower-path:
+# the agent does not get CODEFLOWER_MOUNTS itself.
+if [ -n "${CODEFLOWER_INSTANCE_ID:-}" ]; then
+  CODEFLOWER_PATHS_FILE="${CODEFLOWER_RUN_DIR:-$state/run}/paths-$CODEFLOWER_INSTANCE_ID.json"
+  export CODEFLOWER_PATHS_FILE
+  if ! codeflower-path --write-map "$CODEFLOWER_PATHS_FILE"; then
+    echo "Could not write the mounted folders' host paths" >&2
+    unset CODEFLOWER_PATHS_FILE
+  fi
+fi
+
 # Which agent and model each chat runs, written by the bridge as
 # <session id>.json, so storyteller can name them in a report's header.
 if [ -n "${CODEFLOWER_INSTANCE_ID:-}" ]; then

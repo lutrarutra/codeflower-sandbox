@@ -1,0 +1,100 @@
+#!/usr/local/bin/node --no-warnings
+// Translates between paths on the user's computer and paths in the sandbox,
+// for the folders the app mounted: data, metadata and the user name files
+// by where they are on the host, and the user opens results there.
+import { readFileSync, writeFileSync } from 'node:fs';
+import { posix } from 'node:path';
+
+const usage = `Usage: codeflower-path [PATH...]
+
+Without arguments, lists each folder in the sandbox with where it is on the
+user's computer. With paths, prints one translation per path: a sandbox path
+as it is on the user's computer, a path on the user's computer as it is in the
+sandbox. Host paths do not exist in the sandbox: translate them, never use
+them directly. A path outside every mounted folder is reported and the exit
+status is 1.`;
+
+const STATE = '/codeflower-state';
+
+// Mounts as the app passed them, and the project state; only the startup has
+// CODEFLOWER_MOUNTS, which the agent does not get.
+function startupMap() {
+  const mounts = JSON.parse(process.env.CODEFLOWER_MOUNTS ?? '[]');
+  if (!Array.isArray(mounts)) throw new Error('mount metadata is not an array');
+  const map = mounts
+    .filter((mount) => typeof mount.target === 'string' && typeof mount.source === 'string')
+    .map(({ target, source, given, readOnly }) => ({ target, source, ...(given ? { given } : {}), readOnly: Boolean(readOnly) }));
+  if (process.env.CODEFLOWER_HOST_STATE) {
+    map.push({ target: STATE, source: process.env.CODEFLOWER_HOST_STATE, readOnly: false });
+  }
+  return map;
+}
+
+function readMap() {
+  const file = process.env.CODEFLOWER_PATHS_FILE;
+  if (!file) throw new Error('CODEFLOWER_PATHS_FILE is not set');
+  return JSON.parse(readFileSync(file, 'utf8'));
+}
+
+// Host paths may be Windows paths: compare them with forward slashes, and
+// drive letters and names without case.
+const windows = (path) => /^[A-Za-z]:[\\/]/.test(path) || path.startsWith('\\\\');
+const comparable = (path) => {
+  if (!windows(path)) return posix.normalize(path).replace(/(.)\/$/, '$1');
+  return path.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+};
+const within = (path, root) => path === root || path.startsWith(root.endsWith('/') ? root : `${root}/`);
+
+// The longest matching root wins, as mounts can nest.
+function translate(map, path) {
+  let best = null;
+  const consider = (root, other, toHost) => {
+    if (within(comparable(path), comparable(root)) && (!best || root.length > best.root.length)) {
+      best = { root, other, toHost };
+    }
+  };
+  for (const mount of map) {
+    consider(mount.target, mount.source, true);
+    consider(mount.source, mount.target, false);
+    if (mount.given) consider(mount.given, mount.target, false);
+  }
+  if (!best) return null;
+  const rest = (windows(path) ? path.replace(/\\/g, '/') : posix.normalize(path)).slice(comparable(best.root).length).replace(/^\//, '');
+  if (!rest) return best.other;
+  if (best.toHost && windows(best.other)) return `${best.other.replace(/\\+$/, '')}\\${rest.replace(/\//g, '\\')}`;
+  return posix.join(best.other, rest);
+}
+
+function table(map) {
+  if (!map.length) return 'No folders from the user\'s computer are mounted.\n';
+  return map.map((mount) => {
+    const access = mount.readOnly ? 'read-only' : 'read-write';
+    const given = mount.given ? ` (the user may also write ${mount.given})` : '';
+    return `${mount.target} (${access}) = ${mount.source}${given} on the user's computer\n`;
+  }).join('');
+}
+
+const args = process.argv.slice(2);
+try {
+  if (args[0] === '--help' || args[0] === '-h') {
+    console.log(usage);
+  } else if (args[0] === '--write-map' && args.length === 2) {
+    writeFileSync(args[1], `${JSON.stringify(startupMap(), null, 2)}\n`, { mode: 0o600 });
+  } else if (!args.length) {
+    process.stdout.write(table(readMap()));
+  } else {
+    const map = readMap();
+    for (const path of args) {
+      const result = translate(map, path);
+      if (result === null) {
+        console.error(`codeflower-path: ${path} is not in a mounted folder; the user can mount its folder when starting the sandbox`);
+        process.exitCode = 1;
+      } else {
+        console.log(result);
+      }
+    }
+  }
+} catch (error) {
+  console.error(`codeflower-path: ${error.message}`);
+  process.exitCode = 1;
+}

@@ -31,7 +31,17 @@ The user's folders are mounted under `/data`, each in a subfolder named after it
 - `/codeflower-state/workspace`: your working directory. Keep everything you make here:
   - `scripts/` numbered, rerunnable analysis steps (`01_qc.py`, `02_cluster.py`, …)
   - `figures/`, `results/` (tables, intermediate data such as `.h5ad` or `.parquet`), `reports/`, `logs/`
+  - `plans/`: plans you write in plan mode, which the user reads and may edit before approving
 - `/codeflower-state/env`: the project's persistent software environment.
+
+Each of these folders is somewhere else on the user's computer, and the user, their files and their
+metadata (sample sheets, pipeline configs, notebooks, paths stored in `.h5ad` or `.rds` files) name
+it there, e.g. `/Users/ana/projects/study42/counts.csv`. Those paths do not exist in the sandbox:
+run `codeflower-path` to list the folders with their host paths, and `codeflower-path PATH` to
+translate one either way. Use the sandbox path in your code and commands. When you tell the user
+where a result is, give its path on their computer too. A host path outside every mounted folder
+cannot be reached: ask the user to mount its folder when they next start the sandbox rather than
+searching for it.
 
 ## Sandbox capabilities
 

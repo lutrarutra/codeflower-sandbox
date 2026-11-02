@@ -138,7 +138,7 @@ function launchFacts() {
     `- Engine: ${process.env.CODEFLOWER_ENGINE || 'not reported'}`,
     `- Network: ${process.env.CODEFLOWER_NETWORK === 'isolated' ? 'isolated; run codeflower-network for the current allowlist' : 'no code flower isolation reported; other network restrictions may apply'}`,
     '- Agent tool limits and permissions: not reported here; check the active harness.',
-    '- Project state: /codeflower-state (read-write)',
+    `- Project state: /codeflower-state (read-write)${process.env.CODEFLOWER_HOST_STATE ? `, ${JSON.stringify(process.env.CODEFLOWER_HOST_STATE)} on the user's computer` : ''}`,
     '',
     '## Configured user mounts'
   ];
@@ -150,9 +150,13 @@ function launchFacts() {
         throw new Error('invalid mount metadata');
       }
     }
+    const host = (mount) => typeof mount.source === 'string'
+      ? `, ${JSON.stringify(mount.source)}${mount.given ? ` (given as ${JSON.stringify(mount.given)})` : ''} on the user's computer`
+      : '';
     lines.push(...(mounts.length
-      ? mounts.map((mount) => `- ${JSON.stringify(mount.target)}: ${mount.readOnly ? 'read-only' : 'read-write'}`)
+      ? mounts.map((mount) => `- ${JSON.stringify(mount.target)}: ${mount.readOnly ? 'read-only' : 'read-write'}${host(mount)}`)
       : ['- No user mounts reported.']));
+    if (mounts.length) lines.push('', 'Host paths do not exist in the sandbox: `codeflower-path PATH` translates either way.');
   } catch (error) {
     lines.push(`- Mount metadata unavailable: ${error.message}`);
   }
