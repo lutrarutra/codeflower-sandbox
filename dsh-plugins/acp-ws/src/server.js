@@ -1399,6 +1399,9 @@ export async function startBridge(options) {
         for (const target of clients) {
           if (sessionId === undefined || target.sessions.has(sessionId)) deliver(target, key, tagged);
         }
+        if (sessionId !== undefined && message.method === 'session/request_permission') {
+          void showPlan(host, sessionId, message.params?.toolCall);
+        }
         return;
       }
       // Anything else the agent asks goes to one window: the one whose prompt
@@ -2051,6 +2054,39 @@ export async function startBridge(options) {
     if (listenSocket) server.listen(listenSocket, ready);
     else server.listen(port, host, ready);
   });
+
+  // Files to look at, for a window to open and note in the chat (its Shown tab).
+  function sendShow(target, files, { title, message, sessionId } = {}) {
+    target.send({
+      jsonrpc: '2.0',
+      method: '_codeflower/show',
+      params: {
+        files,
+        ...(sessionId !== undefined ? { sessionId } : {}),
+        ...(typeof title === 'string' ? { title: title.slice(0, 200) } : {}),
+        ...(typeof message === 'string' ? { message: message.slice(0, 2000) } : {})
+      }
+    });
+  }
+
+  // A plan to approve (Claude Code's ExitPlanMode, kind switch_mode) is shown
+  // like a file from codeflower-show: the user reads and may edit it before
+  // answering. Only a file the user may see, i.e. in the workspace.
+  async function showPlan(host, sessionId, toolCall) {
+    const path = activity.isPlan(sessionId, toolCall) ? toolCall?.rawInput?.planFilePath : undefined;
+    if (typeof path !== 'string') return;
+    let file;
+    try {
+      file = await resolveFile(path, fileOptions);
+    } catch {
+      return;
+    }
+    const prompter = host.prompters.get(sessionId);
+    const target = clients.has(prompter) && prompter.sessions.has(sessionId)
+      ? prompter
+      : [...clients].reverse().find((client) => client.sessions.has(sessionId));
+    if (target) sendShow(target, [file], { sessionId, message: 'The plan to approve; edit it before you answer to change it' });
+  }
 
   // The agent asks the user to look at files; the client opens them.
   let showServer;

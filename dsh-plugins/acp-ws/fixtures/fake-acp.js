@@ -257,9 +257,11 @@ input.on('line', async (line) => {
         });
         break;
       }
-      if (text === 'approve plan') {
+      if (text === 'approve plan' || text?.startsWith('approve plan in ')) {
         // Like Claude Code's ExitPlanMode: the kind comes with the tool call, not the request.
+        // `approve plan in <path>`: the file Claude Code wrote the plan to.
         const { sessionId } = message.params;
+        const planFilePath = text.slice('approve plan in '.length) || undefined;
         send({
           jsonrpc: '2.0',
           method: 'session/update',
@@ -267,7 +269,7 @@ input.on('line', async (line) => {
         });
         const result = await request('session/request_permission', {
           sessionId,
-          toolCall: { toolCallId: 'plan-1' },
+          toolCall: { toolCallId: 'plan-1', ...(planFilePath ? { rawInput: { plan: 'The plan', planFilePath } } : {}) },
           options: [{ optionId: 'allow', name: 'Yes', kind: 'allow_once' }]
         });
         reply(sessionId, message.id, `outcome ${result.outcome.optionId ?? result.outcome.outcome}`);

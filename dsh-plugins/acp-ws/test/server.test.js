@@ -1347,6 +1347,41 @@ test('keeps several windows on one chat in sync', async (t) => {
   );
 });
 
+test('shows a plan to approve to the window of its chat, when the user may see it', async (t) => {
+  const workspaceDirectory = await mkdtemp(join(tmpdir(), 'codeflower-workspace-'));
+  t.after(() => rm(workspaceDirectory, { recursive: true, force: true }));
+  const { bridge, sessionsDirectory } = await startTestBridge(t, { workspace: workspaceDirectory });
+  await mkdir(join(workspaceDirectory, 'plans'));
+  const plan = join(workspaceDirectory, 'plans', 'tidy-plan.md');
+  await writeFile(plan, '# The plan\n');
+  // Claude Code's default, next to its login: not shown.
+  const hidden = join(dirname(sessionsDirectory), 'harness-plan.md');
+  await writeFile(hidden, '# Hidden\n');
+
+  const socket = await openSocket(bridge.address);
+  t.after(() => closeSocket(socket));
+  await initialize(socket);
+  const sessionId = (await call(socket, 'session/new', { cwd: '/workspace', mcpServers: [] })).result.sessionId;
+  const ask = async (path) => {
+    send(socket, { jsonrpc: '2.0', id: nextId++, method: 'session/prompt', params: { sessionId, prompt: [{ type: 'text', text: `approve plan in ${path}` }] } });
+    const asked = await receive(socket, (message) => message.method === 'session/request_permission');
+    return () => send(socket, { jsonrpc: '2.0', id: asked.id, result: { outcome: { outcome: 'selected', optionId: 'allow' } } });
+  };
+
+  const answer = await ask(plan);
+  const shown = await receive(socket, (message) => message.method === '_codeflower/show');
+  assert.equal(shown.params.sessionId, sessionId);
+  assert.ok(shown.params.files[0].path.endsWith('/plans/tidy-plan.md'));
+  assert.equal(shown.params.files[0].writable, true);
+  answer();
+  await receive(socket, (message) => message.method === 'session/update' && text(message) === 'outcome allow');
+
+  const answerHidden = await ask(hidden);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(inboxes.get(socket).messages.some((message) => message.method === '_codeflower/show'), false);
+  answerHidden();
+});
+
 test('keeps questions for the user until a window opens their chat', async (t) => {
   const { bridge } = await startTestBridge(t);
   const first = await openSocket(bridge.address);
@@ -1444,10 +1479,17 @@ test('tracks token counts, cost, and quota, and records them with the session', 
   const sessionId = (await call(socket, 'session/new', { cwd: '/workspace', mcpServers: [], _meta: { mine: true } })).result.sessionId;
   const key = sessionKey('claude', sessionId);
 
-  // The bridge asks Claude Code for its rate limit events, next to the window's own _meta.
+  // The bridge asks Claude Code for its rate limit events and puts its plans in
+  // the workspace, next to the window's own _meta.
   const metaReply = call(socket, 'session/prompt', { sessionId, prompt: [{ type: 'text', text: 'what meta' }] });
   const meta = JSON.parse(text(await receive(socket, (message) => message.method === 'session/update')));
-  assert.deepEqual(meta, { mine: true, claudeCode: { emitRawSDKMessages: [{ type: 'rate_limit_event' }] } });
+  assert.deepEqual(meta, {
+    mine: true,
+    claudeCode: {
+      emitRawSDKMessages: [{ type: 'rate_limit_event' }],
+      options: { settings: { plansDirectory: 'plans' } }
+    }
+  });
   await metaReply;
 
   const answer = (await call(socket, 'session/prompt', { sessionId, prompt: [{ type: 'text', text: 'use tokens' }] })).result;

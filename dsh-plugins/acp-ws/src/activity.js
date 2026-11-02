@@ -50,8 +50,13 @@ export function createActivity(onChange = () => {}, now = Date.now) {
     },
 
     permission(id, sessionId, toolCall) {
-      requests.set(id, { sessionId, waitingFor: kindOf(sessionId, toolCall) === PLAN_KIND ? 'plan' : 'permission' });
+      requests.set(id, { sessionId, waitingFor: this.isPlan(sessionId, toolCall) ? 'plan' : 'permission' });
       onChange();
+    },
+
+    // Whether a permission request asks to approve a plan.
+    isPlan(sessionId, toolCall) {
+      return kindOf(sessionId, toolCall) === PLAN_KIND;
     },
 
     question(id, sessionId) {
