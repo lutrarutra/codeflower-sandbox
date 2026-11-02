@@ -1,4 +1,4 @@
-// The chat page, served by the worker itself (`codeflower interactive
+// The chat page, served by the worker itself (`codeflower sandbox
 // --server`): one link opens this sandbox's chats in a browser, like
 // Jupyter's. The page is codeflower-ui's, built into the image; the worker
 // answers the part of the app's page API that one sandbox needs, in the same

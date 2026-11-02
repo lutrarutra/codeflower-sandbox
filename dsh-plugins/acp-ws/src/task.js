@@ -450,7 +450,7 @@ export async function runTask({
     if (!interactive || !ptyHelper?.length) {
       return finish({
         status: 'not_signed_in',
-        message: `${agent.label} is not signed in for this project. Run this task in a terminal to sign in, or sign in with "codeflower interactive" before running it in batch.`
+        message: `${agent.label} is not signed in for this project. Run this task in a terminal to sign in, or sign in with "codeflower sandbox" before running it in batch.`
       });
     }
     try {
@@ -460,7 +460,7 @@ export async function runTask({
         const detail = methods.length ? 'offers more than one terminal sign-in method' : 'offers no terminal sign-in method';
         return finish({
           status: 'not_signed_in',
-          message: `${agent.label} ${detail}. Sign in with "codeflower interactive" before running this task.`
+          message: `${agent.label} ${detail}. Sign in with "codeflower sandbox" before running this task.`
         });
       }
 

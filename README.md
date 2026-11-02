@@ -28,7 +28,7 @@ on: the code flower app downloads it for your machine and mounts it into Claude 
 ## Install
 
 You normally do not install it yourself: the [app](https://github.com/lutrarutra/codeflower-app)
-downloads the release it was tested with and starts it (`codeflower pull`, `codeflower interactive`).
+downloads the release it was tested with and starts it (`codeflower pull`, `codeflower sandbox`).
 To get it by hand:
 
 ```sh
@@ -37,7 +37,7 @@ apptainer pull codeflower-sandbox.sif docker://ghcr.io/lutrarutra/codeflower-san
 ```
 
 Releases are published for linux/amd64 and linux/arm64, tagged `X.Y.Z`, `X.Y`, `latest` and
-`sha-<commit>`. Run your own build with `codeflower interactive --image codeflower-sandbox` (or
+`sha-<commit>`. Run your own build with `codeflower sandbox --image codeflower-sandbox` (or
 `--image FILE.sif`).
 
 ## Contents

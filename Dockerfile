@@ -47,7 +47,7 @@ COPY dsh-plugins/acp-ws/src ./src
 FROM scratch AS storyteller
 ADD --keep-git-dir=false https://github.com/lutrarutra/storyteller.git#v0.3.0 /
 
-# The chat page the worker serves with `codeflower interactive --server`:
+# The chat page the worker serves with `codeflower sandbox --server`:
 # codeflower-ui's web build, pinned by tag. A development build uses the
 # workspace's build instead: --build-context page=../ui/dist-web.
 FROM scratch AS ui-source

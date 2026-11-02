@@ -325,7 +325,7 @@ test('an impossible task ends at once', async (t) => {
 test('a task stops when its agent is not signed in', async (t) => {
   const { result } = await run(t, { task: 'task: x' }, { signedIn: false });
   assert.equal(result.status, 'not_signed_in');
-  assert.match(result.message, /codeflower interactive/);
+  assert.match(result.message, /codeflower sandbox/);
 });
 
 test('a task signs in through the agent terminal method before it starts', async (t) => {
