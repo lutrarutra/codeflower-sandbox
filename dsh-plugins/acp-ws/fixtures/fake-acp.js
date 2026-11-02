@@ -42,6 +42,91 @@ const tasks = new Map();
 const sessionMeta = new Map();
 // A running cost per session, like Claude Code's, which starts over on resume.
 const costs = new Map();
+// Whether the client takes subagents as sessions of their own (ACP subagents
+// RFD), and the children still running, by id: their parent.
+let clientSubagents = false;
+let nextChild = 1;
+const runningChildren = new Map();
+
+function update(sessionId, value) {
+  send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId, update: value } });
+}
+
+// A subagent at work: its settings, a message and a tool call, under its own id.
+function childWork(childId) {
+  update(childId, {
+    sessionUpdate: 'config_option_update',
+    configOptions: [
+      { id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'small', options: [{ value: 'small', name: 'Small model' }] },
+      { id: 'effort', name: 'Effort', category: 'thought_level', type: 'select', currentValue: 'low', options: [{ value: 'low', name: 'Low' }] }
+    ]
+  });
+  update(childId, { sessionUpdate: 'usage_update', used: 500, size: 100000 });
+  update(childId, { sessionUpdate: 'tool_call', toolCallId: `${childId}-tool`, title: 'Read notes.txt', kind: 'read', status: 'completed' });
+  update(childId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'child ' } });
+  update(childId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'found it' } });
+}
+
+// `spawn subagent` (the RFD), `spawn draft subagent` (the draft it grew from),
+// or the flat stream of an agent whose client does not take subagents.
+async function spawnSubagent(sessionId, text) {
+  const childId = `child-${nextChild++}`;
+  const task = 'Find the notes';
+  const draft = text.includes('draft');
+  if (!clientSubagents) {
+    const meta = { claudeCode: { parentToolUseId: 'agent-tool' } };
+    update(sessionId, { sessionUpdate: 'tool_call', toolCallId: `${childId}-tool`, title: 'Read notes.txt', status: 'completed', _meta: meta });
+    update(sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'child found it' }, _meta: meta });
+    return;
+  }
+  if (draft) {
+    update(sessionId, { sessionUpdate: 'subagent_spawned', subagentSessionId: childId, name: 'Notes finder', task, capabilities: {} });
+  } else {
+    update(sessionId, {
+      sessionUpdate: 'subagent_update',
+      sessionId: childId,
+      title: 'Notes finder (Explore)',
+      description: 'Find the notes',
+      capabilities: { cancel: {} },
+      state: { state: 'running' }
+    });
+    const message = { messageId: 'agent-tool', senderSessionId: sessionId, recipientSessionId: childId, content: [{ type: 'text', text: task }] };
+    update(sessionId, { sessionUpdate: 'session_message', ...message });
+    update(childId, { sessionUpdate: 'session_message', ...message });
+  }
+  childWork(childId);
+  if (text.includes('child asks')) {
+    const result = await request('session/request_permission', {
+      sessionId: childId,
+      toolCall: { toolCallId: `${childId}-ask`, title: 'Run grep' },
+      options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }]
+    });
+    update(childId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `child outcome ${result.outcome.optionId ?? result.outcome.outcome}` } });
+  }
+  if (text.includes('keep running')) {
+    runningChildren.set(childId, { parentId: sessionId, draft });
+    return;
+  }
+  endChild(childId, sessionId, draft, 'end_turn');
+}
+
+function endChild(childId, parentId, draft, stopReason) {
+  runningChildren.delete(childId);
+  if (draft) {
+    update(parentId, { sessionUpdate: 'subagent_state_update', subagentSessionId: childId, state: stopReason === 'end_turn' ? 'completed' : 'cancelled' });
+    return;
+  }
+  if (stopReason === 'end_turn') {
+    update(parentId, {
+      sessionUpdate: 'session_message',
+      messageId: 'agent-tool:reply',
+      senderSessionId: childId,
+      recipientSessionId: parentId,
+      content: [{ type: 'text', text: 'The notes are in notes.txt' }]
+    });
+  }
+  update(parentId, { sessionUpdate: 'subagent_update', sessionId: childId, state: { state: 'idle', stopReason } });
+}
 
 function configOptions(sessionId) {
   const values = settings.get(sessionId) ?? { mode: 'default', effort: 'medium' };
@@ -131,6 +216,7 @@ input.on('line', async (line) => {
   switch (message.method) {
     case 'initialize': {
       const capabilities = message.params?.clientCapabilities ?? {};
+      clientSubagents = typeof capabilities.subagents === 'object' && capabilities.subagents !== null;
       const authMethods = [{ id: 'api-key', name: 'API key', _meta: { 'api-key': { provider: 'openai' } } }];
       if (capabilities._meta?.['terminal-auth']) {
         authMethods.push({
@@ -161,6 +247,8 @@ input.on('line', async (line) => {
           noBrowser: process.env.NO_BROWSER ?? null,
           opencodeDatabase: process.env.OPENCODE_DB ?? null,
           pluginSeed: process.env.CLAUDE_CODE_PLUGIN_SEED_DIR ?? null,
+          subagents: clientSubagents,
+          codexConfig: process.env.CODEX_CONFIG ?? null,
           argv: process.argv.slice(2),
           pid: process.pid
         }
@@ -417,6 +505,11 @@ input.on('line', async (line) => {
         });
         break;
       }
+      if (text?.startsWith('spawn ')) {
+        await spawnSubagent(message.params.sessionId, text);
+        reply(message.params.sessionId, message.id, 'parent done');
+        break;
+      }
       if (text === 'ask permission') {
         const result = await request('session/request_permission', {
           sessionId: message.params.sessionId,
@@ -430,6 +523,12 @@ input.on('line', async (line) => {
       break;
     }
     case 'session/cancel':
+      // A subagent stops alone.
+      if (runningChildren.has(message.params?.sessionId)) {
+        const { parentId, draft } = runningChildren.get(message.params.sessionId);
+        endChild(message.params.sessionId, parentId, draft, 'cancelled');
+        break;
+      }
       if (pendingPrompt !== undefined) {
         send({ jsonrpc: '2.0', id: pendingPrompt, result: { stopReason: 'cancelled' } });
         pendingPrompt = undefined;
@@ -449,6 +548,18 @@ input.on('line', async (line) => {
         method: 'session/update',
         params: { sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `steered by ${prompt[0].text}` } } }
       });
+      break;
+    }
+    case 'fake/childSays': {
+      update(message.params.childId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: message.params.text } });
+      send({ jsonrpc: '2.0', id: message.id, result: {} });
+      break;
+    }
+    case 'fake/finishChild': {
+      const { childId } = message.params;
+      const child = runningChildren.get(childId);
+      if (child) endChild(childId, child.parentId, child.draft, 'end_turn');
+      send({ jsonrpc: '2.0', id: message.id, result: {} });
       break;
     }
     case 'fake/steers':

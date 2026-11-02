@@ -107,6 +107,7 @@ export function createSessionStore({
     });
 
   const releaseLease = async (state) => {
+    if (state.child) return;
     const lease = await readJson(state.paths.lease);
     if (lease?.instanceId === instanceId) {
       await unlink(state.paths.lease).catch(() => {});
@@ -119,7 +120,8 @@ export function createSessionStore({
     }
     heartbeat = setInterval(() => {
       for (const state of open.values()) {
-        void enqueue(state, () => writeLease(state));
+        // A subagent's chat is held by its parent's lease.
+        if (!state.child) void enqueue(state, () => writeLease(state));
       }
     }, HEARTBEAT_MS);
     heartbeat.unref();
@@ -178,6 +180,54 @@ export function createSessionStore({
 
     isOpen(nativeSessionId) {
       return open.has(nativeSessionId);
+    },
+
+    /**
+     * Records a subagent's chat beside its parent's, while the parent's is
+     * open here: under the parent's lease, with `parentKey` in its meta, which
+     * keeps it out of the chat lists. False when the parent is not open (a
+     * load replaying it, which is not recorded again).
+     */
+    async openChild(nativeSessionId, parentSessionId) {
+      if (open.has(nativeSessionId)) return true;
+      const parent = open.get(parentSessionId);
+      if (!parent) return false;
+      const sessionPaths = paths(nativeSessionId);
+      await mkdir(sessionPaths.root, { recursive: true, mode: 0o700 });
+      const timestamp = now().toISOString();
+      const meta = (await readJson(sessionPaths.meta)) ?? {
+        version: 1,
+        harness,
+        authMode: authMode ?? null,
+        nativeSessionId,
+        cwd: parent.meta.cwd ?? null,
+        createdAt: timestamp,
+        autoTitle: null
+      };
+      meta.parentKey = sessionKey(harness, parentSessionId);
+      meta.updatedAt ??= timestamp;
+      const recorded = await readFile(sessionPaths.transcript, 'utf8').catch(() => '');
+      const state = {
+        nativeSessionId,
+        paths: sessionPaths,
+        meta,
+        child: true,
+        count: recorded.split('\n').filter((line) => line.trim()).length,
+        queue: Promise.resolve()
+      };
+      open.set(nativeSessionId, state);
+      await enqueue(state, () => writeJsonAtomically(sessionPaths.meta, meta));
+      return true;
+    },
+
+    /** Keeps a subagent's summary in its meta, for windows that open its parent later. */
+    setSubagent(nativeSessionId, summary) {
+      const state = open.get(nativeSessionId);
+      if (!state?.child) return Promise.resolve();
+      state.meta.subagent = summary;
+      state.meta.autoTitle = summary.title || summary.description || state.meta.autoTitle;
+      state.meta.updatedAt = now().toISOString();
+      return enqueue(state, () => writeJsonAtomically(state.paths.meta, state.meta));
     },
 
     record(nativeSessionId, entry) {
@@ -271,6 +321,8 @@ export async function listSessions(directory, now = Date.now()) {
     const root = join(directory, key);
     const meta = await readJson(join(root, 'meta.json')).catch(() => undefined);
     if (!meta || typeof meta.harness !== 'string' || typeof meta.nativeSessionId !== 'string') continue;
+    // Subagents' chats belong to their parent's (listSubagents).
+    if (typeof meta.parentKey === 'string') continue;
     const title = await readJson(join(root, 'title.json')).catch(() => undefined);
     const lease = await readJson(join(root, 'lease.json')).catch(() => undefined);
     sessions.push({
@@ -287,6 +339,41 @@ export async function listSessions(directory, now = Date.now()) {
     });
   }
   return sessions.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+}
+
+// The recorded subagents' chats, by their parent's key.
+async function childKeys(directory) {
+  let keys;
+  try {
+    keys = await readdir(directory);
+  } catch (error) {
+    if (error.code === 'ENOENT') return new Map();
+    throw error;
+  }
+  const byParent = new Map();
+  for (const key of keys) {
+    if (!KEY_PATTERN.test(key) || key.startsWith('.')) continue;
+    const meta = await readJson(join(directory, key, 'meta.json')).catch(() => undefined);
+    if (typeof meta?.parentKey !== 'string') continue;
+    if (!byParent.has(meta.parentKey)) byParent.set(meta.parentKey, []);
+    byParent.get(meta.parentKey).push({ key, meta });
+  }
+  return byParent;
+}
+
+/** The subagents recorded for a chat: their keys, native ids and last summaries. */
+export async function listSubagents(directory, parentKey) {
+  sessionDirectory(directory, parentKey);
+  const children = (await childKeys(directory)).get(parentKey) ?? [];
+  return children
+    .map(({ key, meta }) => ({ key, nativeSessionId: meta.nativeSessionId, parentKey, summary: meta.subagent ?? null, createdAt: meta.createdAt ?? '' }))
+    .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+}
+
+/** The parent's key of a recorded subagent's chat, or undefined for a chat of its own. */
+export async function parentKeyOf(directory, key) {
+  const meta = await readJson(join(sessionDirectory(directory, key), 'meta.json')).catch(() => undefined);
+  return typeof meta?.parentKey === 'string' ? meta.parentKey : undefined;
 }
 
 export async function readTranscript(directory, key) {
@@ -393,4 +480,13 @@ export async function deleteSession(directory, key, now = Date.now()) {
     throw new Error('The session is open on a worker; close it there first');
   }
   await rm(root, { recursive: true, force: true });
+  // Its subagents' chats, and theirs.
+  const byParent = await childKeys(directory);
+  const remove = async (parentKey) => {
+    for (const child of byParent.get(parentKey) ?? []) {
+      await rm(join(directory, child.key), { recursive: true, force: true });
+      await remove(child.key);
+    }
+  };
+  await remove(key);
 }

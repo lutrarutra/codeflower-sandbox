@@ -20,6 +20,8 @@ import {
   createSessionStore,
   deleteSession,
   listSessions,
+  listSubagents,
+  parentKeyOf,
   readTranscript,
   readTranscriptPage,
   renameSession,
@@ -31,6 +33,8 @@ import { createThumbnails } from './thumbnails.js';
 import { DID_NOT_START, addedMcpServers, claudeMcpConfig, describeLeftOut, failedMcpServers, mcpServersFor, withMcpServers } from './mcp.js';
 import { DEFAULT_UPLOAD_MAX_BYTES, createUploads } from './uploads.js';
 import { createUsage, dshTokens } from './usage.js';
+import { createSubagentSettings, mergeMeta, settingsEffects } from './subagents/settings.js';
+import { createSubagentTracker } from './subagents/tracker.js';
 
 const CONNECTION_PATH = '/acp';
 const STATUS_PATH = '/status';
@@ -69,6 +73,8 @@ const TERMINAL_TURN_SETTLE_MS = 500;
 const PASTE_ENTER_MS = 150;
 // ACP steering: a message for the turn the agent is working on (Claude Code, Codex).
 const STEER_METHOD = '_session/steering';
+// A subagent's summary goes to its parent's windows at most this often.
+const SUBAGENT_NOTIFY_MS = 1000;
 
 /**
  * The line users paste into VS Code; the token travels in it like Jupyter's,
@@ -376,6 +382,15 @@ export function createRecorder(store, log) {
       return run(() => store.record(sessionId, entry));
     },
 
+    /** Records a subagent's chat from now on, if its parent's is recorded. */
+    openChild(sessionId, parentId) {
+      return run(() => store.openChild(sessionId, parentId));
+    },
+
+    setSubagent(sessionId, summary) {
+      return run(() => store.setSubagent(sessionId, summary));
+    },
+
     /** Whether recorded messages are still on their way into the store. */
     get busy() {
       return pending > 0;
@@ -498,6 +513,18 @@ export async function startBridge(options) {
     : undefined;
   const recorder = store ? createRecorder(store, log) : undefined;
   const sessionInfo = createSessionInfo({ directory: workerEnvironment.CODEFLOWER_SESSION_INFO_DIR, agent: agent.label, log });
+  // How the agent shows its subagents (subagents/adapters.js), and their
+  // default model and effort in this project.
+  const subagentAdapter = agent.subagents;
+  const subagentSettings = subagentAdapter
+    ? await createSubagentSettings({ file: privateDirectory ? join(privateDirectory, 'subagents', `${agentName}.json`) : undefined, log })
+    : undefined;
+  const subagentEffects = () =>
+    subagentSettings
+      ? settingsEffects(subagentAdapter.spec.settings, subagentSettings.get(), { ...environment, ...agent.env })
+      : { sessionMeta: {}, env: {} };
+  // The settings the running agent started with, for those it reads at start.
+  let startedSubagentEnv = {};
 
   // The agent runs from the first connection until the worker stops; windows
   // (VS Code, the app's page) attach to it side by side and may come and go.
@@ -892,9 +919,11 @@ export async function startBridge(options) {
     // A process the agent works with, started first and ended with it:
     // Codex's shared app-server, which its terminal UI joins too.
     const companion = await startCompanion(pluginEnvironment);
+    startedSubagentEnv = subagentEffects().env;
     const child = spawn(command[0], command.slice(1), {
       env: agentEnvironment(environment, {
         ...agent.env,
+        ...startedSubagentEnv,
         ...pluginEnvironment,
         ...(usageFd ? { CODEFLOWER_USAGE_FD: String(usageFd) } : {})
       }),
@@ -933,8 +962,17 @@ export async function startBridge(options) {
       // terminal (handOver).
       handoffs: new Map(),
       retiring: false,
-      withoutKeys
+      withoutKeys,
+      // Its chats' subagents (subagents/tracker.js), and the summaries that
+      // wait for their parents' windows (subagentChanged).
+      subagents: createSubagentTracker({ onChange: (summary) => subagentChanged(started, summary) }),
+      subagentTimers: new Map()
     };
+    // Canonical subagent updates from outside ACP, if the adapter has them.
+    const stopSubagentWatch = subagentAdapter?.watch?.({
+      log,
+      emit: ({ sessionId, update }) => relayUpdate(started, sessionId, update)
+    });
     // The agent's own events, for what ACP leaves out of turns its terminal
     // UI starts (OpenCode).
     // Codex's follows the chats a terminal UI has (follow).
@@ -997,6 +1035,8 @@ export async function startBridge(options) {
     });
     child.once('close', (code, signal) => {
       started.stopWatching?.();
+      if (typeof stopSubagentWatch === 'function') stopSubagentWatch();
+      for (const timer of started.subagentTimers.values()) clearTimeout(timer);
       if (companion && companion.exitCode === null && companion.signalCode === null) companion.kill('SIGTERM');
       if (stdoutBuffer.trim()) log('ACP child exited with an incomplete stdio frame');
       if (code !== 0 && code !== null) log(`${agentName} exited with status ${code}`);
@@ -1100,7 +1140,11 @@ export async function startBridge(options) {
           params: { key: sessionKey(agentName, sessionId), sessionId, prompt: params.prompt ?? [], ...meta }
         });
       }
-      writeToAgent(host, withSessionMeta(withMcp(host, request, { jsonrpc: '2.0', id: request.bridgeId, method, params })), webSocket);
+      writeToAgent(
+        host,
+        withClientCapabilities(withSessionMeta(withMcp(host, request, { jsonrpc: '2.0', id: request.bridgeId, method, params }))),
+        webSocket
+      );
     };
     if (!prompt) return send();
     const queue = host.prompts.get(sessionId);
@@ -1637,7 +1681,8 @@ export async function startBridge(options) {
     dropPrompts(host, sessionId);
     writeToAgent(host, { jsonrpc: '2.0', method: 'session/cancel', params: { sessionId } });
     for (const [key, { message, sessionId: owner }] of host.waiting) {
-      if (owner !== sessionId) continue;
+      // Its subagents' too.
+      if (owner !== sessionId && !host.subagents.ancestors(owner).includes(sessionId)) continue;
       const result = message.method === 'session/request_permission' ? { outcome: { outcome: 'cancelled' } } : { action: 'cancel' };
       settleWaiting(host, key, result);
       writeToAgent(host, { jsonrpc: '2.0', id: message.id, result });
@@ -1716,7 +1761,8 @@ export async function startBridge(options) {
   // are marked to be asked, not added to the chat again.
   const deliverWaiting = (host, target, sessionId) => {
     for (const [key, { message, sessionId: owner }] of host.waiting) {
-      if (owner !== sessionId) continue;
+      // Its subagents' too.
+      if (owner !== sessionId && !host.subagents.ancestors(owner).includes(sessionId)) continue;
       const params = protocolObject(message.params) ? message.params : {};
       const meta = protocolObject(params._meta) ? params._meta : {};
       deliver(target, key, { ...message, params: { ...params, _meta: { ...meta, 'codeflower/replayed': true } } });
@@ -1820,6 +1866,7 @@ export async function startBridge(options) {
         host.mcpFailed.delete(sessionId);
         for (const target of clients) target.sessions.delete(sessionId);
         void recorder?.close(sessionId);
+        for (const child of host.subagents.childrenOf(sessionId)) void recorder?.close(child.sessionId);
         break;
       // The other windows with the chat open follow a change of settings.
       case 'session/set_config_option':
@@ -1884,50 +1931,56 @@ export async function startBridge(options) {
       }
       return;
     }
-    recorder?.fromAgent(message);
     const sessionId = typeof message.params?.sessionId === 'string' ? message.params.sessionId : undefined;
 
     if (message.method === 'session/update') {
       const update = message.params?.update;
-      trackSettings(host, sessionId, update);
-      if (update?.sessionUpdate === 'tool_call') activity.toolCall(sessionId, update);
-      if (update?.sessionUpdate === 'usage_update' && sessionId !== undefined) usage.update(sessionId, update);
-      // A tool that ran (or failed) while its permission still waited here
-      // was answered elsewhere, in the agent's terminal UI.
-      if (update?.sessionUpdate === 'tool_call_update' && (update.status === 'completed' || update.status === 'failed')) {
-        settleElsewhere(host, sessionId, update.toolCallId, update.status === 'completed' ? 'allow_once' : 'reject');
+      // In the canonical form of subagents (subagents/adapters.js).
+      const translated = sessionId !== undefined ? subagentAdapter?.translate(update, sessionId) : undefined;
+      if (translated) {
+        for (const item of translated) relayUpdate(host, item.sessionId, item.update);
+      } else {
+        relayUpdate(host, sessionId, update, frame, message);
       }
-      if (sessionId === undefined) return;
-      for (const target of clients) if (target.sessions.has(sessionId)) target.sendFrame(frame);
       return;
     }
+    recorder?.fromAgent(message);
 
     if (message.id !== undefined) {
       const key = requestKey(message.id);
       if (message.method === 'session/request_permission' || message.method === 'elicitation/create') {
         // It waits for the user, however long they are away, and goes to
         // every window with the chat open; the key lets them tell when
-        // another one answered.
+        // another one answered. A subagent's goes to its parents' windows
+        // too, which say whose it is.
         const params = protocolObject(message.params) ? message.params : {};
         const meta = protocolObject(params._meta) ? params._meta : {};
-        const tagged = { ...message, params: { ...params, _meta: { ...meta, 'codeflower/requestKey': key } } };
+        const parents = sessionId !== undefined ? host.subagents.ancestors(sessionId) : [];
+        const tagged = {
+          ...message,
+          params: { ...params, _meta: { ...meta, 'codeflower/requestKey': key, ...(parents.length ? { 'codeflower/parentSessionIds': parents } : {}) } }
+        };
         host.waiting.set(key, { message: tagged, sessionId });
-        if (sessionId !== undefined && message.method === 'session/request_permission') {
-          activity.permission(key, sessionId, message.params?.toolCall);
-        } else if (sessionId !== undefined && message.params?.mode !== 'url') {
-          activity.question(key, sessionId);
+        // The chat the user works in waits, not the subagent.
+        const chat = parents.at(-1) ?? sessionId;
+        if (chat !== undefined && message.method === 'session/request_permission') {
+          activity.permission(key, chat, message.params?.toolCall);
+        } else if (chat !== undefined && message.params?.mode !== 'url') {
+          activity.question(key, chat);
         }
         for (const target of clients) {
-          if (sessionId === undefined || target.sessions.has(sessionId)) deliver(target, key, tagged);
+          if (sessionId === undefined || target.sessions.has(sessionId) || parents.some((parent) => target.sessions.has(parent))) {
+            deliver(target, key, tagged);
+          }
         }
-        if (sessionId !== undefined && message.method === 'session/request_permission') {
-          void showPlan(host, sessionId, message.params?.toolCall);
+        if (chat !== undefined && message.method === 'session/request_permission') {
+          void showPlan(host, chat, message.params?.toolCall);
         }
         return;
       }
       // Anything else the agent asks goes to one window: the one whose prompt
       // started the turn, else the newest.
-      const prompter = sessionId !== undefined ? host.prompters.get(sessionId) : undefined;
+      const prompter = sessionId !== undefined ? host.prompters.get(host.subagents.rootOf(sessionId)) : undefined;
       const target = clients.has(prompter) ? prompter : newestClient();
       if (target) {
         host.forwarded.set(key, target);
@@ -1950,6 +2003,115 @@ export async function startBridge(options) {
       return;
     }
     for (const target of clients) target.sendFrame(frame);
+  };
+
+  // One session update in canonical form: its subagents noted, recorded, and
+  // sent to the windows that opened its chat. A subagent's own updates go
+  // only to windows that opened the subagent (_codeflower/subagents/open).
+  const relayUpdate = (host, sessionId, update, frame, message) => {
+    if (sessionId === undefined) return;
+    message ??= { jsonrpc: '2.0', method: 'session/update', params: { sessionId, update } };
+    host.subagents.observe(sessionId, update);
+    // Recorded from its first state the parent's record takes (a load's replay is not).
+    if (update?.sessionUpdate === 'subagent_update' && typeof update.sessionId === 'string') {
+      void recorder?.openChild(update.sessionId, sessionId);
+    }
+    recorder?.fromAgent(message);
+    trackSettings(host, sessionId, update);
+    // A subagent's tools and usage are its parent's turn's, shown in its summary.
+    if (!host.subagents.isChild(sessionId)) {
+      if (update?.sessionUpdate === 'tool_call') activity.toolCall(sessionId, update);
+      if (update?.sessionUpdate === 'usage_update') usage.update(sessionId, update);
+    }
+    // A tool that ran (or failed) while its permission still waited here
+    // was answered elsewhere, in the agent's terminal UI.
+    if (update?.sessionUpdate === 'tool_call_update' && (update.status === 'completed' || update.status === 'failed')) {
+      settleElsewhere(host, sessionId, update.toolCallId, update.status === 'completed' ? 'allow_once' : 'reject');
+    }
+    frame ??= JSON.stringify(message);
+    for (const target of clients) if (target.sessions.has(sessionId)) target.sendFrame(frame);
+  };
+
+  // ---- subagents ----
+
+  // A subagent as the windows see it: its summary with its and its parent's keys.
+  const publicSubagent = (summary) => ({
+    ...summary,
+    key: sessionKey(agentName, summary.sessionId),
+    parentKey: sessionKey(agentName, summary.parentId)
+  });
+
+  // A subagent changed: its summary is kept in its record and goes to the
+  // windows of its parent and its own, at most once a second while it runs.
+  const subagentChanged = (host, summary) => {
+    const childId = summary.sessionId;
+    const publish = () => {
+      host.subagentTimers.delete(childId);
+      const current = host.subagents.summary(childId);
+      if (!current) return;
+      const subagent = publicSubagent(current);
+      void recorder?.setSubagent(childId, subagent);
+      const notice = { jsonrpc: '2.0', method: '_codeflower/subagents/changed', params: { parentKey: subagent.parentKey, subagent } };
+      for (const target of clients) {
+        if (target.subagents && (target.sessions.has(current.parentId) || target.sessions.has(childId))) target.send(notice);
+      }
+    };
+    const running = summary.state === 'running' || summary.state === 'requires_action';
+    if (!running) {
+      clearTimeout(host.subagentTimers.get(childId));
+      publish();
+      return;
+    }
+    if (!host.subagentTimers.has(childId)) host.subagentTimers.set(childId, setTimeout(publish, SUBAGENT_NOTIFY_MS));
+  };
+
+  // The subagent settings, and whether the running agent has yet to take
+  // those it reads only at start (a restart applies them).
+  const subagentSettingsState = () => ({
+    settings: subagentSettings.get(),
+    features: subagentAdapter.features,
+    restartPending: Boolean(agentHost) && JSON.stringify(subagentEffects().env) !== JSON.stringify(startedSubagentEnv)
+  });
+
+  // A chat's subagents: those of the running agent, and those recorded before.
+  const subagentsOf = async (parentKey) => {
+    const live = new Map();
+    const host = agentHost;
+    // A chat, or a subagent with subagents of its own.
+    const parentId = host
+      ? ([...host.sessions.keys()].find((sessionId) => sessionKey(agentName, sessionId) === parentKey) ?? liveSubagent(host, parentKey))
+      : undefined;
+    if (parentId !== undefined) {
+      for (const summary of host.subagents.childrenOf(parentId)) live.set(sessionKey(agentName, summary.sessionId), publicSubagent(summary));
+    }
+    if (sessionsDirectory) {
+      await recorder?.flush();
+      for (const child of await listSubagents(sessionsDirectory, parentKey)) {
+        if (live.has(child.key)) continue;
+        const summary = child.summary ?? { sessionId: child.nativeSessionId, state: 'unknown' };
+        // Recorded as running by a worker that is gone: it cannot be anymore.
+        const gone = !host?.subagents.isChild(child.nativeSessionId) && (summary.state === 'running' || summary.state === 'requires_action');
+        live.set(child.key, { ...summary, key: child.key, parentKey, ...(gone ? { state: 'unknown' } : {}) });
+      }
+    }
+    return [...live.values()].sort((a, b) => String(a.startedAt ?? '').localeCompare(String(b.startedAt ?? '')));
+  };
+
+  // The native id behind a subagent's key, among the running agent's subagents.
+  const liveSubagent = (host, key) => {
+    for (const sessionId of host?.sessions.keys() ?? []) {
+      const found = findSubagent(host, sessionId, key);
+      if (found) return found;
+    }
+    return undefined;
+  };
+  const findSubagent = (host, parentId, key) => {
+    for (const summary of host.subagents.childrenOf(parentId)) {
+      if (sessionKey(agentName, summary.sessionId) === key) return summary.sessionId;
+      const nested = findSubagent(host, summary.sessionId, key);
+      if (nested) return nested;
+    }
+    return undefined;
   };
 
   // A prompt's answer: what the turn added to the session's usage, which a
@@ -1983,14 +2145,20 @@ export async function startBridge(options) {
 
   // What the bridge asks of every session the agent starts, e.g. Claude Code's
   // rate limit events, next to what the window asked.
+  // So are the subagent settings the agent takes per session (subagents/settings.js).
   const withSessionMeta = (message) => {
-    if (!agent.sessionMeta || !SESSION_STARTS.includes(message.method) || !protocolObject(message.params)) return message;
-    const meta = protocolObject(message.params._meta) ? message.params._meta : {};
-    const merged = { ...meta };
-    for (const [name, value] of Object.entries(agent.sessionMeta)) {
-      merged[name] = { ...(protocolObject(meta[name]) ? meta[name] : {}), ...value };
-    }
-    return { ...message, params: { ...message.params, _meta: merged } };
+    if (!SESSION_STARTS.includes(message.method) || !protocolObject(message.params)) return message;
+    const extra = mergeMeta(agent.sessionMeta, subagentEffects().sessionMeta);
+    if (!Object.keys(extra).length) return message;
+    return { ...message, params: { ...message.params, _meta: mergeMeta(message.params._meta, extra) } };
+  };
+
+  // The agent hears of everything the bridge handles for its windows, e.g.
+  // subagents, whichever window or task initialized it first.
+  const withClientCapabilities = (message) => {
+    if (message.method !== 'initialize' || !subagentAdapter || !protocolObject(message.params)) return message;
+    const capabilities = protocolObject(message.params.clientCapabilities) ? message.params.clientCapabilities : {};
+    return { ...message, params: { ...message.params, clientCapabilities: mergeMeta(capabilities, subagentAdapter.clientCapabilities) } };
   };
 
   // The configured MCP servers the agent takes, in every session it starts,
@@ -2142,6 +2310,8 @@ export async function startBridge(options) {
         if (name) log(`Client ${self.id} is ${name.slice(0, 200)}`);
         // A window with chats; `codeflower attach` speaks only the control methods.
         self.acp = true;
+        // One that shows subagents in chats of their own; others never get their updates.
+        self.subagents = protocolObject(message.params?.clientCapabilities?.subagents);
       }
       if (message.method === 'initialize' && host.initialized) {
         const result = await host.initialized;
@@ -2355,7 +2525,9 @@ export async function startBridge(options) {
               capabilities: {
                 plugins: Boolean(plugins?.available),
                 // The agent's own terminal UI on chats (`_codeflower/terminal/start` kind "chat").
-                chatTerminals: Boolean(agent.tuiCommand && Array.isArray(ptyHelper) && ptyHelper.length)
+                chatTerminals: Boolean(agent.tuiCommand && Array.isArray(ptyHelper) && ptyHelper.length),
+                // What the agent tells of its subagents, and which of their settings it takes.
+                ...(subagentAdapter ? { subagents: subagentAdapter.features } : {})
               },
               ...(slurmJobId ? { slurmJobId } : {})
             });
@@ -2405,6 +2577,8 @@ export async function startBridge(options) {
               for (const target of clients) target.sessions.delete(loaded);
               usage.forget(loaded);
               await recorder?.close(loaded);
+              for (const child of host.subagents.childrenOf(loaded)) await recorder?.close(child.sessionId);
+              host.subagents.forget(loaded);
             }
             await deleteSession(directory, key);
             respond({});
@@ -2550,6 +2724,59 @@ export async function startBridge(options) {
             if (!manager.canFetch) throw new InvalidRequest('This sandbox has no network to fetch plugins', { pendingFetch: true });
             respond({ started: true });
             void manager.fetch().catch((error) => log(`Could not fetch plugins: ${error.message}`));
+            break;
+          }
+          // ---- subagents (subagents/*.js) ----
+          case '_codeflower/subagents/list':
+            respond({ subagents: await subagentsOf(requireOwnSession()) });
+            break;
+          // A subagent's chat, opened in a window: what its transcript holds so
+          // far, and from now on its updates and requests, as an attach.
+          case '_codeflower/subagents/open': {
+            const key = requireOwnSession();
+            if (!self.subagents) throw new InvalidRequest('This window does not show subagents');
+            const host = agentHost;
+            const childId = liveSubagent(host, key);
+            const recordedParent = sessionsDirectory ? await parentKeyOf(sessionsDirectory, key) : undefined;
+            if (childId === undefined && !recordedParent) throw new InvalidRequest('Not a subagent of a chat on this worker');
+            while (recorder?.busy) await recorder.idle();
+            const summary = childId !== undefined ? publicSubagent(host.subagents.summary(childId)) : undefined;
+            if (childId !== undefined) self.sessions.add(childId);
+            respond({
+              key,
+              parentKey: summary?.parentKey ?? recordedParent,
+              live: childId !== undefined,
+              ...(childId !== undefined ? { sessionId: childId, transcriptEntries: recorder?.entryCount(childId) ?? 0, subagent: summary } : {})
+            });
+            if (childId !== undefined) {
+              deliverWaiting(host, self, childId);
+              await subagentAdapter.attach?.(childId, { request: (method, request) => requestAgent(host, method, request) });
+            }
+            break;
+          }
+          case '_codeflower/subagents/close': {
+            const childId = liveSubagent(agentHost, requireOwnSession());
+            if (childId !== undefined) self.sessions.delete(childId);
+            respond({});
+            break;
+          }
+          case '_codeflower/subagents/cancel': {
+            const host = agentHost;
+            const childId = liveSubagent(host, requireOwnSession());
+            if (childId === undefined) throw new InvalidRequest('The subagent is not running here');
+            const cancel = subagentAdapter.cancel?.(childId, host.subagents.summary(childId));
+            if (!cancel) throw new InvalidRequest(`${agent.label ?? agentName} cannot stop this subagent`);
+            writeToAgent(host, { jsonrpc: '2.0', ...cancel });
+            respond({});
+            break;
+          }
+          case '_codeflower/subagents/settings': {
+            if (!subagentSettings) throw new InvalidRequest(`${agent.label ?? agentName} has no subagents in code flower`);
+            if (params.settings !== undefined) {
+              await subagentSettings.set(params.settings);
+              broadcast({ jsonrpc: '2.0', method: '_codeflower/subagents/settingsChanged', params: subagentSettingsState() });
+            }
+            respond(subagentSettingsState());
             break;
           }
           case '_codeflower/agent/restart': {

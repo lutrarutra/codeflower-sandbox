@@ -729,7 +729,9 @@ test("manages the agent's plugins and starts the agent with them", async (t) => 
   const { bridge } = await startTestBridge(t, { plugins });
   const socket = await openSocket(bridge.address);
   assert.equal((await initialize(socket)).pluginSeed, '/empty');
-  assert.deepEqual((await call(socket, '_codeflower/status')).result.capabilities, { plugins: true, chatTerminals: true });
+  const { subagents, ...capabilities } = (await call(socket, '_codeflower/status')).result.capabilities;
+  assert.deepEqual(capabilities, { plugins: true, chatTerminals: true });
+  assert.deepEqual(subagents.settings, { model: { applies: 'session' } });
 
   assert.match((await call(socket, '_codeflower/plugins/add', { source: 'npm:x@1' })).error.message, /github:, not npm:/);
   const added = (await call(socket, '_codeflower/plugins/add', { source: 'github:org/mine' })).result;
@@ -756,7 +758,8 @@ test('an agent without plugins says so and refuses the plugin methods', async (t
   const socket = await openSocket(bridge.address);
   t.after(() => closeSocket(socket));
   await initialize(socket);
-  assert.deepEqual((await call(socket, '_codeflower/status')).result.capabilities, { plugins: false, chatTerminals: true });
+  const { subagents: _, ...capabilities } = (await call(socket, '_codeflower/status')).result.capabilities;
+  assert.deepEqual(capabilities, { plugins: false, chatTerminals: true });
   assert.deepEqual((await call(socket, '_codeflower/plugins/list')).result, { available: false });
   assert.match((await call(socket, '_codeflower/plugins/add', { source: 'github:a/b' })).error.message, /no plugins/);
 });
@@ -1714,3 +1717,194 @@ test('serves the chat page only with --server, to the link\'s holder, on its own
 });
   const ticket = async () =>
     (await (await fetch(`${origin}/api/ticket`, { method: 'POST', headers: { authorization, 'content-type': 'application/json' }, body: '{}' })).json()).ticket;
+
+// ---- subagents (src/subagents) ----
+
+const isUpdateOf = (sessionId) => (message) => message.method === 'session/update' && message.params?.sessionId === sessionId;
+
+async function newChat(socket) {
+  return (await call(socket, 'session/new', { cwd: '/workspace', mcpServers: [] })).result.sessionId;
+}
+
+async function prompt(socket, sessionId, text) {
+  return call(socket, 'session/prompt', { sessionId, prompt: [{ type: 'text', text }] });
+}
+
+test('asks the agent for subagents whichever window initializes it first', async (t) => {
+  const { bridge } = await startTestBridge(t);
+  const socket = await openSocket(bridge.address);
+  t.after(() => closeSocket(socket));
+  // A window that does not show subagents: the agent is asked all the same.
+  assert.equal((await initialize(socket)).subagents, true);
+});
+
+test("shows a chat's subagents in chats of their own, opened lazily, with summaries in the parent", async (t) => {
+  const { bridge, sessionsDirectory } = await startTestBridge(t);
+  const window = await openSocket(bridge.address);
+  const old = await openSocket(bridge.address);
+  t.after(() => closeSocket(window));
+  t.after(() => closeSocket(old));
+  await initialize(window, { subagents: {} });
+  await initialize(old);
+  const parentId = await newChat(window);
+  await call(old, 'session/resume', { sessionId: parentId, cwd: '/workspace', mcpServers: [] });
+  const parentKey = sessionKey('claude', parentId);
+  const childKey = sessionKey('claude', 'child-1');
+
+  const changed = receive(window, (message) => message.method === '_codeflower/subagents/changed' && message.params.subagent.state === 'idle');
+  assert.equal((await prompt(window, parentId, 'spawn subagent')).result.stopReason, 'end_turn');
+  const { params } = await changed;
+  assert.equal(params.parentKey, parentKey);
+  assert.equal(params.subagent.key, childKey);
+
+  // The parent's windows hear of the child, never its own work.
+  await call(window, '_codeflower/status');
+  for (const socket of [window, old]) {
+    assert.equal(inboxes.get(socket).messages.some(isUpdateOf('child-1')), false);
+  }
+  assert.equal(inboxes.get(window).messages.some((message) => message.params?.update?.sessionUpdate === 'subagent_update'), true);
+
+  const [subagent] = (await call(window, '_codeflower/subagents/list', { key: parentKey })).result.subagents;
+  assert.equal(subagent.key, childKey);
+  assert.equal(subagent.parentKey, parentKey);
+  assert.equal(subagent.title, 'Notes finder (Explore)');
+  assert.equal(subagent.prompt, 'Find the notes');
+  assert.equal(subagent.state, 'idle');
+  assert.equal(subagent.stopReason, 'end_turn');
+  assert.deepEqual(subagent.model, { value: 'small', name: 'Small model' });
+  assert.deepEqual(subagent.effort, { value: 'low', name: 'Low' });
+  assert.deepEqual(subagent.usage, { context: { used: 500, size: 100000 } });
+  assert.equal(subagent.lastMessage, 'The notes are in notes.txt');
+  assert.ok(subagent.startedAt && subagent.endedAt);
+
+  // Its chat is recorded beside its parent's, out of the chat list.
+  assert.deepEqual((await listSessions(sessionsDirectory)).map((session) => session.key), [parentKey]);
+  const recorded = await readTranscript(sessionsDirectory, childKey);
+  assert.deepEqual(
+    recorded.map((entry) => entry.update?.sessionUpdate),
+    ['session_message', 'config_option_update', 'usage_update', 'tool_call', 'agent_message_chunk', 'agent_message_chunk']
+  );
+  // The worker's usage is the chats'.
+  assert.equal((await call(window, '_codeflower/usage')).result.sessions.some((session) => session.key === childKey), false);
+
+  const opened = (await call(window, '_codeflower/subagents/open', { key: childKey })).result;
+  assert.deepEqual(
+    { live: opened.live, parentKey: opened.parentKey, entries: opened.transcriptEntries },
+    { live: true, parentKey, entries: recorded.length }
+  );
+  assert.match((await call(old, '_codeflower/subagents/open', { key: childKey })).error.message, /does not show subagents/);
+  assert.match((await call(window, '_codeflower/subagents/open', { key: parentKey })).error.message, /Not a subagent/);
+});
+
+test("a running subagent's updates reach the windows that opened it, its permissions its parent's, and it stops when asked", async (t) => {
+  const { bridge } = await startTestBridge(t);
+  const window = await openSocket(bridge.address);
+  t.after(() => closeSocket(window));
+  await initialize(window, { subagents: {} });
+  const parentId = await newChat(window);
+  const childKey = sessionKey('claude', 'child-1');
+
+  const answered = prompt(window, parentId, 'spawn subagent child asks keep running');
+  const permission = await receive(window, (message) => message.method === 'session/request_permission');
+  assert.equal(permission.params.sessionId, 'child-1');
+  assert.deepEqual(permission.params._meta['codeflower/parentSessionIds'], [parentId]);
+  send(window, { jsonrpc: '2.0', id: permission.id, result: { outcome: { outcome: 'selected', optionId: 'allow' } } });
+  assert.equal((await answered).result.stopReason, 'end_turn');
+  const [running] = (await call(window, '_codeflower/subagents/list', { key: sessionKey('claude', parentId) })).result.subagents;
+  assert.equal(running.state, 'running');
+
+  await call(window, '_codeflower/subagents/open', { key: childKey });
+  const said = receive(window, (message) => isUpdateOf('child-1')(message) && message.params.update.content?.text === 'still here');
+  await call(window, 'fake/childSays', { childId: 'child-1', text: 'still here' });
+  await said;
+
+  // Closed: no more of its updates.
+  await call(window, '_codeflower/subagents/close', { key: childKey });
+  await call(window, 'fake/childSays', { childId: 'child-1', text: 'unheard' });
+  await call(window, '_codeflower/status');
+  assert.equal(inboxes.get(window).messages.some((message) => message.params?.update?.content?.text === 'unheard'), false);
+
+  const stopped = receive(window, (message) => message.method === '_codeflower/subagents/changed' && message.params.subagent.state === 'idle');
+  assert.equal((await call(window, '_codeflower/subagents/cancel', { key: childKey })).error, undefined);
+  assert.equal((await stopped).params.subagent.stopReason, 'cancelled');
+});
+
+test("translates the draft form of subagents, and a subagent that cannot be stopped says so", async (t) => {
+  const { bridge, sessionsDirectory } = await startTestBridge(t, { agentName: 'codex' });
+  const window = await openSocket(bridge.address);
+  t.after(() => closeSocket(window));
+  await initialize(window, { subagents: {} });
+  const parentId = await newChat(window);
+  const parentKey = sessionKey('codex', parentId);
+  await prompt(window, parentId, 'spawn draft subagent keep running');
+  const [subagent] = (await call(window, '_codeflower/subagents/list', { key: parentKey })).result.subagents;
+  assert.deepEqual({ title: subagent.title, prompt: subagent.prompt, state: subagent.state }, { title: 'Notes finder', prompt: 'Find the notes', state: 'running' });
+  assert.match((await call(window, '_codeflower/subagents/cancel', { key: subagent.key })).error.message, /cannot stop/);
+
+  const ended = receive(window, (message) => message.method === '_codeflower/subagents/changed' && message.params.subagent.state === 'idle');
+  await call(window, 'fake/finishChild', { childId: 'child-1' });
+  assert.equal((await ended).params.subagent.stopReason, 'end_turn');
+  // Recorded in the canonical form.
+  const kinds = async () => (await readTranscript(sessionsDirectory, parentKey)).map((entry) => entry.update?.sessionUpdate).filter(Boolean);
+  await waitFor(async () => (await kinds()).filter((kind) => kind === 'subagent_update').length === 2);
+  assert.equal((await kinds()).includes('subagent_spawned'), false);
+});
+
+test('an agent without subagents in code flower keeps its own stream', async (t) => {
+  const { bridge } = await startTestBridge(t, { agentName: 'dsh' });
+  const window = await openSocket(bridge.address);
+  t.after(() => closeSocket(window));
+  assert.equal((await initialize(window, { subagents: {} })).subagents, true);
+  assert.equal((await call(window, '_codeflower/status')).result.capabilities.subagents, undefined);
+  assert.match((await call(window, '_codeflower/subagents/settings')).error.message, /no subagents/);
+});
+
+test('sets the default subagent model per session or for the next agent start, as the agent takes it', async (t) => {
+  const { bridge } = await startTestBridge(t);
+  const window = await openSocket(bridge.address);
+  t.after(() => closeSocket(window));
+  await initialize(window, { subagents: {} });
+  const unset = (await call(window, '_codeflower/subagents/settings')).result;
+  assert.deepEqual(unset.settings, { model: 'same', effort: 'same' });
+  const set = (await call(window, '_codeflower/subagents/settings', { settings: { model: 'small' } })).result;
+  assert.deepEqual({ settings: set.settings, restartPending: set.restartPending }, { settings: { model: 'small', effort: 'same' }, restartPending: false });
+  const sessionId = await newChat(window);
+  const reply = receive(window, (message) => isUpdateOf(sessionId)(message) && message.params.update.sessionUpdate === 'agent_message_chunk');
+  await prompt(window, sessionId, 'what meta');
+  const told = JSON.parse((await reply).params.update.content.text);
+  assert.equal(told.claudeCode.options.env.CLAUDE_CODE_SUBAGENT_MODEL, 'small');
+  assert.deepEqual(told.claudeCode.options.settings, { plansDirectory: 'plans' });
+});
+
+test('a setting the agent reads at start waits for its restart', async (t) => {
+  const { bridge } = await startTestBridge(t, { agentName: 'codex' });
+  const window = await openSocket(bridge.address);
+  assert.equal((await initialize(window, { subagents: {} })).codexConfig, null);
+  const changed = receive(window, (message) => message.method === '_codeflower/subagents/settingsChanged');
+  const set = (await call(window, '_codeflower/subagents/settings', { settings: { model: 'gpt-small', effort: 'low' } })).result;
+  assert.equal(set.restartPending, true);
+  assert.deepEqual(set.features.settings, { model: { applies: 'restart' }, effort: { applies: 'restart' } });
+  assert.equal((await changed).params.restartPending, true);
+  const ended = once(window, 'close');
+  await call(window, '_codeflower/agent/restart');
+  await ended;
+  const again = await openSocket(bridge.address);
+  t.after(() => closeSocket(again));
+  assert.deepEqual(JSON.parse((await initialize(again, { subagents: {} })).codexConfig), {
+    'agents.default_subagent_model': 'gpt-small',
+    'agents.default_subagent_reasoning_effort': 'low'
+  });
+  assert.equal((await call(again, '_codeflower/subagents/settings')).result.restartPending, false);
+});
+
+test("deleting a chat deletes its subagents' chats", async (t) => {
+  const { bridge, sessionsDirectory } = await startTestBridge(t);
+  const window = await openSocket(bridge.address);
+  t.after(() => closeSocket(window));
+  await initialize(window, { subagents: {} });
+  const parentId = await newChat(window);
+  await prompt(window, parentId, 'spawn subagent');
+  await waitFor(async () => (await readdir(sessionsDirectory)).length === 2);
+  assert.equal((await call(window, '_codeflower/sessions/delete', { key: sessionKey('claude', parentId) })).error, undefined);
+  assert.deepEqual(await readdir(sessionsDirectory), []);
+});

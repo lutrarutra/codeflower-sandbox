@@ -9,6 +9,8 @@ import { agentEnvironment, createRecorder, endChild } from './server.js';
 import { createSessionInfo } from './session-info.js';
 import { createSessionStore, readJson, sessionKey, writeJsonAtomically } from './sessions.js';
 import { createUsage, dshTokens } from './usage.js';
+import { createSubagentSettings, mergeMeta, settingsEffects } from './subagents/settings.js';
+import { createSubagentTracker } from './subagents/tracker.js';
 
 // A task runs the agent without VS Code: the runner is its ACP client. It
 // sets the task as the agent's goal, answers what a user would (permissions
@@ -506,9 +508,19 @@ export async function runTask({
   const command = await agent.command();
   const usageFd = agent.usageFd;
   const pluginEnvironment = (await plugins?.activate()) ?? {};
+  // The project's subagent settings, as chats get them (subagents/settings.js).
+  const subagentAdapter = agent.subagents;
+  const subagentSettings = subagentAdapter
+    ? await createSubagentSettings({ file: join(dirname(sessionsDirectory), 'subagents', `${agentName}.json`), log })
+    : undefined;
+  const subagentEffects = subagentSettings
+    ? settingsEffects(subagentAdapter.spec.settings, subagentSettings.get(), { ...environment, ...agent.env })
+    : { sessionMeta: {}, env: {} };
+  const sessionMeta = mergeMeta(agent.sessionMeta, subagentEffects.sessionMeta);
   const child = spawn(command[0], command.slice(1), {
     env: agentEnvironment(environment, {
       ...agent.env,
+      ...subagentEffects.env,
       ...pluginEnvironment,
       ...(usageFd ? { CODEFLOWER_USAGE_FD: String(usageFd) } : {})
     }),
@@ -593,10 +605,33 @@ export async function runTask({
     return undefined;
   };
 
+  // The task's subagents, recorded as chats of their own beside it, as the
+  // bridge does for chats; only the task's own updates make its answer.
+  const subagents = createSubagentTracker({
+    onChange: (summary) =>
+      void recorder.setSubagent(summary.sessionId, {
+        ...summary,
+        key: sessionKey(agentName, summary.sessionId),
+        parentKey: sessionKey(agentName, summary.parentId)
+      })
+  });
+
   // A loaded session's history comes back as updates: it is recorded already.
   let replaying = false;
   const fromAgent = (message) => {
     if (replaying && message.method === 'session/update') return;
+    if (message.method === 'session/update' && typeof message.params?.sessionId === 'string') {
+      const translated = subagentAdapter?.translate(message.params.update, message.params.sessionId);
+      for (const { sessionId: target, update } of translated ?? [{ sessionId: message.params.sessionId, update: message.params.update }]) {
+        subagents.observe(target, update);
+        if (update?.sessionUpdate === 'subagent_update' && typeof update.sessionId === 'string') void recorder.openChild(update.sessionId, target);
+        relayUpdate({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: target, update } });
+      }
+      return;
+    }
+    relayUpdate(message);
+  };
+  const relayUpdate = (message) => {
     recorder.fromAgent(message);
     if (message.method === undefined) {
       const pending = calls.get(message.id);
@@ -609,6 +644,7 @@ export async function runTask({
       return;
     }
     if (message.method === 'session/update') {
+      if (message.params?.sessionId !== sessionId) return;
       const update = message.params?.update;
       if (update?.sessionUpdate === 'agent_message_chunk' && update.content?.type === 'text') {
         turnText += update.content.text;
@@ -808,7 +844,11 @@ export async function runTask({
   try {
     const initialized = await call('initialize', {
       protocolVersion: 1,
-      clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+      clientCapabilities: {
+        fs: { readTextFile: false, writeTextFile: false },
+        terminal: false,
+        ...subagentAdapter?.clientCapabilities
+      },
       clientInfo: { name: 'codeflower-task', version: '1' }
     });
     sessionInfo.reported(initialized?.agentInfo);
@@ -850,7 +890,7 @@ export async function runTask({
       const params = {
         sessionId,
         cwd: saved.cwd ?? workspace,
-        ...(agent.sessionMeta ? { _meta: agent.sessionMeta } : {})
+        ...(Object.keys(sessionMeta).length ? { _meta: sessionMeta } : {})
       };
       replaying = true;
       try {
@@ -869,7 +909,7 @@ export async function runTask({
     } else {
       session = await startSession('session/new', {
         cwd: workspace,
-        ...(agent.sessionMeta ? { _meta: agent.sessionMeta } : {}),
+        ...(Object.keys(sessionMeta).length ? { _meta: sessionMeta } : {}),
         ...(systemPrompt ? { systemPrompt: { mode: 'append', content: [{ type: 'text', text: instructions }] } } : {})
       });
       sessionId = session.sessionId;
