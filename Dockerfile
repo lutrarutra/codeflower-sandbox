@@ -51,7 +51,7 @@ ADD --keep-git-dir=false https://github.com/lutrarutra/storyteller.git#v0.3.0 /
 # codeflower-ui's web build, pinned by tag. A development build uses the
 # workspace's build instead: --build-context page=../ui/dist-web.
 FROM scratch AS ui-source
-ADD --keep-git-dir=false https://github.com/lutrarutra/codeflower-ui.git#v0.13.0 /
+ADD --keep-git-dir=false https://github.com/lutrarutra/codeflower-ui.git#v0.14.0 /
 
 FROM node:22-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS page-build
 WORKDIR /ui
