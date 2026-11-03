@@ -1817,6 +1817,26 @@ export async function startBridge(options) {
   const toSettings = (sessionId, update, except) =>
     toSession(sessionId, { jsonrpc: '2.0', method: 'session/update', params: { sessionId, update } }, except);
 
+  // A setting that follows another, or a new chat's start, as the agent's
+  // index.js says (followSetting, e.g. OpenCode's model for each mode, dsh's
+  // last model): asked of the agent like a window's change, whose answer
+  // reaches every window.
+  const followSetting = async (host, sessionId, configId, value, started = false) => {
+    const state = host.sessions.get(sessionId);
+    if (!agent.followSetting || !state || (!started && typeof configId !== 'string')) return;
+    try {
+      const follow = await agent.followSetting({ configId, value, configOptions: state.configOptions ?? [], started });
+      if (follow) await requestAgent(host, 'session/set_config_option', { sessionId, configId: follow.configId, value: follow.value });
+    } catch (error) {
+      log(`Could not apply the setting that follows ${configId}: ${error.message}`);
+    }
+  };
+  // A new chat starts, in a mode if the agent has modes, which settings may follow too.
+  const followMode = (host, sessionId) => {
+    const mode = (host.sessions.get(sessionId)?.configOptions ?? []).find((option) => option?.category === 'mode');
+    return followSetting(host, sessionId, mode?.id, mode?.currentValue, true);
+  };
+
   // The agent answered a client request.
   const settleRequest = (host, request, message) => {
     const { method, params, key } = request;
@@ -1854,7 +1874,13 @@ export async function startBridge(options) {
         void (recorder?.isOpen(sessionId) ?? Promise.resolve()).then(() =>
           usage.opened(sessionId, store?.storedUsage(sessionId))
         );
-        if (clients.has(request.client)) void attachSession(host, request.client, request.id, sessionId, result);
+        if (clients.has(request.client)) {
+          void attachSession(host, request.client, request.id, sessionId, result).then(() => {
+            if (method === 'session/new') return followMode(host, sessionId);
+          });
+        } else if (method === 'session/new') {
+          void followMode(host, sessionId);
+        }
         return true;
       // The agent let go of the chat: the next window or terminal to open it
       // loads it again, instead of attaching to what the agent no longer has.
@@ -1874,6 +1900,7 @@ export async function startBridge(options) {
           state.configOptions = result.configOptions;
           sessionInfo.settings(sessionId, state);
           toSettings(sessionId, { sessionUpdate: 'config_option_update', configOptions: result.configOptions }, request.client);
+          void followSetting(host, sessionId, params?.configId, params?.value);
         }
         break;
       case 'session/set_mode':

@@ -5,21 +5,52 @@
 import { randomBytes } from 'node:crypto';
 import { createServer } from 'node:net';
 import { join } from 'node:path';
-import { exists, readText } from '../support.js';
+import { exists, readText, writePrivate } from '../support.js';
 import { watchEvents } from './events.js';
 
 const DATABASE = 'opencode.db';
+// The model chosen for each mode (OpenCode's agents), in a config of code
+// flower's own that OpenCode merges under the user's (OPENCODE_CONFIG).
+const MODE_MODELS = 'codeflower-models.json';
+// The agent OpenCode starts a chat in, unless the config names another.
+const DEFAULT_MODE = 'build';
 const CONFIG_FILES = ['opencode.json', 'opencode.jsonc'];
 const SERVER_HOST = '127.0.0.1';
 
-export default function opencode({ descriptor, home, launch, nodePath }) {
-  // Its logins and sessions are in one SQLite database, which goes into its
-  // home with its config; the rest of its data stays in HOME.
-  const env = { ...descriptor.env, ...(home ? { OPENCODE_DB: join(home, DATABASE) } : {}) };
+export default function opencode({ descriptor, home, launch, nodePath, environment = {} }) {
+  // Its sessions are in one SQLite database, which goes into its home with its
+  // config; the rest of its data stays in HOME, including the keys that
+  // `opencode auth login` saves (auth.json).
+  const dataHome = environment.XDG_DATA_HOME || (environment.HOME ? join(environment.HOME, '.local', 'share') : undefined);
+  const authFile = dataHome ? join(dataHome, 'opencode', 'auth.json') : undefined;
+  const env = { ...descriptor.env, ...(home ? { OPENCODE_DB: join(home, DATABASE), OPENCODE_CONFIG: join(home, MODE_MODELS) } : {}) };
+  const modeModels = home ? join(home, MODE_MODELS) : undefined;
+  // One change of the file at a time, so none is lost.
+  let modeModelsQueue = Promise.resolve();
   // `opencode acp` serves OpenCode's own API beside ACP. The bridge picks its
   // port and password, so the terminal UI (`opencode attach`) joins the same
   // server and both show the same chats live.
   let server;
+  // What a change of setting means for the models saved by mode (followSetting).
+  async function followMode({ configId, value, configOptions }) {
+    if (!modeModels || typeof value !== 'string') return undefined;
+    const model = configOptions.find((option) => option?.category === 'model');
+    const mode = configOptions.find((option) => option?.category === 'mode');
+    if (!model || !mode) return undefined;
+    const saved = await readModeModels(modeModels);
+    if (configId === model.id) {
+      const current = typeof mode.currentValue === 'string' ? mode.currentValue : undefined;
+      if (!current || saved.agent?.[current]?.model === value) return undefined;
+      const next = { ...saved, agent: { ...saved.agent, [current]: { ...saved.agent?.[current], model: value } } };
+      if (current === DEFAULT_MODE) next.model = value;
+      await writePrivate(modeModels, `${JSON.stringify(next, null, 2)}\n`);
+      return undefined;
+    }
+    if (configId !== mode.id) return undefined;
+    const wanted = saved.agent?.[value]?.model;
+    const offered = (model.options ?? []).flatMap((entry) => entry?.options ?? [entry]).some((choice) => choice?.value === wanted);
+    return wanted && wanted !== model.currentValue && offered ? { configId: model.id, value: wanted } : undefined;
+  }
   const run = (...args) => (launch.endsWith('.js') ? [nodePath, launch, ...args] : [launch, ...args]);
   return {
     // Tests start a fake agent script in its place.
@@ -49,6 +80,19 @@ export default function opencode({ descriptor, home, launch, nodePath }) {
       if (!server) return () => {};
       return watchEvents({ ...server, emit, log });
     },
+    // A model for each mode. OpenCode itself (its terminal UI, `opencode run`)
+    // takes each agent's model from its config, `agent.<mode>.model`, but
+    // `opencode acp` keeps one model through mode changes and starts each chat
+    // on the top-level `model`. So a model chosen in a window is saved for the
+    // chat's mode (and for the default mode as the top-level model too), and a
+    // change of mode, or a new chat, brings that mode's model back. OpenCode
+    // reads the file when it starts, so its terminal UI follows from the next
+    // start; a model the user gave a mode in their own config comes first there.
+    followSetting(change) {
+      const result = modeModelsQueue.then(() => followMode(change));
+      modeModelsQueue = result.catch(() => {});
+      return result;
+    },
     // A key alone does not say whose it is, among OpenCode's providers.
     async provideKey() {
       return "OpenCode needs to know the key's provider: sign in from the chat (Sign in…) instead";
@@ -57,7 +101,9 @@ export default function opencode({ descriptor, home, launch, nodePath }) {
     // (e.g. vLLM on the cluster), which may need neither.
     async signedIn() {
       if (!home) return false;
-      return (await storedCredential(join(home, DATABASE))) || (await configuredProvider(home));
+      return (
+        (await storedCredential(join(home, DATABASE))) || (await savedKey(authFile)) || (await configuredProvider(home))
+      );
     }
   };
 }
@@ -86,6 +132,26 @@ async function storedCredential(file) {
   } catch {
     // Not migrated yet, or a schema of another version: no login to go by.
     return false;
+  }
+}
+
+// The providers `opencode auth login` saved a key or login for.
+async function savedKey(file) {
+  if (!file) return false;
+  try {
+    const providers = JSON.parse(await readText(file));
+    return Object.keys(providers ?? {}).length > 0;
+  } catch {
+    return false;
+  }
+}
+
+async function readModeModels(file) {
+  try {
+    const saved = JSON.parse(await readText(file));
+    return saved !== null && typeof saved === 'object' && !Array.isArray(saved) ? saved : {};
+  } catch {
+    return {};
   }
 }
 

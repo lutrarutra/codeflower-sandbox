@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -54,7 +54,8 @@ test('keeps its database in its home and turns off what calls out on its own', a
   const { opencode, home } = await setup(t);
   assert.equal(opencode.env.OPENCODE_DB, join(home, 'opencode.db'));
   assert.equal(opencode.env.OPENCODE_DISABLE_AUTOUPDATE, '1');
-  assert.equal(opencode.env.OPENCODE_DISABLE_FREE_MODELS, '1');
+  // OpenCode Zen's free models stay, as OpenCode ships them (disabled_providers turns them off).
+  assert.equal(opencode.env.OPENCODE_DISABLE_FREE_MODELS, undefined);
 });
 
 test('is signed in with a stored credential', async (t) => {
@@ -69,6 +70,23 @@ test('is signed in with a stored credential', async (t) => {
   assert.equal(await opencode.signedIn(), false);
   database.prepare('INSERT INTO credential VALUES (?, ?, ?)').run('c1', 'OpenAI', '{}');
   database.close();
+  assert.equal(await opencode.signedIn(), true);
+});
+
+test('is signed in with a key `opencode auth login` saved in its data folder', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'codeflower-opencode-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const agents = (await loadRegistry()).filter(({ descriptor }) => descriptor.id === 'opencode');
+  const { opencode } = createAgents({
+    nodePath: 'node',
+    environment: { OPENCODE_CONFIG_DIR: join(home, 'harness'), HOME: home },
+    agents
+  });
+  assert.equal(await opencode.signedIn(), false);
+  await mkdir(join(home, '.local', 'share', 'opencode'), { recursive: true });
+  await writeFile(join(home, '.local', 'share', 'opencode', 'auth.json'), '{}');
+  assert.equal(await opencode.signedIn(), false);
+  await writeFile(join(home, '.local', 'share', 'opencode', 'auth.json'), JSON.stringify({ openrouter: { type: 'api', key: 'sk-or-test' } }));
   assert.equal(await opencode.signedIn(), true);
 });
 
@@ -90,4 +108,38 @@ test("says why it does not use the app config's key", async (t) => {
 test('never shares sessions on its own', async () => {
   const [{ descriptor }] = (await loadRegistry()).filter(({ descriptor }) => descriptor.id === 'opencode');
   assert.match(descriptor.files['opencode.jsonc'], /"share": "disabled"/);
+});
+
+// `opencode acp` keeps one model through mode changes; OpenCode's terminal UI
+// takes each mode's (agent's) model from its config.
+test('keeps a model for each mode, in a config of its own that OpenCode reads', async (t) => {
+  const { opencode, home } = await setup(t);
+  const file = join(home, 'codeflower-models.json');
+  assert.equal(opencode.env.OPENCODE_CONFIG, file);
+  const options = (mode, model) => [
+    { id: 'model', category: 'model', currentValue: model, options: ['opencode/big-pickle', 'openrouter/openrouter/free', 'openrouter/qwen/qwen3-32b'].map((value) => ({ value })) },
+    { id: 'mode', category: 'mode', currentValue: mode, options: [{ value: 'build' }, { value: 'plan' }] }
+  ];
+  // Nothing saved yet: a mode brings no model.
+  assert.equal(await opencode.followSetting({ configId: 'mode', value: 'build', configOptions: options('build', 'opencode/big-pickle') }), undefined);
+  // Chosen in build, the default mode: also the model new chats start on.
+  assert.equal(await opencode.followSetting({ configId: 'model', value: 'openrouter/openrouter/free', configOptions: options('build', 'openrouter/openrouter/free') }), undefined);
+  await opencode.followSetting({ configId: 'model', value: 'openrouter/qwen/qwen3-32b', configOptions: options('plan', 'openrouter/qwen/qwen3-32b') });
+  assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), {
+    agent: { build: { model: 'openrouter/openrouter/free' }, plan: { model: 'openrouter/qwen/qwen3-32b' } },
+    model: 'openrouter/openrouter/free'
+  });
+  // A change of mode brings its model, unless it is already on it.
+  assert.deepEqual(await opencode.followSetting({ configId: 'mode', value: 'build', configOptions: options('build', 'openrouter/qwen/qwen3-32b') }), {
+    configId: 'model',
+    value: 'openrouter/openrouter/free'
+  });
+  assert.equal(await opencode.followSetting({ configId: 'mode', value: 'plan', configOptions: options('plan', 'openrouter/qwen/qwen3-32b') }), undefined);
+  // Nor a model OpenCode no longer offers (a provider signed out).
+  const without = options('build', 'opencode/big-pickle');
+  without[0].options = [{ value: 'opencode/big-pickle' }];
+  assert.equal(await opencode.followSetting({ configId: 'mode', value: 'build', configOptions: without }), undefined);
+  // A damaged file counts as none.
+  await writeFile(file, '{ not json');
+  assert.equal(await opencode.followSetting({ configId: 'mode', value: 'build', configOptions: options('build', 'opencode/big-pickle') }), undefined);
 });

@@ -156,6 +156,17 @@ function configOptions(sessionId) {
       ]
     }
   ];
+  if (process.argv[2] === 'acp') {
+    // As `opencode acp` offers them: provider/model strings, one model through mode changes.
+    options.push({
+      id: 'model',
+      name: 'Model',
+      category: 'model',
+      type: 'select',
+      currentValue: values.model ?? 'opencode/big-pickle',
+      options: ['opencode/big-pickle', 'openrouter/openrouter/free', 'openrouter/qwen/qwen3-32b'].map((value) => ({ value, name: value }))
+    });
+  }
   if (process.argv.includes('--models')) {
     // Grouped by provider, with [provider, model] values, like dsh's.
     options.push({

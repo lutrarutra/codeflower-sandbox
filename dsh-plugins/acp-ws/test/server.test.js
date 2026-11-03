@@ -368,6 +368,51 @@ test('runs OpenCode with its database in its home until it is signed in', async 
   assert.equal(status.signedIn, false);
 });
 
+test("OpenCode's model follows its mode, in every window and in a new chat", async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'codeflower-opencode-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const agents = createAgents({
+    nodePath: process.execPath,
+    launch: { opencode: fakeAgent },
+    environment: { OPENCODE_CONFIG_DIR: home },
+    agents: (await loadRegistry()).filter(({ descriptor }) => descriptor.id === 'opencode')
+  });
+  assert.equal(agents.opencode.env.OPENCODE_CONFIG, join(home, 'codeflower-models.json'));
+  const { bridge } = await startTestBridge(t, { agentName: 'opencode', agent: agents.opencode });
+  const window = await openSocket(bridge.address);
+  const other = await openSocket(bridge.address);
+  t.after(() => closeSocket(window));
+  t.after(() => closeSocket(other));
+  await initialize(window);
+  await initialize(other);
+  const sessionId = await newChat(window);
+  await call(other, 'session/resume', { sessionId, cwd: '/w', mcpServers: [] });
+  const model = (options) => options.find((option) => option.id === 'model').currentValue;
+  const set = async (configId, value) => (await call(window, 'session/set_config_option', { sessionId, configId, value })).result.configOptions;
+
+  // Chosen per mode, and saved for OpenCode's terminal UI.
+  await set('model', 'openrouter/qwen/qwen3-32b');
+  await set('mode', 'plan');
+  await set('model', 'openrouter/openrouter/free');
+  const saved = async () => JSON.parse(await readFile(join(home, 'codeflower-models.json'), 'utf8').catch(() => '{}'));
+  await waitFor(async () => (await saved()).agent?.plan?.model === 'openrouter/openrouter/free');
+  assert.deepEqual(await saved(), {
+    agent: { default: { model: 'openrouter/qwen/qwen3-32b' }, plan: { model: 'openrouter/openrouter/free' } }
+  });
+
+  // Back in the first mode, its model comes back, in both windows.
+  const followed = (socket) =>
+    receive(socket, (message) => message.params?.update?.sessionUpdate === 'config_option_update' && model(message.params.update.configOptions) === 'openrouter/qwen/qwen3-32b');
+  const seen = [followed(window), followed(other)];
+  assert.equal(model(await set('mode', 'default')), 'openrouter/openrouter/free');
+  await Promise.all(seen);
+
+  // A new chat starts on its mode's model.
+  const fresh = receive(window, (message) => message.params?.update?.sessionUpdate === 'config_option_update' && model(message.params.update.configOptions) === 'openrouter/qwen/qwen3-32b');
+  const next = await newChat(window);
+  assert.equal((await fresh).params.sessionId, next);
+});
+
 test('describes every built-in agent completely', async () => {
   for (const { descriptor } of await loadRegistry()) {
     assert.match(descriptor.id, /^[a-z][a-z0-9-]*$/);
