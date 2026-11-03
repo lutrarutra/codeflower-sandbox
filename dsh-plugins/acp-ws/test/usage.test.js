@@ -128,6 +128,15 @@ test('a session adds up its turns and a running cost that starts over', () => {
   assert.ok(changes > 0);
 });
 
+test("keeps the context when a cancelled turn reports it empty (OpenCode's)", () => {
+  const usage = createUsage();
+  usage.update('s', { sessionUpdate: 'usage_update', used: 0, size: 1000 });
+  assert.deepEqual(usage.snapshot().sessions[0].context, { used: 0, size: 1000 });
+  usage.update('s', { sessionUpdate: 'usage_update', used: 300, size: 1000 });
+  usage.update('s', { sessionUpdate: 'usage_update', used: 0, size: 1000 });
+  assert.deepEqual(usage.snapshot().sessions[0].context, { used: 300, size: 1000 });
+});
+
 test('counts reported beside ACP go to the turn that ends next', () => {
   const usage = createUsage();
   usage.reported('s', dshTokens({ inputTokens: 10, outputTokens: 5 }));

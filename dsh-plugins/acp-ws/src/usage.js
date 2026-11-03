@@ -251,7 +251,12 @@ export function createUsage({ costEstimate = false, saved, onChange = () => {}, 
     update(sessionId, update) {
       if (!object(update) || update.sessionUpdate !== 'usage_update') return;
       const state = session(sessionId);
-      if (Number.isFinite(update.used) && Number.isFinite(update.size)) state.context = { used: update.used, size: update.size };
+      // An empty context after a fuller one is what OpenCode reports for a
+      // cancelled turn: the chat still holds its messages.
+      const emptied = update.used === 0 && state.context?.used > 0;
+      if (Number.isFinite(update.used) && Number.isFinite(update.size) && !emptied) {
+        state.context = { used: update.used, size: update.size };
+      }
       const cost = update.cost;
       if (object(cost) && Number.isFinite(cost.amount) && typeof cost.currency === 'string') {
         // A running total of the agent's query; a smaller one means it started over.
