@@ -1879,7 +1879,8 @@ test('sets the default subagent model per session or for the next agent start, a
 test('a setting the agent reads at start waits for its restart', async (t) => {
   const { bridge } = await startTestBridge(t, { agentName: 'codex' });
   const window = await openSocket(bridge.address);
-  assert.equal((await initialize(window, { subagents: {} })).codexConfig, null);
+  // Codex's own config from its descriptor (multi_agent_v2), to which the settings add theirs.
+  assert.deepEqual(JSON.parse((await initialize(window, { subagents: {} })).codexConfig), { 'features.multi_agent_v2': true });
   const changed = receive(window, (message) => message.method === '_codeflower/subagents/settingsChanged');
   const set = (await call(window, '_codeflower/subagents/settings', { settings: { model: 'gpt-small', effort: 'low' } })).result;
   assert.equal(set.restartPending, true);
@@ -1891,6 +1892,7 @@ test('a setting the agent reads at start waits for its restart', async (t) => {
   const again = await openSocket(bridge.address);
   t.after(() => closeSocket(again));
   assert.deepEqual(JSON.parse((await initialize(again, { subagents: {} })).codexConfig), {
+    'features.multi_agent_v2': true,
     'agents.default_subagent_model': 'gpt-small',
     'agents.default_subagent_reasoning_effort': 'low'
   });

@@ -1,4 +1,12 @@
 // Codex through its ACP adapter (which runs `codex app-server`).
+//
+// Known upstream: Stop (`session/cancel`) ends the turn as cancelled, but a
+// command Codex was running keeps going (seen with codex-acp 2.3.0, Codex
+// 0.164: `sleep 90` still ran after Stop). It is Codex's, not the adapter's:
+// https://github.com/openai/codex/issues/42717 (a stopped sub-agent's command
+// too: https://github.com/openai/codex/issues/57863). The bridge does not kill
+// the turn's processes itself, as it cannot tell them from those the agent
+// leaves running on purpose. Check those issues when updating Codex.
 import { randomBytes } from 'node:crypto';
 import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';

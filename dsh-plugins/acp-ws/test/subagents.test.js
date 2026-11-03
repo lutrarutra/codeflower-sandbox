@@ -6,6 +6,7 @@ import test from 'node:test';
 import { airDraft, createSubagentAdapter, subagentFeatures } from '../src/subagents/adapters.js';
 import { createSubagentSettings, mergeMeta, settingsEffects } from '../src/subagents/settings.js';
 import { createSubagentTracker } from '../src/subagents/tracker.js';
+import { loadRegistry } from '../src/agents.js';
 
 test('an agent names its adapter, and its index.js may replace parts of it', () => {
   assert.equal(createSubagentAdapter(undefined, undefined), undefined);
@@ -31,6 +32,18 @@ test('the draft form becomes the RFD form', () => {
   assert.deepEqual(ended('failed'), { state: 'idle', stopReason: 'error' });
   assert.deepEqual(ended('cancelled'), { state: 'idle', stopReason: 'cancelled' });
   assert.deepEqual(ended('disconnected'), { state: 'unknown' });
+});
+
+// codex-acp 2.3.0 makes a subagent a session of its own only from Codex's
+// `subAgentActivity` items, which only multi_agent_v2 sends. Without them it
+// holds the child back, so the child's approvals never reach the user and
+// the parent's turn waits on it for good.
+test("Codex runs with multi_agent_v2, which the subagent settings keep", async () => {
+  const [{ descriptor }] = (await loadRegistry()).filter(({ descriptor }) => descriptor.id === 'codex');
+  assert.equal(descriptor.subagents.adapter, 'air-draft');
+  assert.deepEqual(JSON.parse(descriptor.env.CODEX_CONFIG), { 'features.multi_agent_v2': true });
+  const { env } = settingsEffects(descriptor.subagents.settings, { model: 'small', effort: 'same' }, descriptor.env);
+  assert.deepEqual(JSON.parse(env.CODEX_CONFIG), { 'features.multi_agent_v2': true, 'agents.default_subagent_model': 'small' });
 });
 
 test('features say only what the descriptor declares', () => {
