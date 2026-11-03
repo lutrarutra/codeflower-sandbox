@@ -456,6 +456,19 @@ input.on('line', async (line) => {
         );
         break;
       }
+      if (text === 'run failing command') {
+        // As dsh-acp reports a command that exited 1: completed, with the marker.
+        const { sessionId } = message.params;
+        update(sessionId, { sessionUpdate: 'tool_call', toolCallId: 'bash-1', title: 'bash', kind: 'other', status: 'in_progress', rawInput: { command: 'false' } });
+        update(sessionId, {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'bash-1',
+          status: 'completed',
+          content: [{ type: 'content', content: { type: 'text', text: '[exit code: 1]' } }]
+        });
+        reply(sessionId, message.id, 'it failed');
+        break;
+      }
       if (text === 'what meta') {
         reply(message.params.sessionId, message.id, JSON.stringify(sessionMeta.get(message.params.sessionId)));
         break;

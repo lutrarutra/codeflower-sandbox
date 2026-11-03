@@ -1895,6 +1895,21 @@ test("translates the draft form of subagents, and a subagent that cannot be stop
   assert.equal((await kinds()).includes('subagent_spawned'), false);
 });
 
+test("dsh's command that exited badly reaches the windows and the transcript as failed", async (t) => {
+  const { bridge, sessionsDirectory } = await startTestBridge(t, { agentName: 'dsh' });
+  const window = await openSocket(bridge.address);
+  t.after(() => closeSocket(window));
+  await initialize(window);
+  const sessionId = await newChat(window);
+  const ended = receive(window, (message) => message.params?.update?.sessionUpdate === 'tool_call_update');
+  await prompt(window, sessionId, 'run failing command');
+  assert.equal((await ended).params.update.status, 'failed');
+  const toolEnd = async () => (await readTranscript(sessionsDirectory, sessionKey('dsh', sessionId))).find((entry) => entry.update?.sessionUpdate === 'tool_call_update');
+  await waitFor(async () => (await toolEnd()) !== undefined);
+  const recorded = await toolEnd();
+  assert.deepEqual({ status: recorded.update.status, rawOutput: recorded.update.rawOutput }, { status: 'failed', rawOutput: { exitCode: 1 } });
+});
+
 test('an agent without subagents in code flower keeps its own stream', async (t) => {
   const { bridge } = await startTestBridge(t, { agentName: 'dsh' });
   const window = await openSocket(bridge.address);

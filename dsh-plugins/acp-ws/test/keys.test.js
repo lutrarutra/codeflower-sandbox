@@ -90,7 +90,8 @@ test('adds default effort metadata to existing custom endpoint patches on startu
   assert.deepEqual(patch[0].config.providers['codeflower-openai-compat'].models, [
     { id: 'existing-model', reasoningEfforts: { low: 'low', medium: 'medium', high: 'high' } }
   ]);
-  assert.deepEqual(command.slice(-2), ['--patch', path]);
+  // With no DeepSeek key, also the patch that starts fresh chats on the route (dsh.test.js).
+  assert.deepEqual(command.slice(-4), ['--patch', path, '--patch', join(environment.DSH_HOME, 'codeflower-default-model.patch.yml')]);
 });
 
 test("stores a configured key in Claude Code's settings and keeps its other settings", async (t) => {

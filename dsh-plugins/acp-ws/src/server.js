@@ -1961,7 +1961,15 @@ export async function startBridge(options) {
     const sessionId = typeof message.params?.sessionId === 'string' ? message.params.sessionId : undefined;
 
     if (message.method === 'session/update') {
-      const update = message.params?.update;
+      let update = message.params?.update;
+      // The agent's own corrections (index.js's adjustUpdate, e.g. dsh's
+      // failed commands), before anything records or reads the update.
+      const adjusted = agent.adjustUpdate?.(update);
+      if (adjusted) {
+        update = adjusted;
+        message = { ...message, params: { ...message.params, update } };
+        frame = undefined;
+      }
       // In the canonical form of subagents (subagents/adapters.js).
       const translated = sessionId !== undefined ? subagentAdapter?.translate(update, sessionId) : undefined;
       if (translated) {
