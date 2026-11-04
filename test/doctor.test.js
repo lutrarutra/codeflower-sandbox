@@ -17,7 +17,6 @@ test('startup facts and live diagnostics are specific to the worker', (t) => {
   const env = {
     ...process.env,
     PATH: `${dir}:${process.env.PATH}`,
-    CODEFLOWER_AGENT: 'codex',
     CODEFLOWER_ENGINE: 'docker',
     CODEFLOWER_NETWORK: 'isolated',
     CODEFLOWER_MOUNTS: JSON.stringify([
@@ -28,7 +27,7 @@ test('startup facts and live diagnostics are specific to the worker', (t) => {
   };
   execFileSync(process.execPath, [doctor, '--write-startup', snapshot], { env });
   const facts = readFileSync(snapshot, 'utf8');
-  assert.match(facts, /Agent: codex/);
+  assert.match(facts, /Agents: every agent of the image runs here/);
   assert.match(facts, /Engine: docker/);
   assert.match(facts, /"\/data\/input\/example": read-only, "\/private\/host\/path" on the user's computer/);
   assert.match(facts, /"\/data\/output\/results": read-write, "\/private\/results" \(given as "\/home\/results"\)/);
