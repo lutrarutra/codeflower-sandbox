@@ -1,0 +1,20 @@
+# R's site profile in the sandbox (/etc/R/Rprofile.site).
+local({
+  # CRAN through Posit Package Manager, which serves binaries for this Debian
+  # release on x86_64, to a user agent naming R's version and platform. Its
+  # binary URL serves source on arm64, where pak would then plan a binary
+  # install and leave out the build's LinkingTo packages: use its source URL.
+  binary <- R.version$arch == "x86_64"
+  options(
+    repos = c(CRAN = paste0("https://packagemanager.posit.co/cran/", if (binary) "__linux__/trixie/", "latest")),
+    HTTPUserAgent = sprintf("R/%s R (%s)", getRversion(),
+                            paste(getRversion(), R.version$platform, R.version$arch, R.version$os))
+  )
+  # The project's library (R_LIBS_USER, one folder per R version) is created on
+  # first use: R leaves out a missing one, and installs would then fail.
+  user <- strsplit(Sys.getenv("R_LIBS_USER"), ":", fixed = TRUE)[[1]]
+  user <- path.expand(base:::.expand_R_libs_env_var(user[nzchar(user)]))
+  if (length(user) && !dir.exists(user[1]) && dir.create(user[1], recursive = TRUE, showWarnings = FALSE)) {
+    .libPaths(c(user[1], .libPaths()))
+  }
+})

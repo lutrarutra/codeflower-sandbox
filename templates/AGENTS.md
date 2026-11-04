@@ -45,10 +45,10 @@ searching for it.
 
 ## Sandbox capabilities
 
-The image includes Python 3.14, conda, uv, Node.js, git, curl, ripgrep (`rg`) and
-`build-essential` (including a C/C++ compiler and make). The project venv can see the image's Python
-packages. R, OpenCV, ffmpeg, extra native libraries and GPU tooling are not guaranteed: check before
-relying on them, and install what you need in a project environment.
+The image includes Python 3.14, conda, uv, R 4.5 (see "R" below), Node.js, git, curl, ripgrep (`rg`)
+and `build-essential` (including a C/C++ compiler and make). The project venv can see the image's
+Python packages. OpenCV, ffmpeg, extra native libraries and GPU tooling are not guaranteed: check
+before relying on them, and install what you need in a project environment.
 
 At the start of a task, run `codeflower-doctor` for this worker's startup facts and current CPU,
 memory, disk, GPU and network information. Its allocation section is what the batch job (or the
@@ -76,10 +76,10 @@ You manage the environment yourself: install what the analysis needs, without as
   `uv venv /codeflower-state/env/venvs/<name>`, install with
   `uv pip install --python /codeflower-state/env/venvs/<name>/bin/python <package>`, and run scripts
   with that environment's `bin/python`.
-- For other tools, R, Bioconductor, or Python packages that need native dependencies, use a conda
-  environment, e.g. `conda create -y -n r -c conda-forge -c bioconda r-base r-seurat`, then
-  `conda run -n r Rscript script.R`. Environments are stored in the project. R is not explicitly
-  installed in the image.
+- R packages: see "R" below.
+- For other tools, or Python packages that need native dependencies, use a conda environment, e.g.
+  `conda create -y -n tools -c conda-forge -c bioconda samtools`, then `conda run -n tools samtools …`.
+  Environments are stored in the project.
 - The image includes `build-essential` for packages that need compiling, but not every native library
   or header. Prefer a prebuilt wheel or conda package when a build needs dependencies not in the image.
 - Do **not** use `apt-get`, `sudo` or write to system directories: the image is read-only and such changes are lost.
@@ -88,6 +88,50 @@ You manage the environment yourself: install what the analysis needs, without as
 - If an install fails (no network, a package that does not build), say so and choose an alternative.
   If the host is not on the allowlist (`codeflower-network` tells), ask the user to allow it as the
   codeflower-network skill describes.
+
+### R
+
+R 4.5 is installed (`R`, `Rscript`), with ggplot2, ragg, svglite, patchwork, pak, renv, BiocManager
+and remotes in its read-only site library. Write R analysis steps as numbered scripts like the Python
+ones (`scripts/03_deseq.R`) and run them with `Rscript`.
+
+- Install packages into the project's R library `/codeflower-state/env/R/4.5` (`R_LIBS_USER`, first
+  on `.libPaths()`), which every worker of the project sees. These installers reuse the image's
+  packages and add only what is missing:
+  - CRAN: `Rscript -e 'install.packages("dplyr")'`
+  - Bioconductor: `Rscript -e 'BiocManager::install("DESeq2", update = FALSE, ask = FALSE)'`
+    (Bioconductor 3.22, the release for R 4.5; the image's library is read-only, so never update)
+  - GitHub: `Rscript -e 'remotes::install_github("user/repo")'` (`"user/repo@v1.2"` for a tag). Do
+    not install devtools for this.
+- pak (`pak::pkg_install()`) is installed too, but it only counts packages in the library it
+  installs into, so it reinstalls the image's (ggplot2 and its dependencies) in the project library.
+  Use it when the installers above cannot resolve the dependencies, and `pak::pkg_sysreqs("<pkg>")`
+  to list the system libraries a package needs.
+- CRAN packages come from Posit Package Manager as prebuilt binaries on x86_64 and are compiled on
+  arm64; Bioconductor and GitHub packages are compiled. Large ones (DESeq2, Seurat) take several
+  minutes: pass `Ncpus = 4` (within the allocation) and run such installs in the background with
+  output in `logs/`.
+- No installer can add system libraries (no root). The headers of the common ones are installed
+  (curl, OpenSSL, libxml2, libgit2, fonts and text shaping, PNG/JPEG/TIFF/WebP, cmake). When a build
+  needs another (GDAL for `sf`, for example), install R and that package in a conda environment
+  (`conda create -y -n r-geo -c conda-forge r-base r-sf`) and run that environment's `Rscript`
+  through `conda run`. Do not mix it with the project library.
+- renv, for a pinned environment:
+  - A repository in `/data/code/<name>` with an `renv.lock`: run `renv::restore()` in it, and run its
+    code from its folder, where its `.Rprofile` activates its library.
+  - When the user asks for a reproducible R environment, or an analysis must keep its package
+    versions apart: `renv::init()` in the code's folder in `/data/code`, or in
+    `/codeflower-state/env/renv/<name>` for an analysis, then `renv::install()` (CRAN, `"bioc::<pkg>"`
+    or `"user/repo"`) and `renv::snapshot()` after each change. Run scripts with
+    `Rscript -e 'renv::load("/codeflower-state/env/renv/<name>"); source("scripts/04_x.R")'`.
+  - Not in the workspace itself: its `.Rprofile` would switch every R script there to that library.
+  - `renv::init()` copies packages already installed in the project library or the image, and
+    renv's cache (`/codeflower-state/env/R/renv-cache`) shares packages between environments, so
+    a new environment rarely downloads much.
+- `codeflower-env-export` records the project library as an renv lockfile
+  (`/codeflower-state/env/exports/R-library.lock`); renv environments keep their own `renv.lock`.
+- With an isolated network, CRAN (through Posit Package Manager) needs `@cran`, Bioconductor
+  `@bioconductor`, and GitHub `@github`.
 
 ### Troubleshooting
 
@@ -117,8 +161,18 @@ You manage the environment yourself: install what the analysis needs, without as
 5. **Long steps** (more than a few minutes): run them in the background with output to `logs/`, and
    check on them, rather than blocking.
 
-Figures: use matplotlib's non-interactive backend (`MPLBACKEND=Agg` is set), save PNG at 150 dpi
-(SVG for simple line art), give axes labels and titles, and use colorblind-friendly palettes.
+Figures: before the first figure of an analysis or a report, ask the user which plotting library
+they want their figures in: matplotlib or seaborn (Python), Plotly (interactive in the report),
+ggplot2 (R), or another. Skip the question when they already said, or when the project's scripts
+already settle it. Keep to the answer for the whole project, and name it in the report's methods.
+
+- With matplotlib or seaborn: the non-interactive backend is set (`MPLBACKEND=Agg`).
+- With ggplot2: save with `ggsave("figures/x.png", p, device = ragg::agg_png, dpi = 150)`,
+  `svglite::svglite` for SVG, or `cairo_pdf` for PDF; combine panels with patchwork
+  (`(p1 | p2) / p3 + plot_annotation(tag_levels = "A")`). Use `theme_classic()` or `theme_bw()` with
+  a base size that reads at the figure's printed width.
+- Save PNG at 150 dpi (SVG for simple line art; 300 dpi, PDF or SVG for figures meant for a
+  publication), give axes labels and titles, and use colorblind-friendly palettes.
 For schematic figures (study designs, workflows, graphical abstracts) and icons, follow the
 codeflower-sketch skill.
 
@@ -161,6 +215,8 @@ The final report is one standalone HTML file, built with the `storyteller` Pytho
   (the SVG, or the plotting code) and add it again under the same key.
 - Each analysis script fills its own section (`with report.section("qc", "Quality control"):`).
   Re-running a script replaces its section in place.
+- Figures made in R go in by their file: `r.figure("figures/volcano.png", caption=…, key=…)` (PNG or
+  SVG). Plotly charts and explorers are Python only.
 - Use an interactive explorer when a result depends on a threshold or filter the user may want to set.
 - Summary of findings first, in plain language, then data, methods (tools, versions, parameters),
   results with captioned figures and tables, and limitations or open questions.

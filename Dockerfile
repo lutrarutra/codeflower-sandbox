@@ -76,6 +76,7 @@ ENV LANG=C.UTF-8 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
+    RENV_CONFIG_PAK_ENABLED=TRUE \
     PATH="/opt/codeflower/bin:/opt/conda/bin:/opt/codeflower/runtime/node_modules/.bin:$PATH"
 
 WORKDIR /opt/codeflower
@@ -114,6 +115,40 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && /opt/conda/bin/python -c 'import sys; assert sys.version_info[:2] == (3, 14), sys.version' \
     && /opt/conda/bin/conda clean --all --force-pkgs-dirs --yes \
     && ln -s /opt/conda/etc/profile.d/conda.sh /etc/profile.d/conda.sh
+
+# R from Debian, with the headers the most common source builds need (CRAN
+# packages without a binary, Bioconductor, GitHub). The image's R packages go to
+# the site library, from a dated Package Manager snapshot; the agent's go to the
+# project's (R_LIBS_USER). ggplot2 and the devices for publication figures,
+# pak for installs from CRAN, GitHub and Bioconductor, renv for pinned project
+# environments, BiocManager for Bioconductor's own installer.
+ARG R_PACKAGES_DATE=2026-11-02
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake \
+    libcurl4-openssl-dev \
+    libfontconfig1-dev \
+    libfreetype-dev \
+    libfribidi-dev \
+    libgit2-dev \
+    libharfbuzz-dev \
+    libjpeg-dev \
+    libpng-dev \
+    libssl-dev \
+    libtiff-dev \
+    libwebp-dev \
+    libxml2-dev \
+    r-base-core \
+    r-base-dev \
+    r-recommended \
+    zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && Rscript -e 'pkgs <- c("ggplot2", "ragg", "svglite", "patchwork", "pak", "renv", "BiocManager", "remotes")' \
+         -e 'options(HTTPUserAgent = sprintf("R/%s R (%s)", getRversion(), paste(getRversion(), R.version$platform, R.version$arch, R.version$os)))' \
+         -e 'install.packages(pkgs, lib = "/usr/local/lib/R/site-library", Ncpus = parallel::detectCores(),' \
+         -e '  repos = c(CRAN = "https://packagemanager.posit.co/cran/__linux__/trixie/'"$R_PACKAGES_DATE"'"))' \
+         -e 'for (p in pkgs) library(p, character.only = TRUE)' \
+    && rm -rf /tmp/Rtmp*
+COPY R/Rprofile.site /etc/R/Rprofile.site
 
 COPY --from=ghcr.io/astral-sh/uv:0.13.6@sha256:af22a52f5eafef3d78e551599d405c02df61919d18028f0cea8eda93bc9986d0 /uv /uvx /usr/local/bin/
 COPY --from=dsh-runtime /usr/local/bin/node /usr/local/bin/node

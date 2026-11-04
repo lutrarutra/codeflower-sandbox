@@ -29,7 +29,8 @@ fi
 if [ ! -x "$venv/bin/pip" ] && [ "${CODEFLOWER_NETWORK:-}" != isolated ]; then
   uv pip install --quiet --python "$venv/bin/python" pip || echo "Could not add pip to $venv" >&2
 fi
-mkdir -p "${CONDA_ENVS_DIRS:-$state/env/conda}" "${R_LIBS_USER:-$state/env/R}"
+# R creates its project library (R_LIBS_USER) itself: /etc/R/Rprofile.site.
+mkdir -p "${CONDA_ENVS_DIRS:-$state/env/conda}"
 
 # Each harness reads its own instructions file. Copy the defaults, and update
 # them with a new image unless the user edited them (a copy of what was
