@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-import { CREDENTIAL_VARIABLES, PROVIDED_KEY_VARIABLE, createAgents } from '../src/agents.js';
+import { CREDENTIAL_VARIABLES, PROVIDED_KEYS_VARIABLE, createAgents } from '../src/agents.js';
 
 async function setup(t) {
   const directory = await mkdtemp(join(tmpdir(), 'codeflower-keys-'));
@@ -23,7 +23,7 @@ async function setup(t) {
 }
 
 test('the key from the app config is never passed on to an agent', () => {
-  assert.ok(CREDENTIAL_VARIABLES.includes(PROVIDED_KEY_VARIABLE));
+  assert.ok(CREDENTIAL_VARIABLES.includes(PROVIDED_KEYS_VARIABLE));
 });
 
 test('stores a configured key in dsh .env', async (t) => {
@@ -177,15 +177,14 @@ for (const [agentName, homeName, fileName] of [
     await writeFile(file, content);
     const result = spawnSync(process.execPath, [fileURLToPath(new URL('../src/index.js', import.meta.url))], {
       env: {
-        CODEFLOWER_AGENT: agentName,
-        CODEFLOWER_API_KEY: 'test-key',
+        CODEFLOWER_API_KEYS: JSON.stringify({ [agentName]: 'test-key' }),
         [homeName]: environment[homeName]
       },
       encoding: 'utf8',
       timeout: 5000
     });
     assert.equal(result.status, 1, result.stderr);
-    assert.match(result.stderr, /Could not store the API key from the app's config: Invalid JSON/);
+    assert.match(result.stderr, /Could not store the API key from the app's config for .+: Invalid JSON/);
     assert.doesNotMatch(result.stderr, /test-key|existing":"secret|worker ready/);
     assert.equal(await readFile(file, 'utf8'), content);
   });

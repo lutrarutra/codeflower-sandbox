@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
-import { request as httpRequest } from 'node:http';
+import { createServer as createHttpServer, request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { appendFile, mkdir, mkdtemp, readFile, realpath, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -22,6 +22,8 @@ import { listSessions, readTranscript, sessionKey } from '../src/sessions.js';
 const fakeAgent = fileURLToPath(new URL('../fixtures/fake-acp.js', import.meta.url));
 const token = 'k'.repeat(43);
 const inboxes = new WeakMap();
+// The agent each test bridge runs, whose windows its sockets are.
+const agentOf = new WeakMap();
 
 function trackSocket(socket) {
   const inbox = { messages: [], waiters: [] };
@@ -39,8 +41,8 @@ function trackSocket(socket) {
   return socket;
 }
 
-async function openSocket(address) {
-  const socket = new WebSocket(`ws://127.0.0.1:${address.port}/acp`, {
+async function openSocket(address, agent = agentOf.get(address)) {
+  const socket = new WebSocket(`ws://127.0.0.1:${address.port}/acp${agent ? `?agent=${agent}` : ''}`, {
     headers: { authorization: `Bearer ${token}` }
   });
   await once(socket, 'open');
@@ -116,7 +118,7 @@ test('lists actions loaded from the configured templates', async (t) => {
   assert.deepEqual((await call(socket, '_codeflower/actions/list')).result, { actions });
 });
 
-async function startTestBridge(t, { agentName = 'claude', ...overrides } = {}) {
+async function startTestBridge(t, { agentName = 'claude', agent, plugins, ...overrides } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'codeflower-acp-ws-'));
   const sessionsDirectory = join(directory, 'sessions');
   const environment = {
@@ -141,13 +143,14 @@ async function startTestBridge(t, { agentName = 'claude', ...overrides } = {}) {
     connectionFile: join(directory, 'instance.json'),
     instanceId: 'instance-test',
     sessionsDirectory,
-    agentName,
-    agent: agents[agentName],
+    agents: { [agentName]: agent ?? agents[agentName] },
+    ...(plugins ? { plugins: { [agentName]: plugins } } : {}),
     ptyHelper,
     environment,
     log: (message) => process.env.BRIDGE_DEBUG && console.error(message),
     ...overrides
   });
+  agentOf.set(bridge.address, agentName);
   t.after(async () => {
     await bridge.close();
     await rm(directory, { recursive: true, force: true });
@@ -183,15 +186,16 @@ test('rejects missing or invalid bearer tokens without starting an agent', async
     advertiseHost: 'localhost',
     token,
     connectionFile: join(directory, 'instance.json'),
-    agentName: 'dsh',
-    agent: {
-      label: 'Marker',
-      env: {},
-      command: async () => [
-        process.execPath,
-        '-e',
-        "require('node:fs').writeFileSync(process.env.TEST_CHILD_MARKER, 'started')"
-      ]
+    agents: {
+      dsh: {
+        label: 'Marker',
+        env: {},
+        command: async () => [
+          process.execPath,
+          '-e',
+          "require('node:fs').writeFileSync(process.env.TEST_CHILD_MARKER, 'started')"
+        ]
+      }
     },
     environment: { ...process.env, TEST_CHILD_MARKER: childMarker },
     log: () => {}
@@ -214,7 +218,7 @@ test('starts the worker agent on connect without passing it any credentials', as
   const { bridge, directory } = await startTestBridge(t, { agentName: 'codex', log: (message) => logs.push(message) });
   const connection = JSON.parse(await readFile(join(directory, 'instance.json'), 'utf8'));
   assert.equal((await stat(join(directory, 'instance.json'))).mode & 0o777, 0o600);
-  assert.equal(connection.agent, 'codex');
+  assert.equal(connection.agent, undefined);
   assert.equal(connection.url, `codeflower://localhost:${bridge.address.port}?token=${token}`);
 
   // Windows attach side by side, and each one is logged.
@@ -222,7 +226,7 @@ test('starts the worker agent on connect without passing it any credentials', as
   const socket = await openSocket(bridge.address);
   await call(other, 'initialize', { protocolVersion: 1, clientCapabilities: {}, clientInfo: { name: 'codeflower-web', version: '1.2.3' } });
   assert.equal(other.readyState, WebSocket.OPEN);
-  assert.match(logs.find((line) => line.startsWith('Client 1 connected')), /^Client 1 connected from \S+; 1 connected$/);
+  assert.match(logs.find((line) => line.startsWith('Client 1 connected')), /^Client 1 connected from \S+ to codex; 1 connected$/);
   assert.ok(logs.includes('Client 1 is codeflower-web 1.2.3'));
   assert.match(logs.find((line) => line.startsWith('Client 2 connected')), /; 2 connected$/);
   await closeSocket(other);
@@ -364,7 +368,9 @@ test('runs OpenCode with its database in its home until it is signed in', async 
   assert.equal(initialized.opencodeDatabase, join(home, 'opencode.db'));
   assert.deepEqual(initialized.credentialVariables, []);
   const status = (await call(socket, '_codeflower/status')).result;
-  assert.deepEqual(status.agentInfo, { id: 'opencode', name: 'OpenCode', color: 'violet' });
+  const { icon, ...info } = status.agentInfo;
+  assert.deepEqual(info, { id: 'opencode', name: 'OpenCode', color: 'violet', iconMono: true });
+  assert.match(icon, /^data:image\/svg\+xml;base64,/);
   assert.equal(status.signedIn, false);
 });
 
@@ -729,6 +735,62 @@ test('stores dsh keys in its own files and adds the endpoint on the next start',
   await closeSocket(again);
 });
 
+test("lists an OpenAI-compatible endpoint's models for dsh and saves the chosen ones with their settings", async (t) => {
+  const endpoint = createHttpServer((request, response) => {
+    const signedIn = request.headers.authorization === 'Bearer sk-compat-secret';
+    if (request.method === 'POST') {
+      response.writeHead(signedIn ? 400 : 401, { 'content-type': 'application/json' });
+      return response.end('{}');
+    }
+    response.writeHead(signedIn ? 200 : 401, { 'content-type': 'application/json' });
+    response.end(JSON.stringify(signedIn ? { data: [{ id: 'm1', context_length: 65536, supported_parameters: ['tools'] }] } : { error: 'no key' }));
+  });
+  await new Promise((resolve) => endpoint.listen(0, '127.0.0.1', resolve));
+  t.after(() => endpoint.close());
+  const baseURL = `http://127.0.0.1:${endpoint.address().port}/v1`;
+  const { bridge, environment } = await startTestBridge(t, { agentName: 'dsh' });
+  const socket = await openSocket(bridge.address);
+
+  assert.deepEqual((await call(socket, '_codeflower/credentials/check', { baseURL, apiKey: 'sk-compat-secret' })).result, {
+    reachable: true,
+    modelsStatus: 200,
+    keyStatus: 400,
+    keyAccepted: true
+  });
+  assert.equal((await call(socket, '_codeflower/credentials/check', { baseURL, apiKey: 'wrong' })).result.keyAccepted, false);
+  assert.match((await call(socket, '_codeflower/credentials/models', { baseURL, apiKey: 'wrong' })).error.message, /answered 401/);
+  const { models } = (await call(socket, '_codeflower/credentials/models', { baseURL, apiKey: 'sk-compat-secret' })).result;
+  assert.deepEqual(models, [{ id: 'm1', contextWindow: 65536, reasoning: false }]);
+  await call(socket, '_codeflower/credentials/set', { openaiCompatible: { baseURL, models, apiKey: 'sk-compat-secret' } });
+  const patch = JSON.parse(await readFile(join(environment.DSH_HOME, 'codeflower-endpoint.patch.yml'), 'utf8'));
+  assert.deepEqual(patch[0].config.providers['codeflower-openai-compat'].models, [{ id: 'm1', contextWindow: 65536, reasoningEfforts: false }]);
+
+  // Edited later: shown without the key, which a blank key keeps, but only for the same URL.
+  assert.deepEqual((await call(socket, '_codeflower/credentials/get')).result, {
+    deepseekKey: false,
+    openaiCompatible: { baseURL, models: [{ id: 'm1', contextWindow: 65536, reasoning: false }], reasoningEfforts: [], hasKey: true }
+  });
+  assert.equal((await call(socket, '_codeflower/credentials/check', { baseURL, apiKey: '' })).result.keyAccepted, true);
+  assert.equal((await call(socket, '_codeflower/credentials/check', { baseURL: `${baseURL}/other`, apiKey: '' })).result.keyAccepted, undefined);
+  await call(socket, '_codeflower/credentials/set', {
+    openaiCompatible: { baseURL, models: [{ id: 'm1' }, { id: 'm2', reasoning: true }], reasoningEfforts: ['high'], apiKey: '' }
+  });
+  assert.match(await readFile(join(environment.DSH_HOME, '.env'), 'utf8'), /^CODEFLOWER_OPENAI_COMPAT_API_KEY=sk-compat-secret$/m);
+  assert.deepEqual((await call(socket, '_codeflower/credentials/get')).result.openaiCompatible.reasoningEfforts, ['high']);
+  assert.match(
+    (await call(socket, '_codeflower/credentials/set', { openaiCompatible: { baseURL: 'https://elsewhere.example/v1', models: ['m1'] } })).error.message,
+    /no key is saved for this URL/
+  );
+  await closeSocket(socket);
+});
+
+test('only dsh lists endpoint models', async (t) => {
+  const { bridge } = await startTestBridge(t, { agentName: 'codex' });
+  const socket = await openSocket(bridge.address);
+  assert.match((await call(socket, '_codeflower/credentials/models', { baseURL: 'https://x.example' })).error.message, /OpenAI-compatible/);
+  await closeSocket(socket);
+});
+
 test('starts a run\'s prompt once dsh has restarted with its keys', async (t) => {
   const { bridge, sessionsDirectory } = await startTestBridge(t, {
     agentName: 'dsh',
@@ -775,7 +837,7 @@ test("manages the agent's plugins and starts the agent with them", async (t) => 
   const socket = await openSocket(bridge.address);
   assert.equal((await initialize(socket)).pluginSeed, '/empty');
   const { subagents, ...capabilities } = (await call(socket, '_codeflower/status')).result.capabilities;
-  assert.deepEqual(capabilities, { plugins: true, chatTerminals: true });
+  assert.deepEqual(capabilities, { plugins: true, chatTerminals: true, shellTerminals: true });
   assert.deepEqual(subagents.settings, { model: { applies: 'session' } });
 
   assert.match((await call(socket, '_codeflower/plugins/add', { source: 'npm:x@1' })).error.message, /github:, not npm:/);
@@ -804,7 +866,7 @@ test('an agent without plugins says so and refuses the plugin methods', async (t
   t.after(() => closeSocket(socket));
   await initialize(socket);
   const { subagents: _, ...capabilities } = (await call(socket, '_codeflower/status')).result.capabilities;
-  assert.deepEqual(capabilities, { plugins: false, chatTerminals: true });
+  assert.deepEqual(capabilities, { plugins: false, chatTerminals: true, shellTerminals: true });
   assert.deepEqual((await call(socket, '_codeflower/plugins/list')).result, { available: false });
   assert.match((await call(socket, '_codeflower/plugins/add', { source: 'github:a/b' })).error.message, /no plugins/);
 });
@@ -1208,10 +1270,9 @@ test('keeps the agent and its chats working while no window is connected', async
   assert.match((await call(first, '_codeflower/sessions/delete', { key: sessionKey('claude', sessionId) })).error.message, /still working/);
   await closeSocket(first);
 
-  const { usage: _, ...unattended } = (await status(bridge.address)).body;
+  const { agents, ...unattended } = (await status(bridge.address)).body;
+  assert.deepEqual(agents.map(({ id, running }) => ({ id, running })), [{ id: 'claude', running: true }]);
   assert.deepEqual(unattended, {
-    agent: 'claude',
-    agentLabel: 'Claude Code',
     connected: false,
     clients: 0,
     multiClient: true,
@@ -1387,7 +1448,11 @@ test('keeps several windows on one chat in sync', async (t) => {
   // A window that did not open the chat gets none of it.
   const chatMethods = ['session/update', 'session/request_permission', '_codeflower/prompted', '_codeflower/shell/output'];
   assert.equal(got(bystander, (message) => chatMethods.includes(message.method)), false);
-  assert.equal((await status(bridge.address)).body.clients, 3);
+  // Windows count by their connections to the worker itself, not by each of their agents'.
+  assert.equal((await status(bridge.address)).body.clients, 0);
+  const own = await openSocket(bridge.address, '');
+  assert.equal((await status(bridge.address)).body.clients, 1);
+  await closeSocket(own);
 
   // The transcript has each prompt once.
   const entries = (await call(second, '_codeflower/sessions/transcript', { key })).result.entries;
@@ -1470,10 +1535,8 @@ test('reports its activity only to holders of the token', async (t) => {
   assert.equal((await status(bridge.address, { authorization: `Bearer ${'x'.repeat(43)}` })).code, 401);
   assert.equal((await fetch(`http://127.0.0.1:${bridge.address.port}/other`)).status, 404);
   const { body } = await status(bridge.address);
-  const { usage, ...activity } = body;
+  const { agents, ...activity } = body;
   assert.deepEqual(activity, {
-    agent: 'claude',
-    agentLabel: 'Claude Code',
     connected: false,
     clients: 0,
     multiClient: true,
@@ -1484,8 +1547,9 @@ test('reports its activity only to holders of the token', async (t) => {
     ended: [],
     turns: 0
   });
-  // Numbers only: the account and the worker's totals, never a chat's.
-  assert.deepEqual(Object.keys(usage).sort(), ['auth', 'costEstimate', 'limits', 'limitsUpdatedAt', 'totals']);
+  // Per agent, numbers only: the account and the worker's totals, never a chat's.
+  assert.deepEqual(agents.map(({ id, running }) => ({ id, running })), [{ id: 'claude', running: false }]);
+  assert.deepEqual(Object.keys(agents[0].usage).sort(), ['auth', 'costEstimate', 'limits', 'limitsUpdatedAt', 'totals']);
 });
 
 test('reports ended turns with their stop reason for a minute', async (t) => {
@@ -1584,10 +1648,10 @@ test('tracks token counts, cost, and quota, and records them with the session', 
       return false;
     }
   });
-  const { body } = await status(bridge.address);
-  assert.equal(body.usage.auth.kind, 'subscription');
-  assert.equal(body.usage.limits.length, 2);
-  assert.equal(body.usage.sessions, undefined);
+  const [{ usage: account }] = (await status(bridge.address)).body.agents;
+  assert.equal(account.auth.kind, 'subscription');
+  assert.equal(account.limits.length, 2);
+  assert.equal(account.sessions, undefined);
   await closeSocket(socket);
 });
 
@@ -1724,7 +1788,7 @@ test('serves the chat page only with --server, to the link\'s holder, on its own
   assert.equal(others.length, 0);
   assert.equal(worker.id, 'local');
   assert.equal(worker.status, 'ready');
-  assert.equal(worker.activity.agent, 'claude');
+  assert.deepEqual(worker.activity.agents.map((agent) => agent.id), ['claude']);
   assert.deepEqual(JSON.parse((await get(address, '/api/workers/local/sessions', { authorization })).body), { sessions: [] });
   const frame = await get(address, '/frame');
   assert.equal(frame.code, 200);
@@ -1736,7 +1800,7 @@ test('serves the chat page only with --server, to the link\'s holder, on its own
     (await (await fetch(`${origin}/api/ticket`, { method: 'POST', headers: { authorization, 'content-type': 'application/json' }, body: '{}' })).json()).ticket;
   const url = `ws://127.0.0.1:${address.port}/api/workers/local/acp`;
   const used = await ticket();
-  const socket = trackSocket(new WebSocket(`${url}?ticket=${used}`, { headers: { origin } }));
+  const socket = trackSocket(new WebSocket(`${url}?ticket=${used}&agent=claude`, { headers: { origin } }));
   await once(socket, 'open');
   assert.equal((await initialize(socket)).protocolVersion, 1);
   await closeSocket(socket);

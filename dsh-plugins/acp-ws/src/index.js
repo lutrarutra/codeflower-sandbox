@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { AGENT_NAMES, createAgents, PROVIDED_KEY_VARIABLE } from './agents.js';
+import { AGENT_NAMES, createAgents, PROVIDED_KEYS_VARIABLE } from './agents.js';
 import { readActions } from './actions.js';
 import { MCP_SERVERS_VARIABLE, parseMcpServers } from './mcp.js';
 import { PLUGINS_FETCH_VARIABLE, PLUGINS_VARIABLE, createPlugins, parsePlugins, runFetch } from './plugins.js';
@@ -25,23 +25,35 @@ function requiredEnvironment(name) {
   return value;
 }
 
-const agentName = requiredEnvironment('CODEFLOWER_AGENT');
-if (!AGENT_NAMES.includes(agentName)) {
+// The worker runs every agent; a task, a terminal UI and a plugins fetch run
+// run one, which CODEFLOWER_AGENT names.
+const agentName = process.env.CODEFLOWER_AGENT || undefined;
+if (agentName !== undefined && !AGENT_NAMES.includes(agentName)) {
   throw new Error(`CODEFLOWER_AGENT must be one of: ${AGENT_NAMES.join(', ')}`);
 }
+const oneAgent = () => {
+  if (!agentName) throw new Error('CODEFLOWER_AGENT is required');
+  return agentName;
+};
 const agents = createAgents({ nodePath: process.execPath, modules: RUNTIME_MODULES });
 
-// The app's config may give the agent an API key. It goes into the
-// agent's own files in the project, and leaves this process's environment so
-// that nothing started from here inherits it.
-const providedKey = process.env[PROVIDED_KEY_VARIABLE];
-delete process.env[PROVIDED_KEY_VARIABLE];
-if (providedKey) {
+// The app's config may give agents API keys. They go into the agents' own
+// files in the project, and leave this process's environment so that nothing
+// started from here inherits them.
+let providedKeys = {};
+try {
+  providedKeys = JSON.parse(process.env[PROVIDED_KEYS_VARIABLE] || '{}');
+} catch {
+  throw new Error(`${PROVIDED_KEYS_VARIABLE} is not valid JSON`);
+}
+delete process.env[PROVIDED_KEYS_VARIABLE];
+for (const [name, key] of Object.entries(providedKeys)) {
+  if (!agents[name] || typeof key !== 'string' || !key) continue;
   try {
-    const kept = await agents[agentName].provideKey?.(providedKey);
-    if (kept) process.stderr.write(`The API key from the app's config was not used: ${kept}\n`);
+    const kept = await agents[name].provideKey?.(key);
+    if (kept) process.stderr.write(`The API key from the app's config for ${agents[name].label} was not used: ${kept}\n`);
   } catch (error) {
-    throw new Error(`Could not store the API key from the app's config: ${error.message}`);
+    throw new Error(`Could not store the API key from the app's config for ${agents[name].label}: ${error.message}`);
   }
 }
 
@@ -68,21 +80,27 @@ delete process.env[PLUGINS_VARIABLE];
 const FETCH_PLUGINS = process.env[PLUGINS_FETCH_VARIABLE] === '1';
 delete process.env[PLUGINS_FETCH_VARIABLE];
 
-// An agent installed outside the image (Claude Code) says when it is missing.
-const missing = await agents[agentName].missing?.();
-if (missing) throw new Error(missing);
+// An agent installed outside the image (Claude Code) says when it is
+// missing: the others run, and its windows hear why it cannot.
+for (const name of AGENT_NAMES) {
+  const missing = await agents[name].missing?.();
+  if (missing) agents[name].unavailable = missing;
+}
+if (agentName && agents[agentName].unavailable) throw new Error(agents[agentName].unavailable);
 
-// The project's plugins/. An isolated sandbox reaches only the providers, so
-// its plugins are fetched by the app's fetch run.
-const plugins = createPlugins({
-  agentName,
-  hooks: agents[agentName].plugins,
-  descriptor: agents[agentName].pluginsDescriptor,
-  directory: join(process.env.CODEFLOWER_SESSIONS_DIR ? dirname(process.env.CODEFLOWER_SESSIONS_DIR) : STATE, 'plugins'),
-  configured: configuredPlugins[agentName] ?? [],
-  canFetch: FETCH_PLUGINS || !process.env.CODEFLOWER_EGRESS_SOCKET,
-  log: (message) => process.stderr.write(`${message}\n`)
-});
+// Each agent's plugins in the project's plugins/. An isolated sandbox reaches
+// only the providers, so its plugins are fetched by the app's fetch run.
+const pluginsOf = (name) =>
+  createPlugins({
+    agentName: name,
+    hooks: agents[name].plugins,
+    descriptor: agents[name].pluginsDescriptor,
+    directory: join(process.env.CODEFLOWER_SESSIONS_DIR ? dirname(process.env.CODEFLOWER_SESSIONS_DIR) : STATE, 'plugins'),
+    configured: configuredPlugins[name] ?? [],
+    canFetch: FETCH_PLUGINS || !process.env.CODEFLOWER_EGRESS_SOCKET,
+    log: (message) => process.stderr.write(`${message}\n`)
+  });
+const plugins = Object.fromEntries(AGENT_NAMES.map((name) => [name, pluginsOf(name)]));
 
 // What the extension shows about this worker.
 // The folders the app mounted, e.g. /data/input/study42, with their host paths.
@@ -112,7 +130,7 @@ const egress = process.env.CODEFLOWER_EGRESS_SOCKET
 
 // `codeflower plugins fetch` and before a start: the app's fetch run.
 if (FETCH_PLUGINS) {
-  const errors = await runFetch(plugins);
+  const errors = await runFetch(plugins[oneAgent()]);
   egress?.close();
   process.exit(errors ? 1 : 0);
 }
@@ -123,9 +141,9 @@ if (process.env.CODEFLOWER_TUI === '1') {
   let code = 1;
   try {
     code = await runTui({
-      agentName,
+      agentName: oneAgent(),
       agent: agents[agentName],
-      plugins,
+      plugins: plugins[agentName],
       mcpServers,
       resume: parseResume(process.env.CODEFLOWER_TUI_RESUME),
       workspace: requiredEnvironment('CODEFLOWER_WORKSPACE'),
@@ -167,7 +185,7 @@ if (process.env.CODEFLOWER_TASK_ATTEMPT_FILE) {
   });
 
   const result = await runTask({
-    agentName,
+    agentName: oneAgent(),
     agent: agents[agentName],
     attemptFile: process.env.CODEFLOWER_TASK_ATTEMPT_FILE,
     sessionsDirectory: requiredEnvironment('CODEFLOWER_SESSIONS_DIR'),
@@ -186,7 +204,7 @@ if (process.env.CODEFLOWER_TASK_ATTEMPT_FILE) {
     interactive: process.env.CODEFLOWER_TASK_INTERACTIVE === '1',
     ptyHelper: ['/opt/conda/bin/python3', '/opt/codeflower/bin/codeflower-pty'],
     mcpServers,
-    plugins,
+    plugins: plugins[agentName],
     input: process.stdin,
     authOut: process.stderr
   });
@@ -221,9 +239,10 @@ const bridge = await startBridge({
   instanceId: requiredEnvironment('CODEFLOWER_INSTANCE_ID'),
   slurmJobId: process.env.CODEFLOWER_SLURM_JOB_ID,
   sessionsDirectory: requiredEnvironment('CODEFLOWER_SESSIONS_DIR'),
-  agentName,
-  agent: agents[agentName],
+  agents,
   initialPrompt,
+  // `codeflower run`: the agent its task is for.
+  initialPromptAgent: process.env.CODEFLOWER_INITIAL_PROMPT_AGENT || undefined,
   mcpServers,
   plugins,
   // The batch job's end, from the app (Slurm, PBS, HTCondor or --time-limit).
@@ -276,14 +295,14 @@ const vscodeLines = localLine
 process.stderr.write(
   [
     '',
-    `code flower worker ready (${agents[agentName].label}). ${opening[0]}`,
+    `code flower worker ready (${AGENT_NAMES.filter((name) => !agents[name].unavailable).map((name) => agents[name].label).join(', ')}). ${opening[0]}`,
     ...opening.slice(1),
     '',
     ...vscodeLines,
     '',
     `  ${workerLine}`,
     '',
-    `Anyone with ${SERVE_PAGE ? 'these links' : 'this line'} can control the agent. Keep job logs private,`,
+    `Anyone with ${SERVE_PAGE ? 'these links' : 'this line'} can control the agents. Keep job logs private,`,
     'e.g. sbatch --output=$HOME/.codeflower-logs/%j.out with that directory chmod 700.',
     '',
     ''

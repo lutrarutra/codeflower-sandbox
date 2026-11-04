@@ -51,7 +51,7 @@ try {
     const { body } = await ask('GET /allowlist HTTP/1.1\r\nHost: codeflower\r\nConnection: close\r\n\r\n');
     const list = JSON.parse(body);
     console.log('The network is isolated: this sandbox reaches only these hosts, through the app.');
-    console.log(`\nThe agent's service (always allowed):\n  ${list.agent.join('\n  ') || '(none)'}`);
+    console.log(`\nThe agents' services (always allowed):\n  ${list.providers.join('\n  ') || '(none)'}`);
     console.log(`\nAllowed by the user:\n  ${list.allowed.join('\n  ') || '(none)'}`);
     console.log(`\nTo allow more, the user adds lines to this file on their computer (changes apply immediately):\n  ${list.file}`);
     // Older apps do not send presets.

@@ -5,12 +5,97 @@ import { join } from 'node:path';
 import test from 'node:test';
 
 import { createAgents, loadRegistry } from '../src/agents.js';
-import { shellExitStatus } from '../src/agents/dsh/index.js';
+import { checkEndpoint, dshEndpointPatch, listEndpointModels, shellExitStatus } from '../src/agents/dsh/index.js';
 
 async function dsh() {
   const agents = (await loadRegistry()).filter(({ descriptor }) => descriptor.id === 'dsh');
   return createAgents({ nodePath: 'node', environment: {}, agents }).dsh;
 }
+
+test("lists an endpoint's models with what it says of each", async () => {
+  let asked;
+  const reply = (body, status = 200) => async (url, init) => {
+    asked = { url, init };
+    return new Response(JSON.stringify(body), { status, statusText: status === 200 ? 'OK' : 'Unauthorized' });
+  };
+  // As OpenRouter answers.
+  const openrouter = {
+    data: [
+      {
+        id: 'qwen/qwen3-coder',
+        name: 'Qwen: Qwen3 Coder',
+        context_length: 262144,
+        architecture: { input_modalities: ['text'] },
+        supported_parameters: ['tools', 'temperature']
+      },
+      {
+        id: 'deepseek/deepseek-r1',
+        name: 'DeepSeek: R1',
+        context_length: 163840,
+        architecture: { input_modalities: ['text', 'image', 'file'] },
+        supported_parameters: ['reasoning', 'include_reasoning']
+      }
+    ]
+  };
+  assert.deepEqual(await listEndpointModels({ baseURL: 'https://openrouter.ai/api/v1/', apiKey: ' sk-or ' }, { fetch: reply(openrouter) }), [
+    { id: 'deepseek/deepseek-r1', name: 'DeepSeek: R1', contextWindow: 163840, input: ['text', 'image'], reasoning: true },
+    { id: 'qwen/qwen3-coder', name: 'Qwen: Qwen3 Coder', contextWindow: 262144, input: ['text'], reasoning: false }
+  ]);
+  assert.equal(asked.url, 'https://openrouter.ai/api/v1/models');
+  assert.equal(asked.init.headers.authorization, 'Bearer sk-or');
+  // As vLLM answers: only the context length; whether it reasons is not said.
+  assert.deepEqual(await listEndpointModels({ baseURL: 'http://gpu01:8000/v1' }, { fetch: reply({ object: 'list', data: [{ id: 'Qwen/Qwen3-32B', max_model_len: 32768 }] }) }), [
+    { id: 'Qwen/Qwen3-32B', contextWindow: 32768 }
+  ]);
+  assert.equal(asked.init.headers.authorization, undefined);
+  await assert.rejects(listEndpointModels({ baseURL: 'https://llm.example.org/v1', apiKey: 'x' }, { fetch: reply({}, 401) }), /answered 401/);
+  await assert.rejects(listEndpointModels({ baseURL: 'ftp://llm.example.org' }), /http or https/);
+});
+
+test('checks that an endpoint answers and takes the key, without a completion', async () => {
+  const calls = [];
+  // `models` and `chat` are the statuses each route answers with.
+  const server = (models, chat) => async (url, init) => {
+    calls.push([init.method ?? 'GET', url, init.body]);
+    return new Response('{}', { status: url.endsWith('/models') ? models : chat });
+  };
+  const baseURL = 'https://llm.example.org/v1';
+  assert.deepEqual(await checkEndpoint({ baseURL, apiKey: 'good' }, { fetch: server(200, 400) }), {
+    reachable: true,
+    modelsStatus: 200,
+    keyStatus: 400,
+    keyAccepted: true
+  });
+  assert.deepEqual(calls.at(-1), ['POST', `${baseURL}/chat/completions`, '{}']);
+  assert.equal((await checkEndpoint({ baseURL, apiKey: 'bad' }, { fetch: server(200, 401) })).keyAccepted, false);
+  // A key rejected by /models needs no second request.
+  calls.length = 0;
+  assert.deepEqual(await checkEndpoint({ baseURL, apiKey: 'bad' }, { fetch: server(401, 400) }), {
+    reachable: true,
+    modelsStatus: 401,
+    keyStatus: 401,
+    keyAccepted: false
+  });
+  assert.equal(calls.length, 1);
+  // Not the API's root: neither said.
+  assert.equal((await checkEndpoint({ baseURL, apiKey: 'good' }, { fetch: server(404, 404) })).keyAccepted, undefined);
+  assert.deepEqual(await checkEndpoint({ baseURL }, { fetch: server(200, 400) }), { reachable: true, modelsStatus: 200 });
+  const down = await checkEndpoint({ baseURL, apiKey: 'x' }, { fetch: async () => { throw new TypeError('fetch failed', { cause: new Error('ECONNREFUSED') }); } });
+  assert.deepEqual(down, { reachable: false, error: `Could not reach ${baseURL}: ECONNREFUSED` });
+});
+
+test("writes the listed models' context window and input, and no effort picker for those that do not reason", () => {
+  const route = {
+    baseURL: 'https://openrouter.ai/api/v1',
+    reasoningEfforts: ['low', 'high'],
+    models: [{ id: 'deepseek/deepseek-r1', name: 'DeepSeek: R1', contextWindow: 163840, input: ['text', 'image'] }, { id: 'qwen/qwen3-coder', reasoning: false }, { id: 'typed' }]
+  };
+  assert.deepEqual(dshEndpointPatch(route)[0].config.providers['codeflower-openai-compat'].models, [
+    { id: 'deepseek/deepseek-r1', name: 'DeepSeek: R1', contextWindow: 163840, input: ['text', 'image'], reasoningEfforts: { low: 'low', high: 'high' } },
+    { id: 'qwen/qwen3-coder', reasoningEfforts: false },
+    { id: 'typed', reasoningEfforts: { low: 'low', high: 'high' } }
+  ]);
+});
 
 // The marker contract of dsh's shell tools (parseExitStatus in @deepseek-ai/dsh-shell).
 test('reads the exit status from the last line of a shell result, as dsh does', () => {

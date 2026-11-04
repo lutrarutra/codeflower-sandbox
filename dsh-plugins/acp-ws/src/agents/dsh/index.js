@@ -29,9 +29,9 @@ export function dshEndpointPatch(route) {
             api: 'openai-completions',
             baseURL: route.baseURL,
             apiKeyEnv: 'CODEFLOWER_OPENAI_COMPAT_API_KEY',
-            models: route.models.map((id) => ({
-              id,
-              reasoningEfforts: route.reasoningEfforts.length ? effortMap(route.reasoningEfforts) : false
+            models: route.models.map(({ reasoning, ...model }) => ({
+              ...model,
+              reasoningEfforts: reasoning !== false && route.reasoningEfforts.length ? effortMap(route.reasoningEfforts) : false
             }))
           }
         }
@@ -68,6 +68,35 @@ async function routeModels(path) {
     return [];
   }
 }
+
+/**
+ * The route the endpoint patch holds, as `_codeflower/credentials/get` shows it to edit: its models with their
+ * settings (`reasoning: false` for those without efforts), and the effort values of those that have them.
+ */
+async function savedRoute(path) {
+  let provider;
+  try {
+    provider = JSON.parse(await readText(path)).find((patch) => patch?.id === 'llm-pi-ai')?.config?.providers?.[OPENAI_COMPAT_PROVIDER];
+  } catch {
+    return undefined;
+  }
+  if (typeof provider?.baseURL !== 'string' || !Array.isArray(provider.models)) return undefined;
+  const models = provider.models.filter((model) => typeof model?.id === 'string');
+  const efforts = models.find((model) => model.reasoningEfforts && typeof model.reasoningEfforts === 'object')?.reasoningEfforts;
+  return {
+    baseURL: provider.baseURL,
+    models: models.map(({ id, name, contextWindow, input, reasoningEfforts }) => ({
+      id,
+      ...(typeof name === 'string' ? { name } : {}),
+      ...(positive(contextWindow) ? { contextWindow } : {}),
+      ...(Array.isArray(input) ? { input } : {}),
+      reasoning: reasoningEfforts !== false
+    })),
+    reasoningEfforts: efforts ? Object.keys(efforts) : []
+  };
+}
+
+const envValue = (env, name) => new RegExp(`^${name}=(.+)$`, 'm').exec(env)?.[1];
 
 // A model choice: dsh's values are JSON `["provider", "model"]`.
 function parseModel(value) {
@@ -109,17 +138,127 @@ async function addDefaultEffortsToExistingRoute(path) {
   if (changed) await writePrivate(path, `${JSON.stringify(patches, null, 2)}\n`);
 }
 
-function validateRoute(value) {
-  const baseURL = requireString(value?.baseURL, 'openaiCompatible.baseURL');
+function requireBaseURL(value, field) {
+  const baseURL = requireString(value, field);
   let parsed;
   try {
     parsed = new URL(baseURL);
   } catch {
-    throw new InvalidRequest('openaiCompatible.baseURL must be a URL');
+    throw new InvalidRequest(`${field} must be a URL`);
   }
   if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
-    throw new InvalidRequest('openaiCompatible.baseURL must use http or https');
+    throw new InvalidRequest(`${field} must use http or https`);
   }
+  return baseURL;
+}
+
+const positive = (value) => (Number.isInteger(value) && value > 0 ? value : undefined);
+
+/**
+ * A model of the route: its id, or an entry of listModels, of which dsh's
+ * profile takes the name, context window and input; `reasoning: false` turns
+ * the effort picker off for it.
+ */
+function routeModel(value) {
+  if (typeof value === 'string') return { id: requireString(value, 'openaiCompatible.models[]') };
+  const model = { id: requireString(value?.id, 'openaiCompatible.models[].id') };
+  if (typeof value.name === 'string' && value.name.trim()) model.name = value.name.trim();
+  if (positive(value.contextWindow)) model.contextWindow = value.contextWindow;
+  if (Array.isArray(value.input) && value.input.includes('text')) model.input = value.input.filter((kind) => kind === 'text' || kind === 'image');
+  if (value.reasoning === false) model.reasoning = false;
+  return model;
+}
+
+/**
+ * The models an OpenAI-compatible endpoint serves, from its `GET /models`,
+ * with what it says of each: OpenRouter's name, context length, input
+ * modalities and supported parameters, vLLM's `max_model_len`. `reasoning` is
+ * left out when the endpoint does not say.
+ */
+function endpoint(params) {
+  const baseURL = requireBaseURL(params?.baseURL, 'baseURL');
+  const apiKey = typeof params.apiKey === 'string' ? params.apiKey.trim() : '';
+  return {
+    baseURL,
+    root: baseURL.replace(/\/+$/, ''),
+    apiKey,
+    headers: { accept: 'application/json', ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}) }
+  };
+}
+
+const unreachable = (baseURL, error) => `Could not reach ${baseURL}: ${error.cause?.message ?? error.message}`;
+const rejectsKey = (status) => status === 401 || status === 403;
+
+/**
+ * Whether an OpenAI-compatible endpoint answers, with the status of its
+ * `GET /models`, and whether it takes the key. A key is tried with an empty
+ * `POST /chat/completions`, which costs nothing: servers check the key before
+ * the body, so 401 or 403 rejects it and 400 or 422 takes it. Some, like
+ * OpenRouter, list their models without a key.
+ */
+export async function checkEndpoint(params, { fetch: get = fetch } = {}) {
+  const { baseURL, root, apiKey, headers } = endpoint(params);
+  let models;
+  try {
+    models = (await get(`${root}/models`, { headers, signal: AbortSignal.timeout(15_000) })).status;
+  } catch (error) {
+    return { reachable: false, error: unreachable(baseURL, error) };
+  }
+  const result = { reachable: true, modelsStatus: models };
+  if (!apiKey) return result;
+  if (rejectsKey(models)) return { ...result, keyAccepted: false, keyStatus: models };
+  try {
+    const chat = (
+      await get(`${root}/chat/completions`, {
+        method: 'POST',
+        headers: { ...headers, 'content-type': 'application/json' },
+        body: '{}',
+        signal: AbortSignal.timeout(15_000)
+      })
+    ).status;
+    result.keyStatus = chat;
+    if (rejectsKey(chat)) result.keyAccepted = false;
+    else if (chat < 300 || chat === 400 || chat === 422) result.keyAccepted = true;
+  } catch (error) {
+    result.error = unreachable(baseURL, error);
+  }
+  return result;
+}
+
+export async function listEndpointModels(params, { fetch: get = fetch } = {}) {
+  const { baseURL, root, headers } = endpoint(params);
+  let response;
+  try {
+    response = await get(`${root}/models`, { headers, signal: AbortSignal.timeout(15_000) });
+  } catch (error) {
+    throw new InvalidRequest(unreachable(baseURL, error));
+  }
+  if (!response.ok) throw new InvalidRequest(`${baseURL}/models answered ${response.status} ${response.statusText}`.trim());
+  let body;
+  try {
+    body = await response.json();
+  } catch {
+    throw new InvalidRequest(`${baseURL}/models did not answer with JSON`);
+  }
+  const entries = Array.isArray(body?.data) ? body.data : Array.isArray(body?.models) ? body.models : Array.isArray(body) ? body : [];
+  const models = new Map();
+  for (const entry of entries) {
+    const id = typeof entry === 'string' ? entry : entry?.id;
+    if (typeof id !== 'string' || !id.trim() || models.has(id)) continue;
+    const model = { id };
+    if (typeof entry.name === 'string' && entry.name.trim() && entry.name !== id) model.name = entry.name.trim();
+    const contextWindow = positive(entry.context_length) ?? positive(entry.max_model_len) ?? positive(entry.context_window);
+    if (contextWindow) model.contextWindow = contextWindow;
+    const modalities = entry.architecture?.input_modalities;
+    if (Array.isArray(modalities) && modalities.includes('text')) model.input = modalities.includes('image') ? ['text', 'image'] : ['text'];
+    if (Array.isArray(entry.supported_parameters)) model.reasoning = entry.supported_parameters.includes('reasoning');
+    models.set(id, model);
+  }
+  return [...models.values()].sort((a, b) => a.id.localeCompare(b.id));
+}
+
+function validateRoute(value) {
+  const baseURL = requireBaseURL(value?.baseURL, 'openaiCompatible.baseURL');
   if (!Array.isArray(value.models) || value.models.length === 0) {
     throw new InvalidRequest('openaiCompatible.models must list at least one model');
   }
@@ -127,7 +266,7 @@ function validateRoute(value) {
   if (!Array.isArray(efforts)) throw new InvalidRequest('openaiCompatible.reasoningEfforts must be a list');
   return {
     baseURL,
-    models: value.models.map((model) => requireString(model, 'openaiCompatible.models[]')),
+    models: value.models.map(routeModel),
     reasoningEfforts: [...new Set(efforts.map((effort) => requireString(effort, 'openaiCompatible.reasoningEfforts[]')))],
     apiKey: requireString(value.apiKey, 'openaiCompatible.apiKey')
   };
@@ -204,6 +343,19 @@ export default function dsh({ home, launch, nodePath, modules }) {
   const usagePatch = modules ? USAGE_PATCH : undefined;
   // The shell tool calls that have not ended, by id.
   const shellCalls = new Set();
+
+  /** The saved endpoint key, only for the URL it was saved with, so that it never goes to another server. */
+  async function savedKey(baseURL) {
+    if (!home || typeof baseURL !== 'string') return undefined;
+    const route = await savedRoute(join(home, ENDPOINT_PATCH));
+    if (route?.baseURL !== baseURL.trim()) return undefined;
+    return envValue(await readText(join(home, '.env')), 'CODEFLOWER_OPENAI_COMPAT_API_KEY');
+  }
+  /** The request with the saved key when it gives none. */
+  async function withSavedKey(params) {
+    if (typeof params?.apiKey === 'string' && params.apiKey.trim()) return params;
+    return { ...params, apiKey: (await savedKey(params?.baseURL)) ?? '' };
+  }
   return {
     async command() {
       const command = [nodePath, launch, '--profile', 'codeflower'];
@@ -286,6 +438,22 @@ export default function dsh({ home, launch, nodePath, modules }) {
     async provideKey(key) {
       await this.setCredentials({ deepseekApiKey: key });
     },
+    // The keys there are, and the route to edit, without its key.
+    async credentials() {
+      const env = home ? await readText(join(home, '.env')) : '';
+      const route = home ? await savedRoute(join(home, ENDPOINT_PATCH)) : undefined;
+      return {
+        deepseekKey: Boolean(envValue(env, 'DEEPSEEK_API_KEY')),
+        ...(route ? { openaiCompatible: { ...route, hasKey: Boolean(envValue(env, 'CODEFLOWER_OPENAI_COMPAT_API_KEY')) } } : {})
+      };
+    },
+    // What an OpenAI-compatible endpoint serves, to choose the route's models from.
+    async listModels(params) {
+      return listEndpointModels(await withSavedKey(params));
+    },
+    async checkEndpoint(params) {
+      return checkEndpoint(await withSavedKey(params));
+    },
     // dsh has no ACP sign-in; its keys go into its own .env in the project.
     async setCredentials(params) {
       if (!home) throw new InvalidRequest('DSH_HOME is not set');
@@ -297,7 +465,12 @@ export default function dsh({ home, launch, nodePath, modules }) {
         changed = true;
       }
       if (params.openaiCompatible !== undefined) {
-        const route = validateRoute(params.openaiCompatible);
+        const given = params.openaiCompatible;
+        const keep = !(typeof given?.apiKey === 'string' && given.apiKey.trim());
+        if (keep && !(await savedKey(given?.baseURL))) {
+          throw new InvalidRequest('openaiCompatible.apiKey is needed: no key is saved for this URL');
+        }
+        const route = validateRoute(keep ? { ...given, apiKey: await savedKey(given.baseURL) } : given);
         env = setEnvLine(env, 'CODEFLOWER_OPENAI_COMPAT_API_KEY', route.apiKey);
         await writePrivate(join(home, ENDPOINT_PATCH), `${JSON.stringify(dshEndpointPatch(route), null, 2)}\n`);
         changed = true;

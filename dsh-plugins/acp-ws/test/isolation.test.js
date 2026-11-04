@@ -37,8 +37,7 @@ test('an isolated bridge listens on the socket and advertises the app port', asy
     connectionFile: join(directory, 'instance.json'),
     instanceId: 'instance-test',
     sessionsDirectory: join(directory, 'sessions'),
-    agentName: 'claude',
-    agent: agents.claude,
+    agents: { claude: agents.claude },
     showSocket: join(directory, 'show.sock'),
     log: () => {}
   });

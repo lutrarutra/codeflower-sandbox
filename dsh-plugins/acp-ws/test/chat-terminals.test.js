@@ -21,7 +21,7 @@ const token = 'k'.repeat(43);
 // ---- a window: a WebSocket that keeps what it was sent ----
 
 function window(address) {
-  const socket = new WebSocket(`ws://127.0.0.1:${address.port}/acp`, { headers: { authorization: `Bearer ${token}` } });
+  const socket = new WebSocket(`ws://127.0.0.1:${address.port}/acp?agent=claude`, { headers: { authorization: `Bearer ${token}` } });
   const messages = [];
   const waiters = [];
   socket.on('message', (data) => {
@@ -109,8 +109,7 @@ async function startTestBridge(t) {
     connectionFile: join(directory, 'instance.json'),
     instanceId: 'instance-test',
     sessionsDirectory: join(directory, 'sessions'),
-    agentName: 'claude',
-    agent,
+    agents: { claude: agent },
     ptyHelper,
     environment,
     workspace,
@@ -260,6 +259,31 @@ test("opens the agent's terminal UI on a chat, which outlives the window, and on
   await again.receive((message) => message.method === '_codeflower/terminal/exit' && message.params.terminalId === fresh.terminalId);
   await assert.rejects(again.call('_codeflower/terminal/start', { kind: 'chat', sessionKey: 'claude-nope' }), /no such chat/);
   await assert.rejects(again.call('_codeflower/terminal/start', { kind: 'chat', sessionKey: 'codex-x' }), /Invalid session key/);
+});
+
+test("opens the user's shell in the workspace, without the worker's token, which outlives the window", async (t) => {
+  const { bridge, workspace } = await startTestBridge(t);
+  const page = await open(t, bridge);
+  assert.equal((await page.call('_codeflower/status')).capabilities.shellTerminals, true);
+  const started = await page.call('_codeflower/terminal/start', { kind: 'shell', columns: 90, rows: 25 });
+  await page.receive((message) => message.method === '_codeflower/terminal/changed' && message.params.terminals.length === 1);
+  const [listed] = (await page.call('_codeflower/terminal/list')).terminals;
+  assert.equal(listed.terminalId, started.terminalId);
+  assert.equal(listed.kind, 'shell');
+  assert.equal(listed.sessionKey, undefined);
+
+  await page.call('_codeflower/terminal/input', { terminalId: started.terminalId, data: 'echo "in [$PWD] token [$CODEFLOWER_TOKEN] $((6 * 7))"\r' });
+  await page.printed(started.terminalId, new RegExp(`in \\[${workspace}\\] token \\[\\] 42`));
+  await page.close();
+
+  // Still running: the next window gets what it printed, and can end it.
+  const again = await open(t, bridge);
+  await again.call('_codeflower/terminal/attach', { terminalId: started.terminalId, columns: 90, rows: 25 });
+  await again.printed(started.terminalId, /token \[\] 42/);
+  await again.call('_codeflower/terminal/input', { terminalId: started.terminalId, data: 'exit 4\r' });
+  const exit = await again.receive((message) => message.method === '_codeflower/terminal/exit');
+  assert.equal(exit.params.exitCode, 4);
+  assert.deepEqual((await again.call('_codeflower/terminal/list')).terminals, []);
 });
 
 test("shows a turn typed in the agent's terminal UI in the chat's windows, and holds their prompts until it ends", async (t) => {

@@ -76,11 +76,17 @@ export function createActivity(onChange = () => {}, now = Date.now) {
       return turns.size > 0;
     },
 
-    // Ended turns stay: a poller would otherwise see them again.
-    clear() {
-      turns.clear();
-      requests.clear();
-      toolKinds.clear();
+    /** Whether a turn runs whose id `belongs` takes. */
+    runningWhere(belongs) {
+      return [...turns.keys()].some(belongs);
+    },
+
+    // Ended turns stay: a poller would otherwise see them again. `belongs`
+    // picks what goes by turn or request id and by session id.
+    clear(belongs = () => true) {
+      for (const id of turns.keys()) if (belongs(id)) turns.delete(id);
+      for (const id of requests.keys()) if (belongs(id)) requests.delete(id);
+      for (const sessionId of toolKinds.keys()) if (belongs(sessionId)) toolKinds.delete(sessionId);
       onChange();
     },
 
@@ -102,4 +108,47 @@ export function createActivity(onChange = () => {}, now = Date.now) {
       };
     }
   };
+}
+
+// One agent's view of the worker's activity. Agents of one worker may use the
+// same ids (two can each have a session-1), so the agent's session ids and
+// turn and request ids go in under its name; its snapshot has its own again.
+const SCOPE = '\n';
+
+export function scopedActivity(activity, agent) {
+  const prefix = `${agent}${SCOPE}`;
+  const scoped = (id) => (typeof id === 'string' ? `${prefix}${id}` : id);
+  const mine = (id) => typeof id === 'string' && id.startsWith(prefix);
+  const own = (id) => id.slice(prefix.length);
+  return {
+    turnStarted: (id, sessionId) => activity.turnStarted(scoped(id), scoped(sessionId)),
+    turnEnded: (id, stopReason) => activity.turnEnded(scoped(id), stopReason),
+    toolCall: (sessionId, update) => activity.toolCall(scoped(sessionId), update),
+    permission: (id, sessionId, toolCall) => activity.permission(scoped(id), scoped(sessionId), toolCall),
+    isPlan: (sessionId, toolCall) => activity.isPlan(scoped(sessionId), toolCall),
+    question: (id, sessionId) => activity.question(scoped(id), scoped(sessionId)),
+    answered: (id) => activity.answered(scoped(id)),
+    busy: (sessionId) => activity.busy(scoped(sessionId)),
+    get running() {
+      return activity.runningWhere(mine);
+    },
+    clear: () => activity.clear(mine),
+    snapshot() {
+      const { chats, ended, turns } = activity.snapshot();
+      const ours = chats.filter((chat) => mine(chat.sessionId)).map((chat) => ({ ...chat, sessionId: own(chat.sessionId) }));
+      return {
+        chats: ours,
+        working: ours.filter((chat) => chat.state === 'working').length,
+        waiting: ours.filter((chat) => chat.state === 'waiting').length,
+        ended: ended.filter((turn) => mine(turn.sessionId)).map((turn) => ({ ...turn, sessionId: own(turn.sessionId) })),
+        turns
+      };
+    }
+  };
+}
+
+/** A session id of the worker's activity, back as [agent, its own session id]. */
+export function unscope(sessionId) {
+  const at = sessionId.indexOf(SCOPE);
+  return [sessionId.slice(0, at), sessionId.slice(at + SCOPE.length)];
 }

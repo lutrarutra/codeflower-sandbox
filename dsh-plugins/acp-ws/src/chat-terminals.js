@@ -1,5 +1,6 @@
-// The agents' own terminal UIs on the worker's chats (`codeflower attach`).
-// A chat's terminal belongs to the worker, not to a window: it keeps running
+// The agents' own terminal UIs on the worker's chats (`codeflower attach`),
+// and the user's shells (the page's Terminal). A terminal belongs to the
+// worker, not to a window: it keeps running
 // while nobody looks at it, and windows attach to it and detach again. Each
 // gets what it printed since it last redrew (a ring buffer) and the output
 // from then on.
@@ -46,10 +47,15 @@ export function createChatTerminals({ ptyHelper, log = () => {}, onChange = () =
 
   const describe = (terminal) => ({
     terminalId: terminal.id,
-    sessionKey: terminal.key,
-    sessionId: terminal.sessionId,
-    // shared: the chat goes on in the windows too; handoff: the terminal has it.
-    mode: terminal.mode,
+    kind: terminal.kind,
+    ...(terminal.kind === 'chat'
+      ? {
+          sessionKey: terminal.key,
+          sessionId: terminal.sessionId,
+          // shared: the chat goes on in the windows too; handoff: the terminal has it.
+          mode: terminal.mode
+        }
+      : {}),
     viewers: terminal.viewers.size,
     startedAt: terminal.startedAt
   });
@@ -72,12 +78,12 @@ export function createChatTerminals({ ptyHelper, log = () => {}, onChange = () =
 
   return {
     /**
-     * Starts `command` for a chat. `key` is the chat's session key, so a chat
-     * has one terminal at most.
+     * Starts `command` for a chat, or a shell (`kind`). `key` is the chat's
+     * session key, so a chat has one terminal at most; a shell has its own.
      */
-    start({ key, sessionId, command, env, cwd, size, mode = 'shared' }) {
+    start({ kind = 'chat', key, sessionId, command, env, cwd, size, mode = 'shared' }) {
       if (!Array.isArray(ptyHelper) || ptyHelper.length === 0) throw new Error('This worker cannot open terminals');
-      if (terminals.has(key)) throw new Error('The chat already has a terminal');
+      if (terminals.has(key)) throw new Error(kind === 'chat' ? 'The chat already has a terminal' : 'The terminal is already running');
       const child = spawn(ptyHelper[0], [...ptyHelper.slice(1), ...command], {
         env: { ...env, COLUMNS: String(size.columns), LINES: String(size.rows) },
         cwd,
@@ -85,6 +91,7 @@ export function createChatTerminals({ ptyHelper, log = () => {}, onChange = () =
       });
       const terminal = {
         id: randomUUID(),
+        kind,
         key,
         sessionId,
         mode,
@@ -142,7 +149,8 @@ export function createChatTerminals({ ptyHelper, log = () => {}, onChange = () =
       if (replay) notify(client, '_codeflower/terminal/output', { terminalId: terminal.id, data: replay, replayed: true });
       if (!watch) {
         // The same size again would not make it redraw: one row less first.
-        if (size.columns === terminal.columns && size.rows === terminal.rows) {
+        // A shell's replay is enough, and a shell only redraws its prompt.
+        if (terminal.kind === 'chat' && size.columns === terminal.columns && size.rows === terminal.rows) {
           setSize(terminal, { columns: size.columns, rows: Math.max(MIN_ROWS, size.rows - 1) });
         }
         setSize(terminal, size);
@@ -159,9 +167,10 @@ export function createChatTerminals({ ptyHelper, log = () => {}, onChange = () =
       for (const client of terminal.viewers.keys()) notify(client, method, { terminalId: terminal.id, ...params });
     },
 
-    // Tells every window that watches a terminal (the rail in `codeflower attach`).
+    // Tells every window that watches a chat's terminal (the rail in `codeflower attach`).
     notifyViewers(method, params) {
       for (const terminal of terminals.values()) {
+        if (terminal.kind !== 'chat') continue;
         for (const client of terminal.viewers.keys()) notify(client, method, { terminalId: terminal.id, ...params });
       }
     },
@@ -197,6 +206,10 @@ export function createChatTerminals({ ptyHelper, log = () => {}, onChange = () =
 
     list() {
       return [...terminals.values()].map(describe);
+    },
+
+    count(kind) {
+      return [...terminals.values()].filter((terminal) => terminal.kind === kind).length;
     },
 
     describe,

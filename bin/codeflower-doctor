@@ -134,7 +134,7 @@ function launchFacts() {
   const lines = [
     '# Sandbox environment at worker startup',
     '',
-    `- Agent: ${process.env.CODEFLOWER_AGENT || 'not reported'}`,
+    '- Agents: every agent of the image runs here; each chat is one agent\'s',
     `- Engine: ${process.env.CODEFLOWER_ENGINE || 'not reported'}`,
     `- Network: ${process.env.CODEFLOWER_NETWORK === 'isolated' ? 'isolated; run codeflower-network for the current allowlist' : 'no code flower isolation reported; other network restrictions may apply'}`,
     '- Agent tool limits and permissions: not reported here; check the active harness.',

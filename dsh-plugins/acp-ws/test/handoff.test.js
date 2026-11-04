@@ -18,7 +18,7 @@ const ptyHelper = ['python3', fileURLToPath(new URL('../../../bin/codeflower-pty
 const token = 'k'.repeat(43);
 
 function window(address) {
-  const socket = new WebSocket(`ws://127.0.0.1:${address.port}/acp`, { headers: { authorization: `Bearer ${token}` } });
+  const socket = new WebSocket(`ws://127.0.0.1:${address.port}/acp?agent=claude`, { headers: { authorization: `Bearer ${token}` } });
   const messages = [];
   const waiters = [];
   socket.on('message', (data) => {
@@ -106,8 +106,7 @@ async function startHandoffBridge(t) {
     connectionFile: join(directory, 'instance.json'),
     instanceId: 'instance-handoff',
     sessionsDirectory: join(directory, 'sessions'),
-    agentName: 'claude',
-    agent,
+    agents: { claude: agent },
     ptyHelper,
     environment,
     workspace,

@@ -15,8 +15,8 @@ import { createSubagentAdapter } from './subagents/adapters.js';
 
 export { InvalidRequest };
 
-// Where the app passes the API key from its config, for the worker's agent.
-export const PROVIDED_KEY_VARIABLE = 'CODEFLOWER_API_KEY';
+// Where the app passes the API keys from its config: JSON, by agent.
+export const PROVIDED_KEYS_VARIABLE = 'CODEFLOWER_API_KEYS';
 
 const AGENTS_DIRECTORY = join(dirname(fileURLToPath(import.meta.url)), 'agents');
 
@@ -31,9 +31,19 @@ export async function loadRegistry(directory = AGENTS_DIRECTORY) {
         if (descriptor.id !== entry.name) throw new Error(`${folder}/agent.json names the agent ${descriptor.id}`);
         if (typeof descriptor.launch !== 'string') throw new Error(`${folder}/agent.json has no launch script`);
         const hooks = existsSync(join(folder, 'index.js')) ? (await import(join(folder, 'index.js'))).default : undefined;
-        return { descriptor, hooks };
+        return { descriptor, hooks, icon: readIcon(folder, descriptor) };
       })
   );
+}
+
+// The agent's logo (agent.json's `icon`, an SVG next to it; see ICONS.md), as a
+// data URL that windows show in an <img>, where an SVG runs no script. A
+// `mono` icon is drawn in currentColor, which an <img> does not inherit: windows
+// use it as a mask over the text color instead.
+function readIcon(folder, descriptor) {
+  if (!descriptor.icon?.file) return undefined;
+  const svg = readFileSync(join(folder, descriptor.icon.file));
+  return { url: `data:image/svg+xml;base64,${svg.toString('base64')}`, mono: descriptor.icon.mono === true };
 }
 
 const registry = await loadRegistry();
@@ -48,8 +58,8 @@ export const DESCRIPTORS = Object.fromEntries(registry.map(({ descriptor }) => [
 // project, written by their sign-in flows.
 export const CREDENTIAL_VARIABLES = [
   ...new Set(registry.flatMap(({ descriptor }) => descriptor.credentialVariables ?? [])),
-  // The key the app's config gives this worker's agent; see provideKey.
-  PROVIDED_KEY_VARIABLE
+  // The keys the app's config gives the agents; see provideKey.
+  PROVIDED_KEYS_VARIABLE
 ];
 
 export async function terminalAuthCommand(agent, method) {
@@ -74,13 +84,18 @@ export async function terminalAuthCommand(agent, method) {
  */
 export function createAgents({ nodePath, modules, launch = {}, environment = process.env, agents = registry }) {
   return Object.fromEntries(
-    agents.map(({ descriptor, hooks }) => {
+    agents.map(({ descriptor, hooks, icon }) => {
       const script = launch[descriptor.id] ?? (modules ? join(modules, descriptor.launch) : descriptor.launch);
       const home = descriptor.home ? environment[descriptor.home.variable] : undefined;
       const agent = {
         label: descriptor.name,
-        // How the chat shows it: name and color, sent with the worker's status.
-        presentation: { id: descriptor.id, name: descriptor.name, ...(descriptor.color ? { color: descriptor.color } : {}) },
+        // How windows show it: name, color and logo.
+        presentation: {
+          id: descriptor.id,
+          name: descriptor.name,
+          ...(descriptor.color ? { color: descriptor.color } : {}),
+          ...(icon ? { icon: icon.url, ...(icon.mono ? { iconMono: true } : {}) } : {})
+        },
         async command() {
           return [nodePath, script];
         },
