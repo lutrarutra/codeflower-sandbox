@@ -1661,9 +1661,10 @@ export async function startBridge(options) {
     };
 
     // Types the next prompt a window sent into the terminal UI, once it is
-    // between turns: as a bracketed paste, then Enter.
+    // between turns: as a bracketed paste, then Enter. Once the terminal moved
+    // to another session, prompts wait for handBack to send them to the adapter.
     const typeNext = (handoff) => {
-      if (handoff.busy || handoff.current || !handoff.terminal) return;
+      if (handoff.left || handoff.busy || handoff.current || !handoff.terminal) return;
       const next = handoff.queue.shift();
       if (!next) return;
       handoff.current = next;
