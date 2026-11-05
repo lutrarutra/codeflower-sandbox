@@ -45,7 +45,7 @@ COPY dsh-plugins/acp-ws/src ./src
 # installs a copy in the project, editable). Pinned by tag; a development build
 # uses the workspace checkout instead: --build-context storyteller=../storyteller.
 FROM scratch AS storyteller
-ADD --keep-git-dir=false https://github.com/lutrarutra/storyteller.git#v0.3.0 /
+ADD --keep-git-dir=false https://github.com/lutrarutra/storyteller.git#v0.4.0 /
 
 # The chat page the worker serves with `codeflower sandbox --server`:
 # codeflower-ui's web build, pinned by tag. A development build uses the
