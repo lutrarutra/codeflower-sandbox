@@ -150,6 +150,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /tmp/Rtmp*
 COPY R/Rprofile.site /etc/R/Rprofile.site
 
+# LibreOffice, headless, draws storyteller's slide decks (pptx to PDF) for their live
+# view; Carlito has Calibri's metrics, for decks made from PowerPoint templates.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    fonts-crosextra-carlito \
+    libreoffice-impress-nogui \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY --from=ghcr.io/astral-sh/uv:0.13.6@sha256:af22a52f5eafef3d78e551599d405c02df61919d18028f0cea8eda93bc9986d0 /uv /uvx /usr/local/bin/
 COPY --from=dsh-runtime /usr/local/bin/node /usr/local/bin/node
 COPY --from=dsh-runtime /opt/codeflower/runtime /opt/codeflower/runtime
@@ -159,8 +166,10 @@ COPY --from=dsh-runtime /opt/codeflower/acp-ws /opt/codeflower/acp-ws
 # project venvs see, so the entrypoint can install the editable copy offline.
 COPY --from=storyteller / /opt/codeflower/src/storyteller
 COPY --from=page / /opt/codeflower/page
+# python-pptx (with lxml, XlsxWriter, typing-extensions) and pypdfium2 are for its decks.
 RUN pip install --no-cache-dir pillow==13.0.0 markdown-it-py==4.2.0 mdurl==0.1.2 hatchling==1.33.0 editables==0.6 pygments==2.21.0 \
-    && python -c "import sys; sys.path.insert(0, '/opt/codeflower/src/storyteller/src'); import storyteller"
+        python-pptx==1.0.2 lxml==6.1.3 XlsxWriter==3.3.1 typing-extensions==4.16.0 pypdfium2==5.14.0 \
+    && python -c "import sys; sys.path.insert(0, '/opt/codeflower/src/storyteller/src'); import storyteller, storyteller.deck"
 
 COPY entrypoint.sh /opt/codeflower/entrypoint.sh
 COPY profile.d/codeflower.sh /etc/profile.d/codeflower.sh
