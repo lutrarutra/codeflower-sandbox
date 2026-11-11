@@ -6,6 +6,8 @@ import { claudePlugins } from './plugins.js';
 
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 const USAGE_TIMEOUT_MS = 15_000;
+// How an async task's end reads as a turn's stop reason.
+const TURN_END = { completed: 'end_turn', stopped: 'cancelled', failed: 'error' };
 
 export default function claude({ descriptor, home, modules, environment }) {
   return {
@@ -73,6 +75,18 @@ export default function claude({ descriptor, home, modules, environment }) {
         emitRawSDKMessages: [{ type: 'rate_limit_event' }],
         options: { settings: { plansDirectory: 'plans' } }
       }
+    },
+    // Claude Code starts turns by itself, e.g. when a background command it said
+    // it waits for ends. The adapter tells of them only to a client of AIR's
+    // async tasks: as a task of type `turn`, spawned when the turn starts and
+    // ended by a state update (its background commands come as tasks too).
+    clientCapabilities: { _meta: { jetbrains: { air: { version: 1, capabilities: ['asyncTasks'] } } } },
+    autonomousTurn(update) {
+      if (typeof update?.asyncTaskId !== 'string') return undefined;
+      if (update.sessionUpdate === 'async_task_spawned' && update.taskType === 'turn') return { id: update.asyncTaskId, started: true };
+      const stopReason = update.sessionUpdate === 'async_task_state_update' ? TURN_END[update.state] : undefined;
+      // The bridge ends only the turns it saw start.
+      return stopReason ? { id: update.asyncTaskId, stopReason } : undefined;
     },
     // Plugins from Claude Code's marketplaces, fetched into a seed (plugins.js).
     plugins: claudePlugins({ descriptor, home, environment }),

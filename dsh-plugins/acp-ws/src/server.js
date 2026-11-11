@@ -1156,6 +1156,9 @@ export async function startBridge(options) {
         ownPrompts: new Map(),
         // Per session: the activity key of a turn the terminal UI started.
         terminalTurns: new Map(),
+        // Turns the agent started by itself (index.js's autonomousTurn): the
+        // session of each, by its activity key.
+        autonomousTurns: new Map(),
         // Chats handed over to the agent's own terminal UI (Claude Code), by
         // session: the adapter let go of them, and the bridge follows the
         // terminal (handOver).
@@ -2089,6 +2092,7 @@ export async function startBridge(options) {
         } else {
           relayUpdate(host, sessionId, update, frame, message);
         }
+        if (sessionId !== undefined) followAutonomousTurn(host, sessionId, update);
         return;
       }
       recorder?.fromAgent(message);
@@ -2286,11 +2290,36 @@ export async function startBridge(options) {
     };
 
     // The agent hears of everything the bridge handles for its windows, e.g.
-    // subagents, whichever window or task initialized it first.
+    // subagents or the turns it starts by itself, whichever window or task
+    // initialized it first.
+    const extraCapabilities = mergeMeta(subagentAdapter?.clientCapabilities, agent.clientCapabilities);
     const withClientCapabilities = (message) => {
-      if (message.method !== 'initialize' || !subagentAdapter || !protocolObject(message.params)) return message;
+      if (message.method !== 'initialize' || !Object.keys(extraCapabilities).length || !protocolObject(message.params)) return message;
       const capabilities = protocolObject(message.params.clientCapabilities) ? message.params.clientCapabilities : {};
-      return { ...message, params: { ...message.params, clientCapabilities: mergeMeta(capabilities, subagentAdapter.clientCapabilities) } };
+      return { ...message, params: { ...message.params, clientCapabilities: mergeMeta(capabilities, extraCapabilities) } };
+    };
+
+    // A turn the agent starts without a prompt (index.js's autonomousTurn), e.g.
+    // Claude Code's when a background command it waits for ends: the chat works
+    // as in a prompt's turn, so windows show it working, also after a reattach.
+    const followAutonomousTurn = (host, sessionId, update) => {
+      const turn = agent.autonomousTurn?.(update);
+      if (!turn || typeof turn.id !== 'string') return;
+      const key = `autonomous-${turn.id}`;
+      if (turn.started) {
+        if (host.autonomousTurns.has(key)) return;
+        host.autonomousTurns.set(key, sessionId);
+        activity.turnStarted(key, sessionId);
+        sessionInfo.turn(sessionId, true);
+        return;
+      }
+      const owner = host.autonomousTurns.get(key);
+      if (owner === undefined) return;
+      host.autonomousTurns.delete(key);
+      const stopReason = turn.stopReason ?? 'end_turn';
+      activity.turnEnded(key, stopReason);
+      if (!activity.busy(owner)) sessionInfo.turn(owner, false);
+      recorder?.record(owner, { kind: 'turn_end', stopReason });
     };
 
     // The configured MCP servers the agent takes, in every session it starts,

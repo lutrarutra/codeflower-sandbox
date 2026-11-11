@@ -1326,6 +1326,40 @@ test('keeps the agent and its chats working while no window is connected', async
   await closeSocket(third);
 });
 
+test('shows a turn the agent starts by itself as working, also to a window that reattaches', async (t) => {
+  const { bridge } = await startTestBridge(t);
+  const first = await openSocket(bridge.address);
+  // Claude Code's adapter tells of such turns only to a client of AIR's async tasks.
+  assert.deepEqual((await initialize(first)).air, { version: 1, capabilities: ['asyncTasks'] });
+  const sessionId = (await call(first, 'session/new', { cwd: '/workspace', mcpServers: [] })).result.sessionId;
+  const key = sessionKey('claude', sessionId);
+  // A background command the agent waited for ended, after its prompt's turn: it goes on by itself.
+  await call(first, 'fake/update', {
+    sessionId,
+    update: { sessionUpdate: 'async_task_spawned', asyncTaskId: 'turn-1', name: 'Claude is working', taskType: 'turn', description: 'A background command ended.' }
+  });
+  const working = await receive(first, (message) => message.method === '_codeflower/activity' && message.params.working === 1);
+  assert.deepEqual(working.params.chats, [{ key, state: 'working' }]);
+  await closeSocket(first);
+
+  const second = await openSocket(bridge.address);
+  await initialize(second);
+  const resumed = (await call(second, 'session/resume', { sessionId, cwd: '/workspace', mcpServers: [] })).result;
+  assert.equal(resumed._meta['codeflower/busy'], true);
+  // A background command's own task ending is not the turn's end.
+  await call(second, 'fake/update', { sessionId, update: { sessionUpdate: 'async_task_state_update', asyncTaskId: 'bash-1', state: 'completed' } });
+  await call(second, 'fake/update', { sessionId, update: { sessionUpdate: 'async_task_state_update', asyncTaskId: 'turn-1', state: 'completed' } });
+  await receive(second, (message) => message.method === '_codeflower/activity' && message.params.working === 0);
+  const finished = (await status(bridge.address)).body;
+  assert.deepEqual(
+    finished.ended.map(({ key, stopReason }) => ({ key, stopReason })),
+    [{ key, stopReason: 'end_turn' }]
+  );
+  const entries = (await call(second, '_codeflower/sessions/transcript', { key })).result.entries;
+  assert.deepEqual(entries.at(-1), { ...entries.at(-1), kind: 'turn_end', stopReason: 'end_turn' });
+  await closeSocket(second);
+});
+
 test('takes a message into the running turn and shows it in every window', async (t) => {
   const { bridge } = await startTestBridge(t);
   const first = await openSocket(bridge.address);

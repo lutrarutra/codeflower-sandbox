@@ -259,6 +259,7 @@ input.on('line', async (line) => {
           opencodeDatabase: process.env.OPENCODE_DB ?? null,
           pluginSeed: process.env.CLAUDE_CODE_PLUGIN_SEED_DIR ?? null,
           subagents: clientSubagents,
+          air: capabilities._meta?.jetbrains?.air ?? null,
           codexConfig: process.env.CODEX_CONFIG ?? null,
           argv: process.argv.slice(2),
           pid: process.pid
@@ -583,6 +584,12 @@ input.on('line', async (line) => {
       const { childId } = message.params;
       const child = runningChildren.get(childId);
       if (child) endChild(childId, child.parentId, child.draft, 'end_turn');
+      send({ jsonrpc: '2.0', id: message.id, result: {} });
+      break;
+    }
+    // Any session update, as an agent sends one on its own (e.g. Claude Code's async tasks).
+    case 'fake/update': {
+      update(message.params.sessionId, message.params.update);
       send({ jsonrpc: '2.0', id: message.id, result: {} });
       break;
     }

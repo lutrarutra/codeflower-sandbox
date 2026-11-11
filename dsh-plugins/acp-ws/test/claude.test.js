@@ -26,6 +26,21 @@ test('the image runs Claude Code from where the app binds it in', async () => {
   assert.equal(descriptor.env.CLAUDE_CODE_EXECUTABLE, '/opt/codeflower/agents/claude/claude');
 });
 
+test('reads the turns Claude Code starts by itself from its async tasks', async (t) => {
+  const { claude } = await setup(t);
+  assert.deepEqual(claude.clientCapabilities._meta.jetbrains.air, { version: 1, capabilities: ['asyncTasks'] });
+  const spawned = (taskType) => ({ sessionUpdate: 'async_task_spawned', asyncTaskId: 'task-1', taskType });
+  const ended = (state) => ({ sessionUpdate: 'async_task_state_update', asyncTaskId: 'task-1', state });
+  assert.deepEqual(claude.autonomousTurn(spawned('turn')), { id: 'task-1', started: true });
+  // Its background commands are tasks too, but no turns.
+  assert.equal(claude.autonomousTurn(spawned('local_bash')), undefined);
+  assert.deepEqual(claude.autonomousTurn(ended('completed')), { id: 'task-1', stopReason: 'end_turn' });
+  assert.deepEqual(claude.autonomousTurn(ended('stopped')), { id: 'task-1', stopReason: 'cancelled' });
+  assert.deepEqual(claude.autonomousTurn(ended('failed')), { id: 'task-1', stopReason: 'error' });
+  assert.equal(claude.autonomousTurn(ended('running')), undefined);
+  assert.equal(claude.autonomousTurn({ sessionUpdate: 'agent_message_chunk' }), undefined);
+});
+
 test('says Claude Code is missing until both the SDK and the CLI are there', async (t) => {
   const { claude, modules, executable } = await setup(t);
   assert.match(await claude.missing(), /Claude Code is not installed/);
