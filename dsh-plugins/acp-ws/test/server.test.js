@@ -2068,3 +2068,66 @@ test("deleting a chat deletes its subagents' chats", async (t) => {
   assert.equal((await call(window, '_codeflower/sessions/delete', { key: sessionKey('claude', parentId) })).error, undefined);
   assert.deepEqual(await readdir(sessionsDirectory), []);
 });
+
+test("resumes a chat whose agent process ended, with its settings, instead of failing every prompt", async (t) => {
+  const { bridge } = await startTestBridge(t);
+  const window = await openSocket(bridge.address);
+  t.after(() => closeSocket(window));
+  await initialize(window);
+  const sessionId = await newChat(window);
+  await call(window, 'session/set_config_option', { sessionId, configId: 'effort', value: 'high' });
+
+  // Ended during a turn: that turn fails and says how to go on; the next prompt works.
+  const failed = await prompt(window, sessionId, 'crash');
+  assert.equal(failed.error.code, -32603);
+  assert.match(failed.error.message, /stopped unexpectedly.*Send a message to go on/);
+  const answered = await prompt(window, sessionId, 'say hello');
+  assert.equal(answered.error, undefined);
+  assert.equal(answered.result.stopReason, 'end_turn');
+  // The resumed chat has the settings it had, also for a window that reattaches.
+  const other = await openSocket(bridge.address);
+  t.after(() => closeSocket(other));
+  await initialize(other);
+  const reattached = await call(other, 'session/resume', { sessionId, cwd: '/workspace', mcpServers: [] });
+  assert.equal(reattached.result.configOptions.find((option) => option.id === 'effort').currentValue, 'high');
+
+  // Ended between turns: the next prompt finds it gone, and goes again once it is back.
+  assert.equal((await prompt(window, sessionId, 'crash after')).result.stopReason, 'end_turn');
+  const again = await prompt(window, sessionId, 'say hello again');
+  assert.equal(again.error, undefined);
+  assert.equal(again.result.stopReason, 'end_turn');
+});
+
+test("restarts an agent whose server ended by itself, and its chats resume on the new one", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'codeflower-companion-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const pidFile = join(directory, 'pid');
+  const base = createAgents({ nodePath: process.execPath, launch: { codex: fakeAgent }, environment: process.env }).codex;
+  // Like Codex's shared app-server: started before the agent, ended with it.
+  const agent = {
+    ...base,
+    companion: async () => ({
+      command: [process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1e6)`],
+      ready: () => waitFor(async () => Boolean(await readFile(pidFile, 'utf8').catch(() => '')))
+    })
+  };
+  const { bridge } = await startTestBridge(t, { agentName: 'codex', agent });
+  const window = await openSocket(bridge.address);
+  await initialize(window);
+  const sessionId = await newChat(window);
+  assert.equal((await prompt(window, sessionId, 'say hello')).result.stopReason, 'end_turn');
+
+  // The server dies (e.g. out of memory): the agent ends too, and its windows hear it ended.
+  const closed = once(window, 'close');
+  process.kill(Number(await readFile(pidFile, 'utf8')), 'SIGABRT');
+  const [code] = await closed;
+  assert.equal(code, 1011);
+
+  // A window opens the chat again: a new agent and server, and the chat goes on.
+  await rm(pidFile);
+  const again = await openSocket(bridge.address);
+  t.after(() => closeSocket(again));
+  await initialize(again);
+  assert.equal((await call(again, 'session/resume', { sessionId, cwd: '/workspace', mcpServers: [] })).error, undefined);
+  assert.equal((await prompt(again, sessionId, 'say hello again')).result.stopReason, 'end_turn');
+});

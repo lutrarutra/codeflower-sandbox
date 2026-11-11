@@ -40,6 +40,8 @@ const settings = new Map();
 const tasks = new Map();
 // What each session's creator put in its _meta, e.g. the bridge's rate limit request.
 const sessionMeta = new Map();
+// Sessions whose Claude Code process ended, which the adapter forgot until resumed.
+const lostSessions = new Set();
 // A running cost per session, like Claude Code's, which starts over on resume.
 const costs = new Map();
 // Whether the client takes subagents as sessions of their own (ACP subagents
@@ -303,6 +305,27 @@ input.on('line', async (line) => {
     }
     case 'session/prompt': {
       const text = message.params.prompt?.[0]?.text;
+      // Like Claude's adapter once the chat's Claude Code process ended (e.g.
+      // out of memory): during a turn, or between turns, which only the next
+      // prompt finds out.
+      if (lostSessions.has(message.params.sessionId)) {
+        send({ jsonrpc: '2.0', id: message.id, error: { code: -32603, message: 'Internal error', data: { details: 'Session not found' } } });
+        break;
+      }
+      if (text === 'crash' || text === 'crash after') {
+        lostSessions.add(message.params.sessionId);
+        settings.delete(message.params.sessionId);
+        if (text === 'crash after') {
+          reply(message.params.sessionId, message.id, 'done before the crash');
+          break;
+        }
+        send({
+          jsonrpc: '2.0',
+          id: message.id,
+          error: { code: -32603, message: 'Internal error: The Claude Agent process exited unexpectedly. Please start a new session.' }
+        });
+        break;
+      }
       if (text === 'cancel me') {
         pendingPrompt = message.id;
         break;
@@ -618,6 +641,7 @@ input.on('line', async (line) => {
         break;
       }
       costs.delete(message.params?.sessionId);
+      lostSessions.delete(message.params?.sessionId);
       sessionMeta.set(message.params?.sessionId, message.params?._meta ?? null);
       if (!tasks.has(message.params?.sessionId)) tasks.set(message.params?.sessionId, { systemPrompt: null });
       send({ jsonrpc: '2.0', id: message.id, result: mcpEcho(message) });

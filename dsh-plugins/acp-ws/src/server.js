@@ -68,6 +68,12 @@ const SIGN_IN_POLL_MS = 2000;
 // setTimeout waits at most about 24 days; longer waits are made of several.
 const MAX_TIMER_MS = 2 ** 31 - 1;
 const SESSION_STARTS = ['session/new', 'session/resume', 'session/load'];
+// The agent lost a chat it had loaded. Claude's adapter does when the chat's
+// Claude Code process ends, e.g. out of memory on a cluster node: the turn that
+// was running fails with the first, and later requests with the second.
+const chatProcessEnded = (error) => error?.code === -32603 && /process exited unexpectedly/i.test(String(error.message));
+const chatNotLoaded = (error) =>
+  error?.code === -32603 && /^Session not found$/i.test(String(error.data?.details ?? ''));
 // How long a turn the agent's terminal UI started is held open after the
 // agent says it ended, for its last updates over ACP.
 const TERMINAL_TURN_SETTLE_MS = 500;
@@ -1164,6 +1170,12 @@ export async function startBridge(options) {
         // terminal (handOver).
         handoffs: new Map(),
         retiring: false,
+        // Chats the agent lost (chatProcessEnded) whose next request resumes
+        // them first, and the resumes on their way.
+        lost: new Set(),
+        recovering: new Map(),
+        // Each loaded session's folder, to resume it in.
+        cwds: new Map(),
         withoutKeys,
         // Its chats' subagents (subagents/tracker.js), and the summaries that
         // wait for their parents' windows (subagentChanged).
@@ -1256,6 +1268,15 @@ export async function startBridge(options) {
         closeClients(started, 1011, 'Agent process ended');
         agentsChanged();
       });
+      // A companion that ended by itself (Codex's app-server, e.g. out of
+      // memory) took the agent's chats with it, and the agent cannot start it
+      // again: the agent ends too, and the windows start it again and resume
+      // their chats, as after any end of the agent.
+      companion?.once('close', (code, signal) => {
+        if (closing || !childRunning(child)) return;
+        log(`${agent.label ?? agentName}'s server ended (${code ?? signal}): restarting ${agent.label ?? agentName}`);
+        endChild(child);
+      });
       return started;
     };
 
@@ -1329,6 +1350,13 @@ export async function startBridge(options) {
     const sendRequest = (host, request, webSocket) => {
       const { key, method, params } = request;
       const sessionId = params?.sessionId;
+      if (typeof sessionId === 'string' && host.lost.has(sessionId) && !SESSION_STARTS.includes(method)) {
+        recoverSession(host, sessionId).then(
+          () => sendRequest(host, request, webSocket),
+          (error) => refuseRequest(request, `Could not resume the chat: ${error.message}`)
+        );
+        return;
+      }
       const prompt = method === 'session/prompt' && typeof sessionId === 'string';
       const send = () => {
         host.requests.set(key, request);
@@ -1380,6 +1408,89 @@ export async function startBridge(options) {
     // Prompts not started yet are cancelled with the turn.
     const dropPrompts = (host, sessionId) => {
       for (const { cancel } of host.prompts.get(sessionId)?.splice(0) ?? []) cancel();
+    };
+
+    // ---- chats the agent lost ----
+
+    // The agent answered that it lost a chat (chatProcessEnded): its next
+    // request resumes it, which starts a new process from its transcript, and
+    // the windows keep it open meanwhile. A request that found the chat gone
+    // goes again once it is back; the turn that was running when it went tells
+    // the user how to go on.
+    const chatLost = (host, request, message) => {
+      const sessionId = request.params?.sessionId;
+      if (typeof sessionId !== 'string' || SESSION_STARTS.includes(request.method) || !host.sessions.has(sessionId)) return false;
+      const ended = chatProcessEnded(message.error);
+      if (!ended && !chatNotLoaded(message.error)) return false;
+      if (!host.lost.has(sessionId)) {
+        host.lost.add(sessionId);
+        log(`${agent.label ?? agentName} lost ${sessionKey(agentName, sessionId)} (${message.error.message}); its next request resumes it`);
+      }
+      if (ended) {
+        message.error = {
+          ...message.error,
+          message: `${agent.label ?? agentName} stopped unexpectedly, e.g. out of memory. Send a message to go on with the chat.`
+        };
+        return false;
+      }
+      if (request.resent) return false;
+      request.resent = true;
+      recoverSession(host, sessionId).then(
+        () => {
+          if (!childRunning(host.child)) {
+            request.reject?.(new Error(`${agentName} exited before answering ${request.method}`));
+            return;
+          }
+          host.requests.set(request.key, request);
+          writeToAgent(host, { jsonrpc: '2.0', id: request.bridgeId, method: request.method, params: request.params });
+        },
+        (error) => {
+          host.requests.set(request.key, request);
+          fromAgent(host, '', {
+            jsonrpc: '2.0',
+            id: request.bridgeId,
+            error: { code: -32603, message: `Could not resume the chat: ${error.message}` }
+          });
+        }
+      );
+      return true;
+    };
+
+    // Resumes a lost chat, once for all the requests that wait for it, with the
+    // settings it had: a new process starts with the defaults.
+    const recoverSession = (host, sessionId) => {
+      let recovering = host.recovering.get(sessionId);
+      if (recovering) return recovering;
+      const before = host.sessions.get(sessionId);
+      recovering = (async () => {
+        const capabilities = (await host.initialized)?.agentCapabilities ?? {};
+        const resume = Boolean(capabilities.sessionCapabilities?.resume) || !capabilities.loadSession;
+        await requestAgent(host, resume ? 'session/resume' : 'session/load', {
+          sessionId,
+          cwd: host.cwds.get(sessionId) ?? workspace,
+          mcpServers: []
+        });
+        host.lost.delete(sessionId);
+        log(`Resumed ${sessionKey(agentName, sessionId)}, which ${agent.label ?? agentName} had lost`);
+        const now = host.sessions.get(sessionId)?.configOptions ?? [];
+        for (const option of before?.configOptions ?? []) {
+          if (typeof option?.id !== 'string' || option.currentValue === undefined) continue;
+          if (now.find((current) => current?.id === option.id)?.currentValue === option.currentValue) continue;
+          try {
+            await requestAgent(host, 'session/set_config_option', { sessionId, configId: option.id, value: option.currentValue });
+          } catch (error) {
+            log(`Could not set ${option.id} again in ${sessionKey(agentName, sessionId)}: ${error.message}`);
+          }
+        }
+      })().finally(() => host.recovering.delete(sessionId));
+      host.recovering.set(sessionId, recovering);
+      return recovering;
+    };
+
+    // Answers a request the bridge could not send with an error.
+    const refuseRequest = (request, message) => {
+      if (allClients.has(request.client)) request.client.send({ jsonrpc: '2.0', id: request.id, error: { code: -32603, message } });
+      else request.reject?.(new Error(message));
     };
 
     // ---- what the agent reports itself, beside ACP ----
@@ -1984,6 +2095,7 @@ export async function startBridge(options) {
         case 'session/load':
           if (request.mcpFailed?.length) host.mcpFailed.set(sessionId, request.mcpFailed);
           else host.mcpFailed.delete(sessionId);
+          if (typeof params?.cwd === 'string') host.cwds.set(sessionId, params.cwd);
           rememberSession(host, sessionId, result);
           // The session's totals start from those its transcript recorded.
           void (recorder?.isOpen(sessionId) ?? Promise.resolve()).then(() =>
@@ -2005,6 +2117,8 @@ export async function startBridge(options) {
           if (host.handoffs.has(sessionId)) break;
           host.sessions.delete(sessionId);
           host.mcpFailed.delete(sessionId);
+          host.lost.delete(sessionId);
+          host.cwds.delete(sessionId);
           for (const target of clients) target.sessions.delete(sessionId);
           void recorder?.close(sessionId);
           for (const child of host.subagents.childrenOf(sessionId)) void recorder?.close(child.sessionId);
@@ -2041,6 +2155,7 @@ export async function startBridge(options) {
         }
         host.requests.delete(requestKey(message.id));
         if (message.error && retryWithoutMcp(host, request, message.error)) return;
+        if (message.error && chatLost(host, request, message)) return;
         const turn = request.method === 'session/prompt' ? endTurn(request, message) : undefined;
         recorder?.fromAgent(message, turn);
         // Attaches answer once the recorder caught up.
@@ -2670,6 +2785,8 @@ export async function startBridge(options) {
             if (activity.busy(loaded)) throw new InvalidRequest('The chat is still working; stop it first');
             host.sessions.delete(loaded);
             host.mcpFailed.delete(loaded);
+            host.lost.delete(loaded);
+            host.cwds.delete(loaded);
             for (const target of clients) target.sessions.delete(loaded);
             usage.forget(loaded);
             await recorder?.close(loaded);
