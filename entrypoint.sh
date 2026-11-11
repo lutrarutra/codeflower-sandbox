@@ -13,12 +13,20 @@ export CODEFLOWER_SANDBOX_PATH
 venv="${VIRTUAL_ENV:-$state/env/venv}"
 workspace="${CODEFLOWER_WORKSPACE:-$state/workspace}"
 
+# The steps that can take a while say so, so whoever watches the start (the
+# app's page, a terminal) tells a slow start from a stuck one. A terminal UI
+# draws over its terminal, so it gets none.
+step() {
+  [ "${CODEFLOWER_TUI:-}" = 1 ] || echo "  sandbox  $*" >&2
+}
+
 # Packages the agent installs go into the project, not into the read-only
 # image, so every worker on the project sees the same environment.
 # Seeding downloads pip; without a network (an isolated sandbox) the venv
 # starts without it: `uv pip install` works, and pip is added by a later
 # start that has a network.
 if [ ! -x "$venv/bin/python" ]; then
+  step "Creating the project's Python environment in $venv (first start)…"
   if ! uv venv --quiet --seed --system-site-packages --python /opt/conda/bin/python "$venv" 2>/dev/null; then
     rm -rf "$venv"
     uv venv --quiet --system-site-packages --python /opt/conda/bin/python "$venv"
@@ -27,6 +35,7 @@ fi
 # `pip install` must reach the venv, not the image's conda base; older
 # projects' venvs were made without pip. Without a network this waits for later.
 if [ ! -x "$venv/bin/pip" ] && [ "${CODEFLOWER_NETWORK:-}" != isolated ]; then
+  step "Adding pip to the project's Python environment…"
   uv pip install --quiet --python "$venv/bin/python" pip || echo "Could not add pip to $venv" >&2
 fi
 # R creates its project library (R_LIBS_USER) itself: /etc/R/Rprofile.site.
@@ -67,6 +76,7 @@ if [ -d "$storyteller_image" ]; then
     echo "Keeping the edited storyteller in $storyteller (the image has another version in $storyteller_image)" >&2
   fi
   if ! "$venv/bin/python" -I -c 'import storyteller.report' 2>/dev/null; then
+    step "Installing storyteller in the project's Python environment…"
     uv pip install --quiet --offline --no-deps --no-build-isolation --python "$venv/bin/python" -e "$storyteller" \
       || echo "Could not install storyteller from $storyteller" >&2
   fi
@@ -161,12 +171,14 @@ fi
 if [ -n "${CODEFLOWER_INSTANCE_ID:-}" ]; then
   CODEFLOWER_INVENTORY_FILE="${CODEFLOWER_RUN_DIR:-$state/run}/inventory-$CODEFLOWER_INSTANCE_ID.md"
   export CODEFLOWER_INVENTORY_FILE
+  [ -z "$(ls -A /data/input 2>/dev/null)" ] || step "Describing the data in /data/input (at most ${CODEFLOWER_INVENTORY_SECONDS:-10} s)…"
   if ! codeflower-inventory --time-limit "${CODEFLOWER_INVENTORY_SECONDS:-10}" --write "$CODEFLOWER_INVENTORY_FILE"; then
     echo "Could not describe the data in /data/input" >&2
     unset CODEFLOWER_INVENTORY_FILE
   fi
 fi
 
+step "Starting the agents' bridge…"
 # The app's development --inspect-port sets this; the agents never
 # inherit an inspector because it is a node flag, not NODE_OPTIONS.
 if [ -n "${CODEFLOWER_BRIDGE_INSPECT:-}" ]; then
