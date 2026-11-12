@@ -423,8 +423,9 @@ const parsedLine = (line) => {
  * The entries before `before` (all of them by default) that fit in `maxBytes`,
  * from the start of a turn when that fits in the limit, so a page does not
  * open in the middle of an answer. `start` is the index of its first entry;
- * `context` holds the agent's latest slash commands from before the page,
- * which the client needs and the page may not have.
+ * `context` holds what the client needs from before the page, which the page
+ * may not have: the agent's latest slash commands, and the files it showed
+ * the user (`show` entries, small), so the client lists them all at once.
  */
 export async function readTranscriptPage(directory, key, { before, maxBytes } = {}) {
   let text;
@@ -456,14 +457,19 @@ export async function readTranscriptPage(directory, key, { before, maxBytes } = 
   const page = lines.slice(start, end);
   const entries = page.map(parsedLine).filter((entry) => entry !== undefined);
   const result = { entries, start, total };
-  if (start > 0 && !page.some((line) => line.includes(COMMANDS_UPDATE))) {
-    for (let index = start - 1; index >= 0; index--) {
-      if (!lines[index].includes(COMMANDS_UPDATE)) continue;
-      const entry = parsedLine(lines[index]);
-      if (entry) result.context = [entry];
-      break;
-    }
+  // In transcript order: the files shown before the page, and the latest slash commands.
+  const context = [];
+  let commands = page.some((line) => line.includes(COMMANDS_UPDATE));
+  for (let index = start - 1; index >= 0; index--) {
+    const line = lines[index];
+    const wanted = ENTRY_KIND.exec(line)?.[1] === 'show' || (!commands && line.includes(COMMANDS_UPDATE));
+    if (!wanted) continue;
+    const entry = parsedLine(line);
+    if (!entry) continue;
+    if (entry.kind !== 'show') commands = true;
+    context.unshift(entry);
   }
+  if (context.length) result.context = context;
   return result;
 }
 

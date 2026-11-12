@@ -59,3 +59,18 @@ test('cuts a turn larger than the limit inside it, keeping at least one entry', 
   // 9 MiB of chunks would pass the 8 MiB limit: the page does not reach back to the prompt.
   assert.equal(before.start, 3);
 });
+
+test("brings the files shown before the page along, so a client lists them before it pages back", async (context) => {
+  const early = { t, kind: 'show', files: ['/workspace/early.png'], message: 'The first figure' };
+  const middle = { t, kind: 'show', files: ['/workspace/report.html'] };
+  const late = { t, kind: 'show', files: ['/workspace/late.png'] };
+  const entries = [commands, early, ...turns.slice(0, 6), middle, ...turns.slice(6, 26), late, ...turns.slice(26)];
+  const directory = await transcript(context, entries);
+  const last = await readTranscriptPage(directory, key, { maxBytes: 64 << 10 });
+  // The page has the last of them; those before it come in transcript order, with the commands.
+  assert.ok(last.entries.some((entry) => entry.kind === 'show' && entry.files[0] === '/workspace/late.png'));
+  assert.deepEqual(last.context, [commands, early, middle]);
+  const earlier = await readTranscriptPage(directory, key, { before: last.start, maxBytes: 64 << 10 });
+  assert.equal(earlier.start, 0);
+  assert.equal(earlier.context, undefined);
+});
