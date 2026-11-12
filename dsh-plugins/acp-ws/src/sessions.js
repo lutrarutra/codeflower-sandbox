@@ -55,7 +55,13 @@ function promptTitle(prompt) {
   }
   const text = prompt
     // Context the client adds for the agent, e.g. the user's shell commands, is not the user's words.
-    .filter((block) => block?.type === 'text' && typeof block.text === 'string' && !block._meta?.['codeflower/shellContext'])
+    .filter(
+      (block) =>
+        block?.type === 'text' &&
+        typeof block.text === 'string' &&
+        !block._meta?.['codeflower/shellContext'] &&
+        !block._meta?.['codeflower/steerNote']
+    )
     .map((block) => block.text)
     .join(' ')
     .replace(/\s+/g, ' ')
