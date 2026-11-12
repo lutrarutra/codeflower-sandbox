@@ -1972,6 +1972,23 @@ test("a running subagent's updates reach the windows that opened it, its permiss
   assert.equal((await stopped).params.subagent.stopReason, 'cancelled');
 });
 
+test('subagents still running end with the chat the agent lets go of', async (t) => {
+  const { bridge } = await startTestBridge(t);
+  const window = await openSocket(bridge.address);
+  t.after(() => closeSocket(window));
+  await initialize(window, { subagents: {} });
+  const parentId = await newChat(window);
+  const parentKey = sessionKey('claude', parentId);
+  assert.equal((await prompt(window, parentId, 'spawn subagent keep running')).result.stopReason, 'end_turn');
+
+  // As Claude Code's adapter: it drops the child without a word.
+  const ended = receive(window, (message) => message.method === '_codeflower/subagents/changed' && message.params.subagent.state === 'unknown');
+  assert.equal((await call(window, 'session/close', { sessionId: parentId })).error, undefined);
+  assert.ok((await ended).params.subagent.endedAt);
+  const [listed] = (await call(window, '_codeflower/subagents/list', { key: parentKey })).result.subagents;
+  assert.equal(listed.state, 'unknown');
+});
+
 test("translates the draft form of subagents, and a subagent that cannot be stopped says so", async (t) => {
   const { bridge, sessionsDirectory } = await startTestBridge(t, { agentName: 'codex' });
   const window = await openSocket(bridge.address);

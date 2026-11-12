@@ -111,3 +111,23 @@ test('the tracker follows children, their children, and children that work again
   assert.equal(tracker.isChild('g'), false);
   assert.ok(changes.length > 0);
 });
+
+test('children that still run end with the chat the agent let go of', () => {
+  const changes = [];
+  const tracker = createSubagentTracker({ onChange: (summary) => changes.push([summary.sessionId, summary.state]) });
+  tracker.observe('p', { sessionUpdate: 'subagent_update', sessionId: 'c', state: { state: 'running' } });
+  tracker.observe('c', { sessionUpdate: 'subagent_update', sessionId: 'g', state: { state: 'requires_action' } });
+  tracker.observe('p', { sessionUpdate: 'subagent_update', sessionId: 'd', state: { state: 'idle', stopReason: 'end_turn' } });
+  tracker.observe('q', { sessionUpdate: 'subagent_update', sessionId: 'o', state: { state: 'running' } });
+  changes.length = 0;
+
+  tracker.endChildren('p');
+  assert.deepEqual(changes, [['g', 'unknown'], ['c', 'unknown']]);
+  assert.ok(tracker.summary('c').endedAt);
+  // One that ended keeps how; another chat's are not touched.
+  assert.equal(tracker.summary('d').state, 'idle');
+  assert.equal(tracker.summary('d').stopReason, 'end_turn');
+  assert.equal(tracker.summary('o').state, 'running');
+  // Known still, so the chat lists them as ended rather than as recorded.
+  assert.equal(tracker.isChild('c'), true);
+});

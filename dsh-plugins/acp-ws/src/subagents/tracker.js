@@ -168,6 +168,24 @@ export function createSubagentTracker({ onChange = () => {}, now = () => new Dat
       children.set(summary.sessionId, structuredClone(summary));
     },
 
+    /**
+     * The agent let go of a chat (session/close): its children that still
+     * run, and theirs, end with it. An adapter may drop them without a word
+     * (claude-agent-acp clears them on teardown), which would show them
+     * running for good.
+     */
+    endChildren(parentId) {
+      for (const summary of children.values()) {
+        if (summary.parentId !== parentId) continue;
+        this.endChildren(summary.sessionId);
+        if (summary.state !== 'running' && summary.state !== 'requires_action') continue;
+        summary.state = 'unknown';
+        summary.endedAt ??= now().toISOString();
+        speaking.delete(summary.sessionId);
+        changed(summary);
+      }
+    },
+
     /** Forgets a chat's children, e.g. when it is deleted. */
     forget(parentId) {
       for (const [childId, summary] of children) {

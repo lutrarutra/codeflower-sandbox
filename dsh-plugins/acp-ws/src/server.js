@@ -2112,6 +2112,9 @@ export async function startBridge(options) {
         // The agent let go of the chat: the next window or terminal to open it
         // loads it again, instead of attaching to what the agent no longer has.
         case 'session/close':
+          // Its subagents went with it, also on a hand-over (the adapter's
+          // Claude Code stopped); before the windows let go, so they hear it.
+          host.subagents.endChildren(sessionId);
           // Handed over to the terminal UI: the windows keep the chat open,
           // and the bridge its settings and record, until it comes back.
           if (host.handoffs.has(sessionId)) break;
