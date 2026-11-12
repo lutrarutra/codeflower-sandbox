@@ -90,13 +90,19 @@ export function createActivity(onChange = () => {}, now = Date.now) {
       onChange();
     },
 
-    /** Chats with a turn running or a request for the user, by session id. */
+    /**
+     * Chats with a turn running or a request for the user, by session id.
+     * `turn` says whether a turn runs: a chat can wait for the user without
+     * one, e.g. for a background subagent's permission after its turn ended.
+     */
     snapshot() {
       const chats = new Map();
-      for (const sessionId of turns.values()) chats.set(sessionId, { sessionId, state: 'working' });
+      for (const sessionId of turns.values()) chats.set(sessionId, { sessionId, state: 'working', turn: true });
       for (const { sessionId, waitingFor } of requests.values()) {
         if (typeof sessionId !== 'string') continue;
-        if (chats.get(sessionId)?.state !== 'waiting') chats.set(sessionId, { sessionId, state: 'waiting', waitingFor });
+        if (chats.get(sessionId)?.state !== 'waiting') {
+          chats.set(sessionId, { sessionId, state: 'waiting', waitingFor, turn: chats.get(sessionId)?.turn === true });
+        }
       }
       const list = [...chats.values()];
       return {

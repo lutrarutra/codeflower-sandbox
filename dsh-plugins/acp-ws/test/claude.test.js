@@ -28,7 +28,7 @@ test('the image runs Claude Code from where the app binds it in', async () => {
 
 test('reads the turns Claude Code starts by itself from its async tasks', async (t) => {
   const { claude } = await setup(t);
-  assert.deepEqual(claude.clientCapabilities._meta.jetbrains.air, { version: 1, capabilities: ['asyncTasks'] });
+  assert.deepEqual(claude.clientCapabilities._meta.jetbrains.air, { version: 1, capabilities: ['asyncTasks', 'backgroundSubagents'] });
   const spawned = (taskType) => ({ sessionUpdate: 'async_task_spawned', asyncTaskId: 'task-1', taskType });
   const ended = (state) => ({ sessionUpdate: 'async_task_state_update', asyncTaskId: 'task-1', state });
   assert.deepEqual(claude.autonomousTurn(spawned('turn')), { id: 'task-1', started: true });

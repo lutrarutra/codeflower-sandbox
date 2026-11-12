@@ -1265,7 +1265,7 @@ test('keeps the agent and its chats working while no window is connected', async
   send(first, { jsonrpc: '2.0', id: promptId, method: 'session/prompt', params: { sessionId, prompt: [{ type: 'text', text: 'long task' }] } });
   assert.equal(text(await receive(first, (message) => message.method === 'session/update')), 'started');
   const working = await receive(first, (message) => message.method === '_codeflower/activity' && message.params.working === 1);
-  assert.deepEqual(working.params.chats, [{ key: sessionKey('claude', sessionId), state: 'working' }]);
+  assert.deepEqual(working.params.chats, [{ key: sessionKey('claude', sessionId), state: 'working', turn: true }]);
   assert.match((await call(first, '_codeflower/agent/restart')).error.message, /still working/);
   assert.match((await call(first, '_codeflower/sessions/delete', { key: sessionKey('claude', sessionId) })).error.message, /still working/);
   await closeSocket(first);
@@ -1279,7 +1279,7 @@ test('keeps the agent and its chats working while no window is connected', async
     running: true,
     working: 1,
     waiting: 0,
-    chats: [{ key: sessionKey('claude', sessionId), state: 'working', title: 'long task' }],
+    chats: [{ key: sessionKey('claude', sessionId), state: 'working', turn: true, title: 'long task' }],
     ended: [],
     turns: 0
   });
@@ -1330,7 +1330,7 @@ test('shows a turn the agent starts by itself as working, also to a window that 
   const { bridge } = await startTestBridge(t);
   const first = await openSocket(bridge.address);
   // Claude Code's adapter tells of such turns only to a client of AIR's async tasks.
-  assert.deepEqual((await initialize(first)).air, { version: 1, capabilities: ['asyncTasks'] });
+  assert.deepEqual((await initialize(first)).air, { version: 1, capabilities: ['asyncTasks', 'backgroundSubagents'] });
   const sessionId = (await call(first, 'session/new', { cwd: '/workspace', mcpServers: [] })).result.sessionId;
   const key = sessionKey('claude', sessionId);
   // A background command the agent waited for ended, after its prompt's turn: it goes on by itself.
@@ -1339,7 +1339,7 @@ test('shows a turn the agent starts by itself as working, also to a window that 
     update: { sessionUpdate: 'async_task_spawned', asyncTaskId: 'turn-1', name: 'Claude is working', taskType: 'turn', description: 'A background command ended.' }
   });
   const working = await receive(first, (message) => message.method === '_codeflower/activity' && message.params.working === 1);
-  assert.deepEqual(working.params.chats, [{ key, state: 'working' }]);
+  assert.deepEqual(working.params.chats, [{ key, state: 'working', turn: true }]);
   await closeSocket(first);
 
   const second = await openSocket(bridge.address);
@@ -1581,7 +1581,7 @@ test('keeps questions for the user until a window opens their chat', async (t) =
   await closeSocket(first);
 
   assert.deepEqual((await status(bridge.address)).body.chats, [
-    { key: sessionKey('claude', sessionId), state: 'waiting', waitingFor: 'plan', title: 'approve plan' }
+    { key: sessionKey('claude', sessionId), state: 'waiting', waitingFor: 'plan', turn: true, title: 'approve plan' }
   ]);
 
   const second = await openSocket(bridge.address);

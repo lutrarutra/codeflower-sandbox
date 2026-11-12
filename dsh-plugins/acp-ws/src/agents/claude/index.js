@@ -80,7 +80,12 @@ export default function claude({ descriptor, home, modules, environment }) {
     // it waits for ends. The adapter tells of them only to a client of AIR's
     // async tasks: as a task of type `turn`, spawned when the turn starts and
     // ended by a state update (its background commands come as tasks too).
-    clientCapabilities: { _meta: { jetbrains: { air: { version: 1, capabilities: ['asyncTasks'] } } } },
+    // With `backgroundSubagents`, a turn ends at its result while subagents it
+    // started in the background still run (else the adapter holds the prompt
+    // open until they end, and the chat looks busy); their permission requests
+    // come after it, and the turn Claude Code starts when one ends is a task.
+    // An AIR client gets subagents in the AIR draft form (agent.json).
+    clientCapabilities: { _meta: { jetbrains: { air: { version: 1, capabilities: ['asyncTasks', 'backgroundSubagents'] } } } },
     // Its commands (commands.js): the adapter streams no output of them, so
     // they run through codeflower-cmd, which copies it to the bridge; not when
     // the user has a shell prefix of their own. Background commands' output
