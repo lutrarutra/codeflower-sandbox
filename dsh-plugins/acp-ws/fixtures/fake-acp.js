@@ -330,6 +330,11 @@ input.on('line', async (line) => {
         pendingPrompt = message.id;
         break;
       }
+      // A task that says `hang through wrap-up`: every later turn waits too, until it is cancelled.
+      if (tasks.get(message.params?.sessionId)?.task?.includes('hang through wrap-up')) {
+        pendingPrompt = message.id;
+        break;
+      }
       if (text === 'leave plan mode') {
         const { sessionId } = message.params;
         settings.set(sessionId, { ...settings.get(sessionId), mode: 'default' });

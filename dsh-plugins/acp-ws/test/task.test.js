@@ -288,7 +288,7 @@ test('a task that receives a wrap-up file trigger wraps up graciously', async (t
 });
 
 test('cancelling with a cancel file trigger during wrap up ends the task as cancelled', async (t) => {
-  const context = await setup(t, { task: 'task: hang, never done', report: false });
+  const context = await setup(t, { task: 'task: hang through wrap-up, never done', report: false });
   const attemptDir = join(context.taskDirectory, 'attempts', '1');
   setTimeout(async () => {
     await writeFile(join(attemptDir, 'wrap-up'), 'interrupt\n');
