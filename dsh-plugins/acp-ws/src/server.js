@@ -9,6 +9,7 @@ import { createInterface } from 'node:readline';
 import { WebSocket, WebSocketServer } from 'ws';
 import { createActivity, scopedActivity, unscope } from './activity.js';
 import { createChatTerminals, terminalSize } from './chat-terminals.js';
+import { createCommands, standardCommandEvents, startCommandOutputServer } from './commands.js';
 import { hookSettings, tailTranscript, transcriptPath } from './agents/claude/mirror.js';
 import { createSessionInfo } from './session-info.js';
 import { CREDENTIAL_VARIABLES, InvalidRequest, terminalAuthCommand } from './agents.js';
@@ -81,6 +82,17 @@ const TERMINAL_TURN_SETTLE_MS = 500;
 const PASTE_ENTER_MS = 150;
 // ACP steering: a message for the turn the agent is working on (Claude Code, Codex).
 const STEER_METHOD = '_session/steering';
+// The states an AIR async task ends in.
+const BACKGROUND_TASK_ENDED = new Set(['completed', 'failed', 'stopped']);
+// A background task as windows get it: what names it, not its paths.
+const backgroundTask = (update) => ({
+  id: update.asyncTaskId,
+  name: typeof update.name === 'string' && update.name ? update.name : 'Background task',
+  taskType: typeof update.taskType === 'string' ? update.taskType : 'task',
+  ...(typeof update.description === 'string' && update.description ? { description: update.description } : {})
+});
+// A chat's commands go to its windows at most this often.
+const COMMANDS_NOTIFY_MS = 250;
 // A subagent's summary goes to its parent's windows at most this often.
 const SUBAGENT_NOTIFY_MS = 1000;
 // Changes of the agents' states go to the windows at most this often.
@@ -479,6 +491,10 @@ export async function startBridge(options) {
     // (codeflower-hook), while a chat is handed over to it.
     hookSocket = join(tmpdir(), `codeflower-hook-${instanceId}.sock`),
     hookCommand = '/opt/codeflower/bin/codeflower-hook',
+    // An agent's shell prefix that copies its commands' output to the bridge
+    // (codeflower-cmd), for agents whose index.js asks for it (`commands.env`).
+    commandsSocket = join(tmpdir(), `codeflower-commands-${instanceId}.sock`),
+    commandsWrapper = '/opt/codeflower/bin/codeflower-cmd',
     // The project state: only its workspace may be shown or read.
     privateDirectory = sessionsDirectory ? dirname(sessionsDirectory) : undefined,
     // Read-write mounts (/data/output/NAME, /data/code/NAME), where reports may also take comments.
@@ -542,6 +558,8 @@ export async function startBridge(options) {
   const broadcast = (message) => {
     for (const target of clients) target.send(message);
   };
+  // Where codeflower-cmd sends commands' output, once it listens.
+  let commandsServer;
   // The agent's own terminal UI on chats (`codeflower attach`): one per chat at
   // most, kept while no window watches it. Every window hears what runs where.
   const chatTerminals = createChatTerminals({
@@ -566,6 +584,15 @@ export async function startBridge(options) {
 
   // The agents, by name (createRuntime), and the one a chat's key is of.
   const runtimes = new Map();
+  // A command one of the agents runs (commands.js), by the id windows watch it with.
+  const commandById = (commandId) => {
+    if (typeof commandId !== 'string') return undefined;
+    for (const runtime of runtimes.values()) {
+      const command = runtime.commands.byId(commandId);
+      if (command) return { runtime, command };
+    }
+    return undefined;
+  };
   const runtimeOfKey = (key) =>
     typeof key === 'string' ? [...runtimes.values()].find((runtime) => key.startsWith(`${runtime.name}-`)) : undefined;
   // What the windows show of the agents (_codeflower/agents), sent to all of
@@ -1030,6 +1057,44 @@ export async function startBridge(options) {
     };
     // The newest window with chats (`codeflower attach` has only terminals).
     const newestClient = () => [...clients].filter((target) => target.acp).at(-1);
+
+    // The commands the agent runs, by chat (commands.js), which its windows
+    // hear of (`_codeflower/commands/changed`) and may watch read-only.
+    const commandTimers = new Map();
+    const commands = createCommands({
+      onChange(sessionId) {
+        if (commandTimers.has(sessionId)) return;
+        commandTimers.set(
+          sessionId,
+          setTimeout(() => {
+            commandTimers.delete(sessionId);
+            toSession(sessionId, {
+              jsonrpc: '2.0',
+              method: '_codeflower/commands/changed',
+              params: { key: sessionKey(agentName, sessionId), sessionId, commands: commands.list(sessionId) }
+            });
+          }, COMMANDS_NOTIFY_MS).unref()
+        );
+      }
+    });
+    // The agent's index.js may read its commands itself (`commands.events`),
+    // with the standard reading at hand, or have none followed (`commands: false`).
+    const commandEvents = (update) => {
+      if (agent.commands === false) return [];
+      const events = agent.commands?.events ? agent.commands.events(update, standardCommandEvents) : standardCommandEvents(update);
+      return Array.isArray(events) ? events : [];
+    };
+    // What the agent needs to run its commands through codeflower-cmd, if it asks.
+    const commandsEnvironment = () => {
+      const own = commandsServer && agent.commands?.env?.({ wrapper: commandsWrapper, environment });
+      return own && Object.keys(own).length
+        ? { ...own, CODEFLOWER_COMMANDS_SOCKET: commandsSocket, CODEFLOWER_COMMANDS_AGENT: agentName }
+        : {};
+    };
+    const followCommands = (host, sessionId, update) => {
+      if (host.subagents.isChild(sessionId)) return;
+      for (const event of commandEvents(update)) commands.apply(sessionId, event);
+    };
     const closeClients = (host, code, reason) => {
       for (const target of clients) if (!host || target.agent === host) target.close(code, reason);
     };
@@ -1130,7 +1195,8 @@ export async function startBridge(options) {
           ...agent.env,
           ...startedSubagentEnv,
           ...pluginEnvironment,
-          ...(usageFd ? { CODEFLOWER_USAGE_FD: String(usageFd) } : {})
+          ...(usageFd ? { CODEFLOWER_USAGE_FD: String(usageFd) } : {}),
+          ...commandsEnvironment()
         }),
         stdio: usageFd ? ['pipe', 'pipe', 'inherit', ...Array(usageFd - 3).fill('ignore'), 'pipe'] : ['pipe', 'pipe', 'inherit']
       });
@@ -1165,6 +1231,9 @@ export async function startBridge(options) {
         // Turns the agent started by itself (index.js's autonomousTurn): the
         // session of each, by its activity key.
         autonomousTurns: new Map(),
+        // Per session: the agent's work that runs on after its turns (AIR async
+        // tasks, e.g. Claude Code's background commands), by task id.
+        backgroundTasks: new Map(),
         // Chats handed over to the agent's own terminal UI (Claude Code), by
         // session: the adapter let go of them, and the bridge follows the
         // terminal (handOver).
@@ -1263,6 +1332,8 @@ export async function startBridge(options) {
         if (agentHost === started) {
           agentHost = undefined;
           activity.clear();
+          // Its commands ended with it.
+          commands.clear();
           void recorder?.closeAll();
         }
         closeClients(started, 1011, 'Agent process ended');
@@ -1969,6 +2040,7 @@ export async function startBridge(options) {
       if (!waiting) return false;
       host.waiting.delete(key);
       activity.answered(key);
+      commands.answered(key);
       const { sessionId } = waiting;
       const params = {
         ...(sessionId !== undefined ? { key: sessionKey(agentName, sessionId), sessionId } : {}),
@@ -2015,7 +2087,10 @@ export async function startBridge(options) {
             ...(protocolObject(result._meta) ? result._meta : {}),
             'codeflower/transcriptEntries': recorder?.entryCount(sessionId) ?? 0,
             'codeflower/busy': activity.busy(sessionId),
-            ...(leftOut.length ? { 'codeflower/mcpLeftOut': leftOut } : {})
+            ...(leftOut.length ? { 'codeflower/mcpLeftOut': leftOut } : {}),
+            ...(host.backgroundTasks.has(sessionId)
+              ? { 'codeflower/backgroundTasks': [...host.backgroundTasks.get(sessionId).values()] }
+              : {})
           }
         }
       });
@@ -2210,7 +2285,11 @@ export async function startBridge(options) {
         } else {
           relayUpdate(host, sessionId, update, frame, message);
         }
-        if (sessionId !== undefined) followAutonomousTurn(host, sessionId, update);
+        if (sessionId !== undefined) {
+          followAutonomousTurn(host, sessionId, update);
+          followBackgroundTask(host, sessionId, update);
+          followCommands(host, sessionId, update);
+        }
         return;
       }
       recorder?.fromAgent(message);
@@ -2230,6 +2309,9 @@ export async function startBridge(options) {
             params: { ...params, _meta: { ...meta, 'codeflower/requestKey': key, ...(parents.length ? { 'codeflower/parentSessionIds': parents } : {}) } }
           };
           host.waiting.set(key, { message: tagged, sessionId });
+          // A command it asks to run waits for the user: not running yet.
+          const askedFor = message.method === 'session/request_permission' ? message.params?.toolCall?.toolCallId : undefined;
+          if (sessionId !== undefined && typeof askedFor === 'string') commands.waiting(sessionId, askedFor, key);
           // The chat the user works in waits, not the subagent.
           const chat = parents.at(-1) ?? sessionId;
           if (chat !== undefined && message.method === 'session/request_permission') {
@@ -2438,6 +2520,24 @@ export async function startBridge(options) {
       activity.turnEnded(key, stopReason);
       if (!activity.busy(owner)) sessionInfo.turn(owner, false);
       recorder?.record(owner, { kind: 'turn_end', stopReason });
+    };
+
+    // The agent's work that goes on after its turn (AIR async tasks other than
+    // its own turns, which followAutonomousTurn takes), e.g. Claude Code's
+    // background commands: a window that attaches learns of those still
+    // running (`codeflower/backgroundTasks`), and follows the updates. They
+    // end with the agent's process, and so does this host.
+    const followBackgroundTask = (host, sessionId, update) => {
+      if (typeof update?.asyncTaskId !== 'string' || host.subagents.isChild(sessionId)) return;
+      if (update.sessionUpdate === 'async_task_spawned' && update.taskType !== 'turn') {
+        const tasks = host.backgroundTasks.get(sessionId) ?? new Map();
+        host.backgroundTasks.set(sessionId, tasks);
+        tasks.set(update.asyncTaskId, backgroundTask(update));
+      } else if (update.sessionUpdate === 'async_task_state_update' && BACKGROUND_TASK_ENDED.has(update.state)) {
+        const tasks = host.backgroundTasks.get(sessionId);
+        tasks?.delete(update.asyncTaskId);
+        if (tasks?.size === 0) host.backgroundTasks.delete(sessionId);
+      }
     };
 
     // The configured MCP servers the agent takes, in every session it starts,
@@ -2774,6 +2874,12 @@ export async function startBridge(options) {
           );
           break;
         }
+        case '_codeflower/commands/list': {
+          const key = requireOwnSession();
+          const sessionId = commands.sessions().find((id) => sessionKey(agentName, id) === key);
+          respond({ commands: sessionId === undefined ? [] : commands.list(sessionId) });
+          break;
+        }
         case '_codeflower/sessions/rename':
           await renameSession(requireSessions(), requireOwnSession(), params.title);
           respond({});
@@ -2795,6 +2901,7 @@ export async function startBridge(options) {
             await recorder?.close(loaded);
             for (const child of host.subagents.childrenOf(loaded)) await recorder?.close(child.sessionId);
             host.subagents.forget(loaded);
+            commands.clear(loaded);
           }
           await deleteSession(directory, key);
           respond({});
@@ -2966,6 +3073,8 @@ export async function startBridge(options) {
       plugins: Boolean(plugins?.available),
       // The agent's own terminal UI on chats (`_codeflower/terminal/start` kind "chat").
       chatTerminals: Boolean(agent.tuiCommand && Array.isArray(ptyHelper) && ptyHelper.length),
+      // The chats' commands (`_codeflower/commands/*`), to watch with `terminal/attach`.
+      commands: agent.commands !== false,
       // What the agent tells of its subagents, and which of their settings it takes.
       ...(subagentAdapter ? { subagents: subagentAdapter.features } : {})
     });
@@ -3019,6 +3128,7 @@ export async function startBridge(options) {
         return account;
       },
       flush: () => recorder?.flush(),
+      commands,
       // The chats with a turn running or a request waiting, for a wrap-up.
       wrapUpCandidates: () => (agentHost ? [...new Set(activity.snapshot().chats.map((chat) => chat.sessionId))] : []),
       wrapUp: (sessionId, notice, template) => (agentHost ? wrapUpChat(agentHost, sessionId, notice, template) : Promise.resolve()),
@@ -3096,8 +3206,9 @@ export async function startBridge(options) {
       released = true;
       for (const terminal of self.terminals.values()) terminal.kill('SIGTERM');
       self.terminals.clear();
-      // The chats' terminals keep running without it.
+      // The chats' terminals keep running without it, and so do the agents' commands.
       chatTerminals.detachClient(self);
+      for (const each of runtimes.values()) each.commands.detachClient(self);
       void uploads.release(self);
       void downloads.release(self);
       clients.delete(self);
@@ -3212,7 +3323,7 @@ export async function startBridge(options) {
             terminal.stdin.write(params.data);
           } else {
             const chat = chatTerminals.byId(params.terminalId);
-            if (!chat) throw new InvalidRequest('Unknown terminal');
+            if (!chat) throw new InvalidRequest(commandById(params.terminalId) ? 'A command is only watched' : 'Unknown terminal');
             chatTerminals.input(chat, self, params.data);
           }
           respond({});
@@ -3224,12 +3335,23 @@ export async function startBridge(options) {
           } else {
             const chat = chatTerminals.byId(params.terminalId);
             if (chat) await chatTerminals.close(chat);
+            // Closing a command's view only stops watching it: the agent stops its commands.
+            const command = commandById(params.terminalId);
+            if (command) command.runtime.commands.detach(command.command, self);
           }
           respond({});
           break;
         // A chat's terminal: watch it (again), follow the window's size, stop watching.
         case '_codeflower/terminal/attach': {
           const chat = chatTerminals.byId(params.terminalId);
+          // A command the agent runs, watched only.
+          const command = chat ? undefined : commandById(params.terminalId);
+          if (command) {
+            const { runtime, command: entry } = command;
+            runtime.commands.attach(entry, self);
+            respond({ terminalId: entry.id, sessionKey: sessionKey(runtime.name, entry.sessionId), sessionId: entry.sessionId, watch: true, command: runtime.commands.describe(entry) });
+            break;
+          }
           if (!chat) throw new InvalidRequest('Unknown terminal');
           rememberLinkBase(chat, params.linkBase);
           chatTerminals.attach(chat, self, { size: terminalSize(params), watch: params.watch === true });
@@ -3238,6 +3360,10 @@ export async function startBridge(options) {
         }
         case '_codeflower/terminal/resize': {
           const chat = chatTerminals.byId(params.terminalId);
+          if (!chat && commandById(params.terminalId)) {
+            respond({});
+            break;
+          }
           if (!chat) throw new InvalidRequest('Unknown terminal');
           chatTerminals.resize(chat, self, terminalSize(params, chat));
           respond({});
@@ -3246,6 +3372,8 @@ export async function startBridge(options) {
         case '_codeflower/terminal/detach': {
           const chat = chatTerminals.byId(params.terminalId);
           if (chat) chatTerminals.detach(chat, self);
+          const command = chat ? undefined : commandById(params.terminalId);
+          if (command) command.runtime.commands.detach(command.command, self);
           respond({});
           break;
         }
@@ -3389,6 +3517,25 @@ export async function startBridge(options) {
     log(`codeflower-show is unavailable: ${error.message}`);
   }
 
+  // The output of commands that agents run through codeflower-cmd. A run
+  // that starts before its tool call reached the bridge waits for it a little.
+  if ([...runtimes.values()].some((runtime) => runtime.agent.commands?.env)) {
+    try {
+      commandsServer = await startCommandOutputServer(commandsSocket, async (run) => {
+        const runtime = runtimes.get(run?.agent);
+        if (!runtime || typeof run.command !== 'string') return undefined;
+        for (let attempt = 0; attempt < 10; attempt++) {
+          const sink = runtime.commands.claim(run.command);
+          if (sink) return sink;
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        return undefined;
+      });
+    } catch (error) {
+      log(`Commands' output is unavailable: ${error.message}`);
+    }
+  }
+
   // Claude Code's hooks, for chats handed over to its terminal UI.
   let hookServer;
   if ([...runtimes.values()].some((runtime) => runtime.agent.handoff)) {
@@ -3457,6 +3604,7 @@ export async function startBridge(options) {
       sockets.close();
       await showServer?.close();
       await hookServer?.close();
+      await commandsServer?.close();
       await uploads.close();
       await downloads.close();
       await unlink(connectionFile).catch((error) => {

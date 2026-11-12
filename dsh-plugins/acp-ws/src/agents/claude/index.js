@@ -81,6 +81,13 @@ export default function claude({ descriptor, home, modules, environment }) {
     // async tasks: as a task of type `turn`, spawned when the turn starts and
     // ended by a state update (its background commands come as tasks too).
     clientCapabilities: { _meta: { jetbrains: { air: { version: 1, capabilities: ['asyncTasks'] } } } },
+    // Its commands (commands.js): the adapter streams no output of them, so
+    // they run through codeflower-cmd, which copies it to the bridge; not when
+    // the user has a shell prefix of their own. Background commands' output
+    // comes from their AIR task's file.
+    commands: {
+      env: ({ wrapper, environment }) => (environment.CLAUDE_CODE_SHELL_PREFIX ? {} : { CLAUDE_CODE_SHELL_PREFIX: wrapper })
+    },
     autonomousTurn(update) {
       if (typeof update?.asyncTaskId !== 'string') return undefined;
       if (update.sessionUpdate === 'async_task_spawned' && update.taskType === 'turn') return { id: update.asyncTaskId, started: true };

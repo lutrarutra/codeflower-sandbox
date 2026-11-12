@@ -1,0 +1,85 @@
+#!/usr/local/bin/node
+// Runs an agent's command and lets the bridge watch its output: the agent's
+// shell prefix (Claude Code's CLAUDE_CODE_SHELL_PREFIX), which the bridge sets
+// for agents that do not stream their commands' output themselves.
+//
+//   codeflower-cmd COMMAND        runs COMMAND with bash -c
+//   codeflower-cmd PROGRAM ARG…   runs PROGRAM with its arguments
+//
+// The command gets the same stdin, and the agent the same stdout, stderr and
+// exit status; a copy of the output goes to the bridge's socket
+// (CODEFLOWER_COMMANDS_SOCKET), which shows it to the windows that watch the
+// command. Without the socket, or when it fails, the command only runs.
+import { spawn } from 'node:child_process';
+import { createConnection } from 'node:net';
+
+const argv = process.argv.slice(2);
+if (!argv.length) {
+  process.stderr.write('usage: codeflower-cmd COMMAND | PROGRAM ARG…\n');
+  process.exit(2);
+}
+const [program, args] = argv.length === 1 ? ['/bin/bash', ['-c', argv[0]]] : [argv[0], argv.slice(1)];
+
+// The bridge's own variables are not the command's.
+const socketPath = process.env.CODEFLOWER_COMMANDS_SOCKET;
+const agent = process.env.CODEFLOWER_COMMANDS_AGENT;
+const env = { ...process.env };
+delete env.CODEFLOWER_COMMANDS_SOCKET;
+delete env.CODEFLOWER_COMMANDS_AGENT;
+
+// At most this much waits for the socket; beyond, the copy drops output.
+const MAX_QUEUED = 4 * 1024 * 1024;
+let socket;
+
+if (socketPath && agent) {
+  try {
+    socket = createConnection(socketPath);
+    socket.on('error', () => {
+      socket?.destroy();
+      socket = undefined;
+    });
+    socket.write(`${JSON.stringify({ agent, command: argv.join(' '), cwd: process.cwd(), pid: process.pid })}\n`);
+  } catch {
+    socket = undefined;
+  }
+}
+const copy = (chunk) => {
+  if (!socket || socket.destroyed) return;
+  if (socket.writableLength + chunk.length > MAX_QUEUED) return;
+  socket.write(chunk);
+};
+
+const child = spawn(program, args, { env, stdio: ['inherit', 'pipe', 'pipe'] });
+child.stdout.on('data', (chunk) => {
+  copy(chunk);
+  process.stdout.write(chunk);
+});
+child.stderr.on('data', (chunk) => {
+  copy(chunk);
+  process.stderr.write(chunk);
+});
+process.stdout.on('error', () => {});
+process.stderr.on('error', () => {});
+
+// What the agent sends the command (e.g. a cancel) goes on to it.
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT']) {
+  process.on(signal, () => child.kill(signal));
+}
+
+child.once('error', (error) => {
+  process.stderr.write(`codeflower-cmd: ${program}: ${error.message}\n`);
+  socket?.end();
+  process.exit(127);
+});
+// When its output closes, as the agent's own shell would wait for it.
+child.once('close', (code, signal) => {
+  const status = code ?? (signal ? 128 + ({ SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGKILL: 9, SIGTERM: 15 }[signal] ?? 1) : 1);
+  const exit = () => process.exit(status);
+  if (socket && !socket.destroyed) {
+    socket.end(exit);
+    setTimeout(exit, 1000).unref();
+  } else {
+    // Its own output first.
+    process.stdout.write('', exit);
+  }
+});

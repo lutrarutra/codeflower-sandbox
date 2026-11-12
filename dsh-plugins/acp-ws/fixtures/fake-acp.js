@@ -480,6 +480,37 @@ input.on('line', async (line) => {
         );
         break;
       }
+      // `run streaming command [LINES] [MS]`: a command whose output streams as
+      // Codex's adapter sends it (terminal _meta), a line every MS.
+      if (text?.startsWith('run streaming command')) {
+        const { sessionId } = message.params;
+        const [lines = 20, every = 300] = text.slice('run streaming command'.length).trim().split(/\s+/).filter(Boolean).map(Number);
+        const toolCallId = `cmd-${Date.now()}`;
+        update(sessionId, {
+          sessionUpdate: 'tool_call',
+          toolCallId,
+          title: `for i in $(seq 1 ${lines}); do echo line $i; done`,
+          kind: 'execute',
+          status: 'in_progress',
+          content: [{ type: 'terminal', terminalId: toolCallId }],
+          _meta: { terminal_info: { terminal_id: toolCallId, cwd: '/workspace' } }
+        });
+        let line = 0;
+        const timer = setInterval(() => {
+          line += 1;
+          update(sessionId, { sessionUpdate: 'tool_call_update', toolCallId, _meta: { terminal_output_delta: { terminal_id: toolCallId, data: `line ${line}\n` } } });
+          if (line < lines) return;
+          clearInterval(timer);
+          update(sessionId, {
+            sessionUpdate: 'tool_call_update',
+            toolCallId,
+            status: 'completed',
+            _meta: { terminal_exit: { terminal_id: toolCallId, exit_code: 0, signal: null } }
+          });
+          reply(sessionId, message.id, 'the command ran');
+        }, every);
+        break;
+      }
       if (text === 'run failing command') {
         // As dsh-acp reports a command that exited 1: completed, with the marker.
         const { sessionId } = message.params;

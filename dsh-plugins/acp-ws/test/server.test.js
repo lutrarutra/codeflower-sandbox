@@ -837,7 +837,7 @@ test("manages the agent's plugins and starts the agent with them", async (t) => 
   const socket = await openSocket(bridge.address);
   assert.equal((await initialize(socket)).pluginSeed, '/empty');
   const { subagents, ...capabilities } = (await call(socket, '_codeflower/status')).result.capabilities;
-  assert.deepEqual(capabilities, { plugins: true, chatTerminals: true, shellTerminals: true });
+  assert.deepEqual(capabilities, { plugins: true, chatTerminals: true, commands: true, shellTerminals: true });
   assert.deepEqual(subagents.settings, { model: { applies: 'session' } });
 
   assert.match((await call(socket, '_codeflower/plugins/add', { source: 'npm:x@1' })).error.message, /github:, not npm:/);
@@ -866,7 +866,7 @@ test('an agent without plugins says so and refuses the plugin methods', async (t
   t.after(() => closeSocket(socket));
   await initialize(socket);
   const { subagents: _, ...capabilities } = (await call(socket, '_codeflower/status')).result.capabilities;
-  assert.deepEqual(capabilities, { plugins: false, chatTerminals: true, shellTerminals: true });
+  assert.deepEqual(capabilities, { plugins: false, chatTerminals: true, commands: true, shellTerminals: true });
   assert.deepEqual((await call(socket, '_codeflower/plugins/list')).result, { available: false });
   assert.match((await call(socket, '_codeflower/plugins/add', { source: 'github:a/b' })).error.message, /no plugins/);
 });
@@ -1358,6 +1358,46 @@ test('shows a turn the agent starts by itself as working, also to a window that 
   const entries = (await call(second, '_codeflower/sessions/transcript', { key })).result.entries;
   assert.deepEqual(entries.at(-1), { ...entries.at(-1), kind: 'turn_end', stopReason: 'end_turn' });
   await closeSocket(second);
+});
+
+test('tells a window that attaches of the background tasks still running, until they end or the agent does', async (t) => {
+  const { bridge } = await startTestBridge(t);
+  let socket = await openSocket(bridge.address);
+  await initialize(socket);
+  const sessionId = (await call(socket, 'session/new', { cwd: '/workspace', mcpServers: [] })).result.sessionId;
+  const spawn = (asyncTaskId, taskType, name) =>
+    call(socket, 'fake/update', { sessionId, update: { sessionUpdate: 'async_task_spawned', asyncTaskId, name, taskType, description: name, outputFilePath: '/tmp/x' } });
+  const reattach = async () => {
+    await closeSocket(socket);
+    socket = await openSocket(bridge.address);
+    await initialize(socket);
+    return (await call(socket, 'session/resume', { sessionId, cwd: '/workspace', mcpServers: [] })).result._meta;
+  };
+
+  await spawn('bash-1', 'shell', 'npm test');
+  // The agent's own turns are not background work.
+  await spawn('turn-1', 'turn', 'Claude is working');
+  await call(socket, 'fake/update', { sessionId, update: { sessionUpdate: 'async_task_state_update', asyncTaskId: 'turn-1', state: 'completed' } });
+  assert.deepEqual((await reattach())['codeflower/backgroundTasks'], [
+    { id: 'bash-1', name: 'npm test', taskType: 'shell', description: 'npm test' }
+  ]);
+
+  await call(socket, 'fake/update', { sessionId, update: { sessionUpdate: 'async_task_state_update', asyncTaskId: 'bash-1', state: 'running' } });
+  assert.equal((await reattach())['codeflower/backgroundTasks'].length, 1);
+  await call(socket, 'fake/update', { sessionId, update: { sessionUpdate: 'async_task_state_update', asyncTaskId: 'bash-1', state: 'completed' } });
+  assert.equal((await reattach())['codeflower/backgroundTasks'], undefined);
+
+  // A restart ends the agent's tasks with it.
+  await spawn('bash-2', 'shell', 'sleep 60');
+  const ended = once(socket, 'close');
+  await call(socket, '_codeflower/agent/restart');
+  await ended;
+  socket = await openSocket(bridge.address);
+  t.after(() => closeSocket(socket));
+  await initialize(socket);
+  const resumed = await call(socket, 'session/resume', { sessionId, cwd: '/workspace', mcpServers: [] });
+  assert.ok(resumed.result, resumed.error?.message);
+  assert.equal(resumed.result._meta['codeflower/backgroundTasks'], undefined);
 });
 
 test('takes a message into the running turn and shows it in every window', async (t) => {
@@ -2147,4 +2187,56 @@ test("restarts an agent whose server ended by itself, and its chats resume on th
   await initialize(again);
   assert.equal((await call(again, 'session/resume', { sessionId, cwd: '/workspace', mcpServers: [] })).error, undefined);
   assert.equal((await prompt(again, sessionId, 'say hello again')).result.stopReason, 'end_turn');
+});
+
+test("tells a chat's windows of the commands the agent runs, and lets them watch one read-only", async (t) => {
+  const { bridge } = await startTestBridge(t);
+  const socket = await openSocket(bridge.address);
+  await initialize(socket);
+  const sessionId = (await call(socket, 'session/new', { cwd: '/workspace', mcpServers: [] })).result.sessionId;
+  const key = sessionKey('claude', sessionId);
+  const changed = (count) => (message) => message.method === '_codeflower/commands/changed' && message.params.commands.filter((command) => !command.endedAt).length === count;
+  // As Codex's adapter streams a command's output.
+  await call(socket, 'fake/update', {
+    sessionId,
+    update: {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'cmd-1',
+      title: 'make',
+      kind: 'execute',
+      status: 'in_progress',
+      _meta: { terminal_info: { terminal_id: 'cmd-1', cwd: '/workspace' } }
+    }
+  });
+  const started = await receive(socket, changed(1));
+  assert.equal(started.params.key, key);
+  const [command] = started.params.commands;
+  assert.equal(command.command, 'make');
+  assert.deepEqual((await call(socket, '_codeflower/commands/list', { key })).result.commands.map((each) => each.commandId), [command.commandId]);
+
+  await call(socket, 'fake/update', {
+    sessionId,
+    update: { sessionUpdate: 'tool_call_update', toolCallId: 'cmd-1', _meta: { terminal_output_delta: { terminal_id: 'cmd-1', data: 'compiling\n' } } }
+  });
+  const attached = await call(socket, '_codeflower/terminal/attach', { terminalId: command.commandId, columns: 80, rows: 24 });
+  assert.equal(attached.result.watch, true);
+  assert.equal(attached.result.sessionKey, key);
+  const replay = await receive(socket, (message) => message.method === '_codeflower/terminal/output' && message.params.terminalId === command.commandId);
+  assert.deepEqual([replay.params.data, replay.params.replayed], ['compiling\n', true]);
+  // Watched only: nothing is typed into it.
+  assert.match((await call(socket, '_codeflower/terminal/input', { terminalId: command.commandId, data: 'q' })).error.message, /only watched/);
+
+  await call(socket, 'fake/update', {
+    sessionId,
+    update: { sessionUpdate: 'tool_call_update', toolCallId: 'cmd-1', _meta: { terminal_output_delta: { terminal_id: 'cmd-1', data: 'done\n' } } }
+  });
+  assert.equal((await receive(socket, (message) => message.method === '_codeflower/terminal/output' && !message.params.replayed)).params.data, 'done\n');
+  await call(socket, 'fake/update', {
+    sessionId,
+    update: { sessionUpdate: 'tool_call_update', toolCallId: 'cmd-1', status: 'completed', _meta: { terminal_exit: { terminal_id: 'cmd-1', exit_code: 0 } } }
+  });
+  assert.equal((await receive(socket, (message) => message.method === '_codeflower/terminal/exit')).params.exitCode, 0);
+  const ended = await receive(socket, changed(0));
+  assert.equal(ended.params.commands[0].exitCode, 0);
+  await closeSocket(socket);
 });

@@ -6,6 +6,7 @@
 // from then on.
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { createRingBuffer } from './ring-buffer.js';
 
 // What a window that attaches gets of the output so far.
 export const TERMINAL_BUFFER_BYTES = 256 * 1024;
@@ -62,13 +63,6 @@ export function createChatTerminals({ ptyHelper, log = () => {}, onChange = () =
 
   const notify = (client, method, params) => client.send({ jsonrpc: '2.0', method, params });
 
-  const remember = (terminal, data) => {
-    terminal.buffer.push(data);
-    terminal.buffered += data.length;
-    while (terminal.buffered > TERMINAL_BUFFER_BYTES && terminal.buffer.length > 1) {
-      terminal.buffered -= terminal.buffer.shift().length;
-    }
-  };
 
   const setSize = (terminal, { columns, rows }) => {
     terminal.columns = columns;
@@ -98,15 +92,14 @@ export function createChatTerminals({ ptyHelper, log = () => {}, onChange = () =
         child,
         control: child.stdio[3],
         viewers: new Map(),
-        buffer: [],
-        buffered: 0,
+        buffer: createRingBuffer(TERMINAL_BUFFER_BYTES),
         columns: size.columns,
         rows: size.rows,
         startedAt: new Date().toISOString()
       };
       terminals.set(key, terminal);
       const output = (data) => {
-        remember(terminal, data);
+        terminal.buffer.push(data);
         for (const client of terminal.viewers.keys()) notify(client, '_codeflower/terminal/output', { terminalId: terminal.id, data });
       };
       child.stdout.setEncoding('utf8');
@@ -145,7 +138,7 @@ export function createChatTerminals({ ptyHelper, log = () => {}, onChange = () =
      */
     attach(terminal, client, { size, watch = false }) {
       terminal.viewers.set(client, { watch });
-      const replay = terminal.buffer.join('');
+      const replay = terminal.buffer.text();
       if (replay) notify(client, '_codeflower/terminal/output', { terminalId: terminal.id, data: replay, replayed: true });
       if (!watch) {
         // The same size again would not make it redraw: one row less first.
