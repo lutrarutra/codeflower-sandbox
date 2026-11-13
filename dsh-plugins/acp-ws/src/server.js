@@ -34,6 +34,7 @@ import { createThumbnails } from './thumbnails.js';
 import { DID_NOT_START, addedMcpServers, claudeMcpConfig, describeLeftOut, failedMcpServers, mcpServersFor, withMcpServers } from './mcp.js';
 import { DEFAULT_UPLOAD_MAX_BYTES, createUploads } from './uploads.js';
 import { createUsage, dshTokens } from './usage.js';
+import { createPromptQueue, queuedPromptOf } from './prompt-queue.js';
 import { createSubagentSettings, mergeMeta, settingsEffects } from './subagents/settings.js';
 import { createSubagentTracker } from './subagents/tracker.js';
 
@@ -1055,6 +1056,16 @@ export async function startBridge(options) {
         if (target !== except && target.sessions.has(sessionId)) target.send(message);
       }
     };
+    // The prompts waiting for each chat's turn to end, from any window
+    // (prompt-queue.js). Outside the agent's host: they outlive its restarts.
+    const promptQueue = createPromptQueue({
+      onChange: (sessionId) =>
+        toSession(sessionId, {
+          jsonrpc: '2.0',
+          method: '_codeflower/queue',
+          params: { key: sessionKey(agentName, sessionId), sessionId, ...promptQueue.snapshot(sessionId) }
+        })
+    });
     // The newest window with chats (`codeflower attach` has only terminals).
     const newestClient = () => [...clients].filter((target) => target.acp).at(-1);
 
@@ -1325,6 +1336,10 @@ export async function startBridge(options) {
         if (code !== 0 && code !== null) log(`${agentName} exited with status ${code}`);
         else if (signal) log(`${agentName} exited on signal ${signal}`);
         for (const sessionId of started.prompts.keys()) dropPrompts(started, sessionId);
+        // A turn the exit ended did not finish: the prompts after it wait for a window.
+        for (const request of started.requests.values()) {
+          if (request.method === 'session/prompt') promptQueue.pause(request.params?.sessionId, 'error');
+        }
         for (const request of started.requests.values()) {
           request.reject?.(new Error(`${agentName} exited before answering ${request.method}`));
         }
@@ -1481,6 +1496,68 @@ export async function startBridge(options) {
       for (const { cancel } of host.prompts.get(sessionId)?.splice(0) ?? []) cancel();
     };
 
+    // Stops a chat's turn as a window's Stop does, and answers the requests it
+    // waits on (its subagents' too) with a cancel, as no window will.
+    const cancelChat = (host, sessionId) => {
+      dropPrompts(host, sessionId);
+      writeToAgent(host, { jsonrpc: '2.0', method: 'session/cancel', params: { sessionId } });
+      for (const [key, { message, sessionId: owner }] of host.waiting) {
+        if (owner !== sessionId && !host.subagents.ancestors(owner).includes(sessionId)) continue;
+        const result = message.method === 'session/request_permission' ? { outcome: { outcome: 'cancelled' } } : { action: 'cancel' };
+        settleWaiting(host, key, result);
+        writeToAgent(host, { jsonrpc: '2.0', id: message.id, result });
+      }
+    };
+
+    // The chat's next queued prompt goes, if nothing runs in it: as a prompt
+    // of the bridge's own, which every window shows (`_codeflower/prompted`),
+    // or typed into the terminal UI that has the chat.
+    const drainQueue = (sessionId) => {
+      const host = agentHost;
+      if (!host || closing || !childRunning(host.child) || !host.sessions.has(sessionId) || !promptQueue.ready(sessionId)) return;
+      const handoff = host.handoffs.get(sessionId);
+      if (handoff) {
+        if (handoff.left || handoff.busy || handoff.current || handoff.queue.length) return;
+        const item = promptQueue.next(sessionId);
+        const prompt = item.prompt.filter((block) => block?.type === 'text' && typeof block.text === 'string');
+        if (!prompt.length) {
+          log(`A queued prompt of ${handoff.key} has no text for the terminal UI; it was dropped`);
+          return drainQueue(sessionId);
+        }
+        handoff.queue.push({ client: null, prompt, item });
+        typeNext(handoff);
+        return;
+      }
+      if (activity.busy(sessionId) || host.prompts.has(sessionId)) return;
+      const item = promptQueue.next(sessionId);
+      requestAgent(host, 'session/prompt', { sessionId, prompt: item.prompt }).catch((error) =>
+        log(`A queued prompt of ${sessionKey(agentName, sessionId)} failed: ${error.message}`)
+      );
+    };
+
+    // A turn runs in the chat, or a prompt waits to start one.
+    const chatRunning = (host, sessionId) => {
+      const handoff = host.handoffs.get(sessionId);
+      if (handoff) return handoff.busy || Boolean(handoff.current);
+      return activity.busy(sessionId) || host.prompts.has(sessionId);
+    };
+
+    // Stops the turn for the queue's first prompt, which goes once it ended:
+    // Esc in the terminal UI that has the chat, else as a window's Stop.
+    const interruptChat = (host, sessionId) => {
+      const handoff = host.handoffs.get(sessionId);
+      if (handoff) {
+        if (handoff.terminal) chatTerminals.write(handoff.terminal, '\x1b');
+        return;
+      }
+      cancelChat(host, sessionId);
+    };
+
+    // A turn of the chat ended: the queue goes on, or pauses (prompt-queue.js).
+    const queueTurnEnded = (sessionId, stopReason) => {
+      if (promptQueue.turnEnded(sessionId, stopReason)) drainQueue(sessionId);
+    };
+
     // ---- chats the agent lost ----
 
     // The agent answered that it lost a chat (chatProcessEnded): its next
@@ -1620,6 +1697,7 @@ export async function startBridge(options) {
             sessionInfo.turn(sessionId, false);
             recorder?.record(sessionId, { kind: 'turn_end', stopReason: 'end_turn' });
             promptEnded(host, sessionId);
+            queueTurnEnded(sessionId, 'end_turn');
           }, TERMINAL_TURN_SETTLE_MS).unref();
           return;
         }
@@ -1812,6 +1890,8 @@ export async function startBridge(options) {
       handoff.current?.client?.send({ jsonrpc: '2.0', id: handoff.current.id, result: { stopReason: 'cancelled' } });
       if (agentHost !== host || !childRunning(host.child) || closing) return;
       log(`${handoff.key} is back from the terminal UI`);
+      // The queued prompts the terminal did not get yet go back to the queue.
+      promptQueue.putFirst(sessionId, handoff.queue.filter((queued) => queued.item).map((queued) => queued.item));
       await requestAgent(host, 'session/resume', { sessionId, cwd: handoff.cwd, mcpServers: [] });
       for (const queued of handoff.queue) {
         if (!queued.client || !allClients.has(queued.client)) continue;
@@ -1825,6 +1905,7 @@ export async function startBridge(options) {
           params: { sessionId, prompt: queued.prompt }
         });
       }
+      drainQueue(sessionId);
     };
 
     // An update of the terminal's chat, from its transcript: recorded and sent
@@ -1936,12 +2017,14 @@ export async function startBridge(options) {
               .then(() => handoff.tail?.flush())
               .then(() => {
                 if (!handoff.busy || handoff.turns !== turn) return;
-                endTerminalTurn(handoff, event.hook_event_name === 'Stop' ? 'end_turn' : 'error');
+                const stopReason = event.hook_event_name === 'Stop' ? 'end_turn' : 'error';
+                endTerminalTurn(handoff, stopReason);
                 const answered = handoff.current;
                 handoff.current = undefined;
                 answered?.client?.send({ jsonrpc: '2.0', id: answered.id, result: { stopReason: 'end_turn' } });
                 answered?.done?.();
                 typeNext(handoff);
+                queueTurnEnded(sessionId, stopReason);
               });
           }
           return;
@@ -1980,18 +2063,12 @@ export async function startBridge(options) {
     };
 
     const wrapUpChat = async (host, sessionId, notice, template) => {
+      // The wrap-up goes instead of the prompts waiting for the turn.
+      promptQueue.clear(sessionId);
       const handoff = host.handoffs.get(sessionId);
       if (handoff) return wrapUpInTerminal(handoff, notice, template);
       // As a client cancels: the turn, then the requests it waits on.
-      dropPrompts(host, sessionId);
-      writeToAgent(host, { jsonrpc: '2.0', method: 'session/cancel', params: { sessionId } });
-      for (const [key, { message, sessionId: owner }] of host.waiting) {
-        // Its subagents' too.
-        if (owner !== sessionId && !host.subagents.ancestors(owner).includes(sessionId)) continue;
-        const result = message.method === 'session/request_permission' ? { outcome: { outcome: 'cancelled' } } : { action: 'cancel' };
-        settleWaiting(host, key, result);
-        writeToAgent(host, { jsonrpc: '2.0', id: message.id, result });
-      }
+      cancelChat(host, sessionId);
       const deadline = Date.now() + WRAP_UP_CANCEL_MS;
       while (activity.busy(sessionId) && Date.now() < deadline && !closing) await new Promise((resolve) => setTimeout(resolve, 200));
       if (closing || agentHost !== host) return;
@@ -2087,6 +2164,7 @@ export async function startBridge(options) {
             ...(protocolObject(result._meta) ? result._meta : {}),
             'codeflower/transcriptEntries': recorder?.entryCount(sessionId) ?? 0,
             'codeflower/busy': activity.busy(sessionId),
+            'codeflower/queue': promptQueue.snapshot(sessionId),
             ...(leftOut.length ? { 'codeflower/mcpLeftOut': leftOut } : {}),
             ...(host.backgroundTasks.has(sessionId)
               ? { 'codeflower/backgroundTasks': [...host.backgroundTasks.get(sessionId).values()] }
@@ -2178,6 +2256,8 @@ export async function startBridge(options) {
           );
           if (allClients.has(request.client)) {
             void attachSession(host, request.client, request.id, sessionId, result).then(() => {
+              // Prompts queued before the agent restarted go on once the chat is back.
+              drainQueue(sessionId);
               if (method === 'session/new') return followMode(host, sessionId);
             });
           } else if (method === 'session/new') {
@@ -2263,6 +2343,7 @@ export async function startBridge(options) {
         }
         if (request.method === 'session/prompt' && typeof request.params?.sessionId === 'string') {
           promptEnded(host, request.params.sessionId);
+          queueTurnEnded(request.params.sessionId, message.error ? 'error' : (message.result?.stopReason ?? null));
         }
         return;
       }
@@ -2520,6 +2601,7 @@ export async function startBridge(options) {
       activity.turnEnded(key, stopReason);
       if (!activity.busy(owner)) sessionInfo.turn(owner, false);
       recorder?.record(owner, { kind: 'turn_end', stopReason });
+      drainQueue(owner);
     };
 
     // The agent's work that goes on after its turn (AIR async tasks other than
@@ -2627,6 +2709,9 @@ export async function startBridge(options) {
         // Stop in a chat the terminal UI has: Esc there, and the prompts typed
         // next are dropped.
         const handoff = host.handoffs.get(message.params?.sessionId);
+        // The prompts queued on the worker stay, paused once the turn ended
+        // cancelled; a window takes the user's own back to its composer first
+        // (`_codeflower/queue/take`).
         if (handoff && message.method === 'session/cancel') {
           for (const queued of handoff.queue.splice(0)) {
             queued.client?.send({ jsonrpc: '2.0', id: queued.id, result: { stopReason: 'cancelled' } });
@@ -2668,6 +2753,7 @@ export async function startBridge(options) {
       ) {
         // Still loaded in this agent: reattach instead of loading it again.
         await attachSession(host, self, message.id, sessionId, host.sessions.get(sessionId));
+        drainQueue(sessionId);
         return;
       }
       // A chat the terminal UI has: prompts are typed there, nothing else goes.
@@ -2854,6 +2940,14 @@ export async function startBridge(options) {
         if (!sessionKeyAllowed(params.key)) throw new InvalidRequest('Invalid session key');
         return params.key;
       };
+      // The chat whose queue a window changes: one it has open.
+      const queuedChat = () => {
+        const key = requireOwnSession();
+        const host = agentHost;
+        const sessionId = [...(self.sessions ?? [])].find((id) => sessionKey(agentName, id) === key);
+        if (!host || sessionId === undefined || !host.sessions.has(sessionId)) throw new InvalidRequest('Open the chat in this window first');
+        return { host, sessionId };
+      };
       switch (message.method) {
         case '_codeflower/usage':
           respond(usageSnapshot());
@@ -2988,6 +3082,65 @@ export async function startBridge(options) {
           void manager.fetch().catch((error) => log(`Could not fetch plugins: ${error.message}`));
           break;
         }
+        // ---- the chats' prompt queues (prompt-queue.js) ----
+        case '_codeflower/queue/add': {
+          const { host, sessionId } = queuedChat();
+          const replace = params.mode === 'replace';
+          const item = promptQueue.add(sessionId, queuedPromptOf(params), { replace });
+          if (replace && chatRunning(host, sessionId)) interruptChat(host, sessionId);
+          else drainQueue(sessionId);
+          respond({ id: item.id, ...promptQueue.snapshot(sessionId) });
+          break;
+        }
+        case '_codeflower/queue/remove': {
+          const { sessionId } = queuedChat();
+          respond({ removed: promptQueue.remove(sessionId, params.id), ...promptQueue.snapshot(sessionId) });
+          break;
+        }
+        // Back to the window: one to edit (`id`), or the user's own (`editable`) when it stops the turn.
+        case '_codeflower/queue/take': {
+          const { sessionId } = queuedChat();
+          const items = promptQueue.take(sessionId, { id: typeof params.id === 'string' ? params.id : undefined, editable: params.editable === true });
+          respond({ items: items.map(({ id, title, text, prompt, editable, action }) => ({ id, title, text, prompt, ...(editable ? { editable } : {}), ...(action ? { action } : {}) })) });
+          break;
+        }
+        // Into the running turn where the agent takes messages while it works;
+        // otherwise first in the queue, and the turn stops so it goes next.
+        case '_codeflower/queue/sendNow': {
+          const { host, sessionId } = queuedChat();
+          const item = promptQueue.find(sessionId, params.id);
+          if (!item) {
+            respond({ sent: false });
+            break;
+          }
+          // A command or an action is a prompt of its own: the window gave no `steer` for it.
+          const running = chatRunning(host, sessionId);
+          if (running && item.steer && !host.handoffs.has(sessionId) && (await host.initialized)?._meta?.steering?.supported === true) {
+            promptQueue.take(sessionId, { id: item.id });
+            const steered = await requestAgent(host, STEER_METHOD, {
+              sessionId,
+              prompt: item.steer,
+              _meta: { steering: { idleBehavior: 'promptRequired' } }
+            }).catch(() => undefined);
+            if (steered?.outcome === 'injected' || steered?.outcome === 'startedNewTurn') {
+              respond({ sent: true, steered: true });
+              break;
+            }
+            promptQueue.putFirst(sessionId, [item]);
+          }
+          promptQueue.sendFirst(sessionId, item.id, { afterCancel: chatRunning(host, sessionId) });
+          if (chatRunning(host, sessionId)) interruptChat(host, sessionId);
+          else drainQueue(sessionId);
+          respond({ sent: true });
+          break;
+        }
+        case '_codeflower/queue/resume': {
+          const { sessionId } = queuedChat();
+          promptQueue.resume(sessionId);
+          drainQueue(sessionId);
+          respond(promptQueue.snapshot(sessionId));
+          break;
+        }
         // ---- subagents (subagents/*.js) ----
         case '_codeflower/subagents/list':
           respond({ subagents: await subagentsOf(requireOwnSession()) });
@@ -3075,6 +3228,8 @@ export async function startBridge(options) {
       chatTerminals: Boolean(agent.tuiCommand && Array.isArray(ptyHelper) && ptyHelper.length),
       // The chats' commands (`_codeflower/commands/*`), to watch with `terminal/attach`.
       commands: agent.commands !== false,
+      // The chats' prompt queues on the worker (`_codeflower/queue/*`).
+      promptQueue: true,
       // What the agent tells of its subagents, and which of their settings it takes.
       ...(subagentAdapter ? { subagents: subagentAdapter.features } : {})
     });

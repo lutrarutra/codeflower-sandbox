@@ -255,6 +255,8 @@ input.on('line', async (line) => {
               ? {}
               : { sessionCapabilities: { systemPrompt: { mode: { append: {} } } } })
           },
+          // Like Claude Code: it takes messages into the running turn.
+          _meta: { steering: { supported: true } },
           leakedAppToken: process.env.CODEFLOWER_TOKEN ?? null,
           credentialVariables: CREDENTIAL_VARIABLES.filter((name) => process.env[name] !== undefined),
           noBrowser: process.env.NO_BROWSER ?? null,
@@ -656,10 +658,12 @@ input.on('line', async (line) => {
       send({ jsonrpc: '2.0', id: message.id, result: { steers } });
       break;
     case 'fake/finish': {
-      const { sessionId } = message.params;
+      // `stopReason`: how the turn ends, end_turn by default.
+      const { sessionId, stopReason } = message.params;
       const id = longTasks.get(sessionId);
       longTasks.delete(sessionId);
-      if (id !== undefined) reply(sessionId, id, 'done');
+      if (id !== undefined && stopReason && stopReason !== 'end_turn') send({ jsonrpc: '2.0', id, result: { stopReason } });
+      else if (id !== undefined) reply(sessionId, id, 'done');
       break;
     }
     // As the Claude Code adapter: lets go of a session, which it can resume later.

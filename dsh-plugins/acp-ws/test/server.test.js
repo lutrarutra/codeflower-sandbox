@@ -837,7 +837,7 @@ test("manages the agent's plugins and starts the agent with them", async (t) => 
   const socket = await openSocket(bridge.address);
   assert.equal((await initialize(socket)).pluginSeed, '/empty');
   const { subagents, ...capabilities } = (await call(socket, '_codeflower/status')).result.capabilities;
-  assert.deepEqual(capabilities, { plugins: true, chatTerminals: true, commands: true, shellTerminals: true });
+  assert.deepEqual(capabilities, { plugins: true, chatTerminals: true, commands: true, promptQueue: true, shellTerminals: true });
   assert.deepEqual(subagents.settings, { model: { applies: 'session' } });
 
   assert.match((await call(socket, '_codeflower/plugins/add', { source: 'npm:x@1' })).error.message, /github:, not npm:/);
@@ -866,7 +866,7 @@ test('an agent without plugins says so and refuses the plugin methods', async (t
   t.after(() => closeSocket(socket));
   await initialize(socket);
   const { subagents: _, ...capabilities } = (await call(socket, '_codeflower/status')).result.capabilities;
-  assert.deepEqual(capabilities, { plugins: false, chatTerminals: true, commands: true, shellTerminals: true });
+  assert.deepEqual(capabilities, { plugins: false, chatTerminals: true, commands: true, promptQueue: true, shellTerminals: true });
   assert.deepEqual((await call(socket, '_codeflower/plugins/list')).result, { available: false });
   assert.match((await call(socket, '_codeflower/plugins/add', { source: 'github:a/b' })).error.message, /no plugins/);
 });
@@ -1534,6 +1534,196 @@ test('keeps several windows on one chat in sync', async (t) => {
     entries.filter((entry) => entry.kind === 'prompt').map((entry) => entry.prompt[0].text),
     ['long task', 'hello', 'cancel me', 'ask permission']
   );
+});
+
+test('queues prompts on the worker, which go on while no window is open', async (t) => {
+  const { bridge } = await startTestBridge(t);
+  let first = await openSocket(bridge.address);
+  t.after(() => closeSocket(first));
+  await initialize(first);
+  const sessionId = (await call(first, 'session/new', { cwd: '/workspace', mcpServers: [] })).result.sessionId;
+  const key = sessionKey('claude', sessionId);
+  const queue = (socket, text, extra = {}) =>
+    call(socket, '_codeflower/queue/add', { key, prompt: [{ type: 'text', text }], editable: true, ...extra });
+
+  // Only a chat the window has open.
+  assert.match((await call(first, '_codeflower/queue/add', { key: 'claude-other', prompt: [{ type: 'text', text: 'x' }] })).error.message, /Open the chat/);
+
+  // While no turn runs, a queued prompt goes at once.
+  const longTask = await queue(first, 'long task');
+  assert.equal(longTask.result.id, 'q-1');
+  await receive(first, (message) => message.method === '_codeflower/prompted' && message.params.prompt[0].text === 'long task');
+  await receive(first, (message) => text(message) === 'started');
+
+  // While it runs, they wait; every window hears of the queue.
+  const added = await queue(first, 'after the long task');
+  assert.deepEqual(added.result.items, [{ id: 'q-2', title: 'after the long task', editable: true }]);
+  const told = await receive(first, (message) => message.method === '_codeflower/queue' && message.params.items[0]?.id === 'q-2');
+  assert.deepEqual(told.params, { key, sessionId, items: [{ id: 'q-2', title: 'after the long task', editable: true }] });
+  await queue(first, 'last');
+
+  // The window goes away (a closed laptop); the turn ends and the next prompt goes without it.
+  await closeSocket(first);
+  const finisher = await openSocket(bridge.address);
+  t.after(() => closeSocket(finisher));
+  await initialize(finisher);
+  send(finisher, { jsonrpc: '2.0', method: 'fake/finish', params: { sessionId } });
+  await waitFor(async () => {
+    const entries = (await call(finisher, '_codeflower/sessions/transcript', { key })).result.entries;
+    return entries.filter((entry) => entry.kind === 'prompt').length === 3;
+  });
+
+  // A window that opens the chat sees what is left, and the turns that ran.
+  first = await openSocket(bridge.address);
+  await initialize(first);
+  const resumed = await call(first, 'session/resume', { sessionId, cwd: '/workspace', mcpServers: [] });
+  assert.deepEqual(resumed.result._meta['codeflower/queue'], { items: [] });
+  const entries = (await call(first, '_codeflower/sessions/transcript', { key })).result.entries;
+  assert.deepEqual(
+    entries.filter((entry) => entry.kind === 'prompt').map((entry) => entry.prompt[0].text),
+    ['long task', 'after the long task', 'last']
+  );
+});
+
+test('a turn that ends otherwise pauses the queue, which any window resumes', async (t) => {
+  const { bridge } = await startTestBridge(t);
+  const first = await openSocket(bridge.address);
+  const second = await openSocket(bridge.address);
+  t.after(() => Promise.all([first, second].map(closeSocket)));
+  for (const socket of [first, second]) await initialize(socket);
+  const sessionId = (await call(first, 'session/new', { cwd: '/workspace', mcpServers: [] })).result.sessionId;
+  const key = sessionKey('claude', sessionId);
+  const queue = (socket, text) => call(socket, '_codeflower/queue/add', { key, prompt: [{ type: 'text', text }], editable: true });
+
+  await queue(first, 'long task');
+  await receive(first, (message) => text(message) === 'started');
+  await queue(first, 'after the refusal');
+  send(first, { jsonrpc: '2.0', method: 'fake/finish', params: { sessionId, stopReason: 'refusal' } });
+  const paused = await receive(first, (message) => message.method === '_codeflower/queue' && message.params.paused);
+  assert.deepEqual(paused.params.paused, { stopReason: 'refusal' });
+  assert.deepEqual(paused.params.items.map((item) => item.title), ['after the refusal']);
+
+  // A window that opens the chat sees it paused, and resumes it.
+  const resumed = await call(second, 'session/resume', { sessionId, cwd: '/workspace', mcpServers: [] });
+  assert.deepEqual(resumed.result._meta['codeflower/queue'], {
+    items: [{ id: 'q-2', title: 'after the refusal', editable: true }],
+    paused: { stopReason: 'refusal' }
+  });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const sent = (message) => message.method === '_codeflower/prompted' && message.params.prompt[0].text === 'after the refusal';
+  assert.equal(inboxes.get(first).messages.some(sent), false);
+  assert.deepEqual((await call(second, '_codeflower/queue/resume', { key })).result, { items: [] });
+  for (const socket of [first, second]) {
+    await receive(socket, (message) => message.method === '_codeflower/prompted' && message.params.prompt[0].text === 'after the refusal');
+  }
+});
+
+test('any window removes, edits or sends now a queued prompt, and Stop takes them back', async (t) => {
+  const { bridge } = await startTestBridge(t);
+  const first = await openSocket(bridge.address);
+  const second = await openSocket(bridge.address);
+  t.after(() => Promise.all([first, second].map(closeSocket)));
+  for (const socket of [first, second]) await initialize(socket);
+  const sessionId = (await call(first, 'session/new', { cwd: '/workspace', mcpServers: [] })).result.sessionId;
+  await call(second, 'session/resume', { sessionId, cwd: '/workspace', mcpServers: [] });
+  const key = sessionKey('claude', sessionId);
+  const queue = (socket, text, extra = {}) =>
+    call(socket, '_codeflower/queue/add', { key, prompt: [{ type: 'text', text }], editable: true, ...extra });
+  const titles = async () => (await call(second, '_codeflower/queue/remove', { key, id: 'none' })).result.items.map((item) => item.title);
+
+  await queue(first, 'long task');
+  await receive(first, (message) => text(message) === 'started');
+  const removed = (await queue(first, 'remove me')).result.id;
+  const edited = (await queue(first, 'edit me')).result.id;
+  const steered = (await queue(first, 'steer me', { steer: [{ type: 'text', text: 'steer me' }] })).result.id;
+  await queue(first, 'feedback', { editable: false, title: 'Preview feedback' });
+  await queue(first, 'mine');
+
+  assert.equal((await call(second, '_codeflower/queue/remove', { key, id: removed })).result.removed, true);
+  const taken = (await call(second, '_codeflower/queue/take', { key, id: edited })).result.items;
+  assert.deepEqual(taken.map((item) => [item.text, item.prompt[0].text]), [['edit me', 'edit me']]);
+
+  // Send now: into the running turn, where the agent takes messages while it works.
+  assert.deepEqual((await call(second, '_codeflower/queue/sendNow', { key, id: steered })).result, { sent: true, steered: true });
+  await receive(first, (message) => message.method === '_codeflower/prompted' && message.params.prompt[0].text === 'steer me');
+  assert.deepEqual(await titles(), ['Preview feedback', 'mine']);
+
+  send(first, { jsonrpc: '2.0', method: 'fake/finish', params: { sessionId } });
+  await receive(first, (message) => text(message) === 'done');
+  await receive(first, (message) => text(message) === 'reply to feedback in session-1');
+  await receive(first, (message) => text(message) === 'reply to mine in session-1');
+
+  // Stop: the window takes the user's own back to its composer; the rest waits, paused.
+  await queue(first, 'cancel me');
+  await receive(first, (message) => message.method === '_codeflower/prompted' && message.params.prompt[0].text === 'cancel me');
+  await queue(first, 'feedback', { editable: false, title: 'Preview feedback' });
+  await queue(first, 'mine');
+  const own = (await call(second, '_codeflower/queue/take', { key, editable: true })).result.items;
+  assert.deepEqual(own.map((item) => item.text), ['mine']);
+  send(second, { jsonrpc: '2.0', method: 'session/cancel', params: { sessionId } });
+  const paused = await receive(first, (message) => message.method === '_codeflower/queue' && message.params.paused);
+  assert.deepEqual(paused.params.items.map((item) => item.title), ['Preview feedback']);
+  assert.deepEqual(paused.params.paused, { stopReason: 'cancelled' });
+});
+
+test('the queue outlives a restart of the agent', async (t) => {
+  const { bridge } = await startTestBridge(t);
+  let socket = await openSocket(bridge.address);
+  t.after(() => closeSocket(socket));
+  await initialize(socket);
+  const sessionId = (await call(socket, 'session/new', { cwd: '/workspace', mcpServers: [] })).result.sessionId;
+  const key = sessionKey('claude', sessionId);
+  const queue = (text) => call(socket, '_codeflower/queue/add', { key, prompt: [{ type: 'text', text }], editable: true });
+  await queue('long task');
+  await receive(socket, (message) => text(message) === 'started');
+  await queue('after the restart');
+  send(socket, { jsonrpc: '2.0', method: 'fake/finish', params: { sessionId, stopReason: 'max_tokens' } });
+  await receive(socket, (message) => message.method === '_codeflower/queue' && message.params.paused);
+
+  const ended = once(socket, 'close');
+  await call(socket, '_codeflower/agent/restart');
+  await ended;
+  socket = await openSocket(bridge.address);
+  await initialize(socket);
+  const resumed = await call(socket, 'session/resume', { sessionId, cwd: '/workspace', mcpServers: [] });
+  assert.ok(resumed.result, resumed.error?.message);
+  assert.deepEqual(resumed.result._meta['codeflower/queue'], {
+    items: [{ id: 'q-2', title: 'after the restart', editable: true }],
+    paused: { stopReason: 'max_tokens' }
+  });
+  await call(socket, '_codeflower/queue/resume', { key });
+  await receive(socket, (message) => message.method === '_codeflower/prompted' && message.params.prompt[0].text === 'after the restart');
+  await receive(socket, (message) => text(message)?.startsWith('reply to after the restart'));
+});
+
+test('send now without steering, and an interrupting action, stop the turn and go next', async (t) => {
+  const { bridge } = await startTestBridge(t);
+  const socket = await openSocket(bridge.address);
+  t.after(() => closeSocket(socket));
+  await initialize(socket);
+  const sessionId = (await call(socket, 'session/new', { cwd: '/workspace', mcpServers: [] })).result.sessionId;
+  const key = sessionKey('claude', sessionId);
+  const queue = (text, extra = {}) => call(socket, '_codeflower/queue/add', { key, prompt: [{ type: 'text', text }], editable: true, ...extra });
+  const prompted = (wanted) => receive(socket, (message) => message.method === '_codeflower/prompted' && message.params.prompt[0].text === wanted);
+
+  // A command is a prompt of its own: the turn stops, and it goes next.
+  await queue('cancel me');
+  await prompted('cancel me');
+  await queue('later');
+  const command = (await queue('/compact')).result.id;
+  assert.deepEqual((await call(socket, '_codeflower/queue/sendNow', { key, id: command })).result, { sent: true });
+  await prompted('/compact');
+  await prompted('later');
+
+  // An interrupting action replaces the queue.
+  await queue('cancel me');
+  await prompted('cancel me');
+  await queue('dropped');
+  const action = await queue('wrap up now', { editable: false, title: 'Wrap up', action: { id: 'wrap-up', title: 'Wrap up' }, mode: 'replace' });
+  assert.deepEqual(action.result.items, [{ id: action.result.id, title: 'Wrap up', action: { id: 'wrap-up', title: 'Wrap up' } }]);
+  await prompted('wrap up now');
+  const entries = (await call(socket, '_codeflower/sessions/transcript', { key })).result.entries;
+  assert.equal(entries.some((entry) => entry.kind === 'prompt' && entry.prompt[0].text === 'dropped'), false);
 });
 
 test('shows a plan to approve to the window of its chat, when the user may see it', async (t) => {
