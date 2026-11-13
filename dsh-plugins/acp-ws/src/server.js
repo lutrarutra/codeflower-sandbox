@@ -903,10 +903,10 @@ export async function startBridge(options) {
     latestLinkBase = linkBase;
   };
 
-  // The chat a show is for: the only one working (the agent calls
+  // The chat a show is for: the only one with a turn working (the agent calls
   // codeflower-show in a turn), if exactly one is.
   const showingChat = () => {
-    const working = activity.snapshot().chats.filter((chat) => chat.state === 'working');
+    const working = activity.snapshot().chats.filter((chat) => chat.state === 'working' && chat.turn);
     return working.length === 1 ? sessionKey(...unscope(working[0].sessionId)) : undefined;
   };
 
@@ -2492,6 +2492,9 @@ export async function startBridge(options) {
         }
       };
       const running = summary.state === 'running' || summary.state === 'requires_action';
+      // Its top chat works while it does, also after the turn that started it.
+      if (running) activity.backgroundStarted(`subagent-${childId}`, host.subagents.rootOf(childId));
+      else activity.backgroundEnded(`subagent-${childId}`);
       if (!running) {
         clearTimeout(host.subagentTimers.get(childId));
         publish();
@@ -2615,10 +2618,13 @@ export async function startBridge(options) {
         const tasks = host.backgroundTasks.get(sessionId) ?? new Map();
         host.backgroundTasks.set(sessionId, tasks);
         tasks.set(update.asyncTaskId, backgroundTask(update));
+        // The chat works on it, also after its turn.
+        activity.backgroundStarted(`task-${update.asyncTaskId}`, sessionId);
       } else if (update.sessionUpdate === 'async_task_state_update' && BACKGROUND_TASK_ENDED.has(update.state)) {
         const tasks = host.backgroundTasks.get(sessionId);
         tasks?.delete(update.asyncTaskId);
         if (tasks?.size === 0) host.backgroundTasks.delete(sessionId);
+        activity.backgroundEnded(`task-${update.asyncTaskId}`);
       }
     };
 

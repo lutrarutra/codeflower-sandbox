@@ -12,6 +12,9 @@ const ENDED_MS = 60_000;
 export function createActivity(onChange = () => {}, now = Date.now) {
   // Turn request id -> session id.
   const turns = new Map();
+  // Work id -> session id: what a chat's agent does after its turn, e.g. a
+  // background command or subagent. The chat works, but takes a prompt.
+  const background = new Map();
   // Agent request id -> { sessionId, waitingFor }.
   const requests = new Map();
   // Session id -> tool call id -> kind, from tool_call updates: a permission
@@ -39,6 +42,16 @@ export function createActivity(onChange = () => {}, now = Date.now) {
       if (ended.length > MAX_ENDED) ended.shift();
       if (![...turns.values()].includes(sessionId)) toolKinds.delete(sessionId);
       onChange();
+    },
+
+    backgroundStarted(id, sessionId) {
+      if (background.get(id) === sessionId) return;
+      background.set(id, sessionId);
+      onChange();
+    },
+
+    backgroundEnded(id) {
+      if (background.delete(id)) onChange();
     },
 
     toolCall(sessionId, update) {
@@ -85,6 +98,7 @@ export function createActivity(onChange = () => {}, now = Date.now) {
     // picks what goes by turn or request id and by session id.
     clear(belongs = () => true) {
       for (const id of turns.keys()) if (belongs(id)) turns.delete(id);
+      for (const id of background.keys()) if (belongs(id)) background.delete(id);
       for (const id of requests.keys()) if (belongs(id)) requests.delete(id);
       for (const sessionId of toolKinds.keys()) if (belongs(sessionId)) toolKinds.delete(sessionId);
       onChange();
@@ -93,11 +107,15 @@ export function createActivity(onChange = () => {}, now = Date.now) {
     /**
      * Chats with a turn running or a request for the user, by session id.
      * `turn` says whether a turn runs: a chat can wait for the user without
-     * one, e.g. for a background subagent's permission after its turn ended.
+     * one, e.g. for a background subagent's permission after its turn ended,
+     * and work without one, e.g. on a background command.
      */
     snapshot() {
       const chats = new Map();
       for (const sessionId of turns.values()) chats.set(sessionId, { sessionId, state: 'working', turn: true });
+      for (const sessionId of background.values()) {
+        if (!chats.has(sessionId)) chats.set(sessionId, { sessionId, state: 'working', turn: false });
+      }
       for (const { sessionId, waitingFor } of requests.values()) {
         if (typeof sessionId !== 'string') continue;
         if (chats.get(sessionId)?.state !== 'waiting') {
@@ -129,6 +147,8 @@ export function scopedActivity(activity, agent) {
   return {
     turnStarted: (id, sessionId) => activity.turnStarted(scoped(id), scoped(sessionId)),
     turnEnded: (id, stopReason) => activity.turnEnded(scoped(id), stopReason),
+    backgroundStarted: (id, sessionId) => activity.backgroundStarted(scoped(id), scoped(sessionId)),
+    backgroundEnded: (id) => activity.backgroundEnded(scoped(id)),
     toolCall: (sessionId, update) => activity.toolCall(scoped(sessionId), update),
     permission: (id, sessionId, toolCall) => activity.permission(scoped(id), scoped(sessionId), toolCall),
     isPlan: (sessionId, toolCall) => activity.isPlan(scoped(sessionId), toolCall),
