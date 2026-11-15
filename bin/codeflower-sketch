@@ -7,23 +7,33 @@ attached: Servier Medical Art (PNG or slide kits) and SciDraw (SVG or PNG), or
 icons generated on the user's request. Nothing here downloads icons; only
 `generate` uses the network, to call the image provider the user configured.
 Each icon keeps its source, license and credit, so `credits` can write the
-attribution a figure needs. Only the standard library is used.
+attribution a figure needs. Servier's slide kits become SVG icons through
+LibreOffice (`soffice`, run as a subprocess), and keep their PowerPoint shapes
+for decks (`pptx`). Only the standard library is used.
 """
 
 import argparse
 import base64
+import collections
+import concurrent.futures
+import copy
+import gzip
 import hashlib
 import html
 import io
 import json
+import math
 import os
 import posixpath
+import queue
 import re
 import shutil
+import signal
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -136,8 +146,9 @@ def lookup(root, ref):
     return meta
 
 
-def add_icon(root, source, data, suffix, meta, known):
-    """Stores one icon. Returns (ref, True) when added, or (ref of the same image, False)."""
+def add_icon(root, source, data, suffix, meta, known, extras=None):
+    """Stores one icon, and `extras` ({file name: data}) next to it. Returns (ref, True) when added, or (ref of the
+    same image, False)."""
     digest = sha256(data)
     if digest in known:
         return known[digest], False
@@ -148,6 +159,9 @@ def add_icon(root, source, data, suffix, meta, known):
     staging = Path(tempfile.mkdtemp(prefix=".import-", dir=folder))
     try:
         (staging / meta["filename"]).write_bytes(data)
+        for name, extra in (extras or {}).items():
+            (staging / name).parent.mkdir(parents=True, exist_ok=True)
+            (staging / name).write_bytes(extra)
         (staging / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n")
         base = slug(meta["title"])
         for attempt in range(1, 1000):
@@ -167,10 +181,24 @@ def add_icon(root, source, data, suffix, meta, known):
 
 
 def known_digests(root):
-    return {meta.get("sha256"): meta["ref"] for meta in icons(root) if meta.get("sha256")}
+    """The icons by the sha256 of their file and, for icons from slide kits, of the drawing they came from."""
+    known = {}
+    for meta in icons(root):
+        for key in ("sha256", "sourceSha256"):
+            if meta.get(key):
+                known[meta[key]] = meta["ref"]
+    return known
 
 
 # ---- reading slide kits ----
+
+def q(prefix, name):
+    return f"{{{NS[prefix]}}}{name}"
+
+
+def local(tag):
+    return tag.rsplit("}", 1)[-1]
+
 
 def title_from_name(name):
     stem = Path(name).stem
@@ -179,84 +207,1021 @@ def title_from_name(name):
 
 
 def shape_text(shape):
-    return " ".join(" ".join(t.text or "" for t in p.iter(f"{{{NS['a']}}}t")).strip()
-                    for p in shape.iter(f"{{{NS['a']}}}p")).strip()
+    return " ".join(" ".join(t.text or "" for t in p.iter(q("a", "t"))).strip()
+                    for p in shape.iter(q("a", "p"))).strip()
 
 
-def shape_center(shape):
-    off = shape.find(".//a:xfrm/a:off", NS)
-    ext = shape.find(".//a:xfrm/a:ext", NS)
+def top_xfrm(element):
+    for path in ("p:grpSpPr/a:xfrm", "p:spPr/a:xfrm", "p:xfrm"):
+        xfrm = element.find(path, NS)
+        if xfrm is not None:
+            return xfrm
+    return element.find(".//a:xfrm", NS)
+
+
+def element_rect(element):
+    """(x0, y0, x1, y1) of a slide element, in EMU."""
+    xfrm = top_xfrm(element)
+    off = xfrm.find("a:off", NS) if xfrm is not None else None
+    ext = xfrm.find("a:ext", NS) if xfrm is not None else None
     if off is None or ext is None:
         return None
-    return (int(off.get("x", 0)) + int(ext.get("cx", 0)) / 2, int(off.get("y", 0)) + int(ext.get("cy", 0)) / 2)
+    x, y = int(off.get("x", 0)), int(off.get("y", 0))
+    return (x, y, x + int(ext.get("cx", 0)), y + int(ext.get("cy", 0)))
+
+
+def rect_distance(a, b):
+    """The gap between two rectangles (0 when they overlap), then the distance of their centers."""
+    dx = max(0, a[0] - b[2], b[0] - a[2])
+    dy = max(0, a[1] - b[3], b[1] - a[3])
+    centers = ((a[0] + a[2] - b[0] - b[2]) / 2) ** 2 + ((a[1] + a[3] - b[1] - b[3]) / 2) ** 2
+    return (dx * dx + dy * dy, centers)
 
 
 def is_placeholder_name(text):
-    return not text or re.fullmatch(r"(picture|image|grafik|bild|graphic|object|group)\s*\d*", text.strip(), re.IGNORECASE) is not None
+    return not text or re.fullmatch(
+        r"(picture|image|grafik|bild|graphic|graphique|dessin|drawing|object|objet|group|groupe|freeform|forme libre|forme|"
+        r"autoshape|shape|rectangle|oval|ellipse|text ?box|line|connector|imagen|grupo)[\s_-]*\d*", text.strip(), re.IGNORECASE) is not None
 
 
-def slide_pictures(package, kit):
-    """(data, suffix, title) for each picture on the slides of one .pptx, with the nearest text as its name."""
-    names = set(package.namelist())
-    slides = sorted((n for n in names if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)),
-                    key=lambda n: int(re.search(r"(\d+)\.xml$", n).group(1)))
-    for slide_name in slides:
-        rels_name = posixpath.join(posixpath.dirname(slide_name), "_rels", posixpath.basename(slide_name) + ".rels")
-        targets = {}
-        if rels_name in names:
-            for rel in ElementTree.fromstring(package.read(rels_name)):
-                targets[rel.get("Id")] = posixpath.normpath(posixpath.join(posixpath.dirname(slide_name), rel.get("Target", "")))
-        tree = ElementTree.fromstring(package.read(slide_name))
-        texts = []
-        for shape in tree.iter(f"{{{NS['p']}}}sp"):
-            text, center = shape_text(shape), shape_center(shape)
-            if text and center:
-                texts.append((center, text))
-        heading = texts[0][1] if texts else ""
-        for number, picture in enumerate(tree.iter(f"{{{NS['p']}}}pic"), 1):
-            svg_blip = picture.find(".//asvg:svgBlip", NS)
-            blip = picture.find(".//a:blip", NS)
-            embed = (svg_blip if svg_blip is not None else blip)
-            target = targets.get(embed.get(f"{{{NS['r']}}}embed")) if embed is not None else None
-            suffix = Path(target or "").suffix.lower()
-            if target not in names or suffix not in IMAGE_SUFFIXES:
+# Office writes alt text like "Une image contenant personne debout…" by itself: it names nothing.
+AUTO_ALT_TEXT = re.compile(r"image contenant|picture containing|image containing|bild, das|description (générée|automatically generated)",
+                           re.IGNORECASE)
+# Some alt texts are the path of the file the drawing was pasted from.
+FILE_NAME = re.compile(r"[\\/]|\.(png|jpe?g|emf|wmf|gif|tiff?|svg|bmp)\b", re.IGNORECASE)
+SLIDE_SIZE = (12192000, 6858000)
+# LibreOffice's SVG export counts in 1/100 mm.
+EMU_PER_SVG_UNIT = 360
+SKIP_REASONS = ("text", "lines", "tiny shapes", "arrows", "plain shapes", "photos", "empty", "other")
+LINE_PRESETS = {"line", "straightConnector1", "bentConnector2", "bentConnector3", "bentConnector4", "bentConnector5",
+                "curvedConnector2", "curvedConnector3", "curvedConnector4", "curvedConnector5", "arc", "leftBrace",
+                "rightBrace", "leftBracket", "rightBracket"}
+ARROW_PRESETS = LINE_PRESETS | {
+    "rightArrow", "leftArrow", "upArrow", "downArrow", "leftRightArrow", "upDownArrow", "bentArrow", "uturnArrow",
+    "curvedRightArrow", "curvedLeftArrow", "curvedUpArrow", "curvedDownArrow", "notchedRightArrow", "stripedRightArrow",
+    "chevron", "homePlate", "triangle", "rightArrowCallout", "circularArrow", "bentUpArrow", "leftUpArrow"}
+VECTOR_PICTURES = {".emf", ".wmf"}
+PHOTO_SUFFIXES = {".jpg", ".jpeg"}
+FILL_TAGS = {"noFill", "solidFill", "gradFill", "blipFill", "pattFill", "grpFill"}
+COLOR_TAGS = {"scrgbClr", "srgbClr", "hslClr", "sysClr", "schemeClr", "prstClr"}
+DEFAULT_CLR_MAP = {"bg1": "lt1", "tx1": "dk1", "bg2": "lt2", "tx2": "dk2"}
+SVG_BLIP_URI = "{96DAC541-7B7A-43D3-8B79-37D633B846F1}"
+REGISTERED_PREFIXES = set()
+
+
+def register_namespaces(data):
+    """Keeps the prefixes of a part (a14, a16…) when its elements are written out again."""
+    for prefix, uri in set(re.findall(rb'xmlns:([A-Za-z_][\w.-]*)="([^"]*)"', data)):
+        prefix = prefix.decode()
+        if prefix not in REGISTERED_PREFIXES:
+            REGISTERED_PREFIXES.add(prefix)
+            try:
+                ElementTree.register_namespace(prefix, uri.decode())
+            except ValueError:
+                pass
+
+
+for _prefix, _uri in NS.items():
+    ElementTree.register_namespace(_prefix, _uri)
+    REGISTERED_PREFIXES.add(_prefix)
+ElementTree.register_namespace("xlink", XLINK_NS)
+ElementTree.register_namespace("", SVG_NS)
+
+# The theme of decks this script writes, and of kits that have none: Office's.
+DEFAULT_THEME = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    f'<a:theme xmlns:a="{NS["a"]}" name="Office"><a:themeElements><a:clrScheme name="Office">'
+    '<a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1><a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1>'
+    '<a:dk2><a:srgbClr val="44546A"/></a:dk2><a:lt2><a:srgbClr val="E7E6E6"/></a:lt2>'
+    + "".join(f'<a:{name}><a:srgbClr val="{value}"/></a:{name}>' for name, value in (
+        ("accent1", "4472C4"), ("accent2", "ED7D31"), ("accent3", "A5A5A5"), ("accent4", "FFC000"), ("accent5", "5B9BD5"),
+        ("accent6", "70AD47"), ("hlink", "0563C1"), ("folHlink", "954F72")))
+    + '</a:clrScheme><a:fontScheme name="Office">'
+    '<a:majorFont><a:latin typeface="Calibri Light"/><a:ea typeface=""/><a:cs typeface=""/></a:majorFont>'
+    '<a:minorFont><a:latin typeface="Calibri"/><a:ea typeface=""/><a:cs typeface=""/></a:minorFont></a:fontScheme>'
+    '<a:fmtScheme name="Office"><a:fillStyleLst>'
+    '<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>'
+    '<a:solidFill><a:schemeClr val="phClr"><a:tint val="50000"/></a:schemeClr></a:solidFill>'
+    '<a:solidFill><a:schemeClr val="phClr"><a:shade val="80000"/></a:schemeClr></a:solidFill></a:fillStyleLst><a:lnStyleLst>'
+    + "".join(f'<a:ln w="{width}"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:prstDash val="solid"/><a:miter lim="800000"/></a:ln>'
+              for width in (6350, 12700, 19050))
+    + '</a:lnStyleLst><a:effectStyleLst>' + '<a:effectStyle><a:effectLst/></a:effectStyle>' * 3 + '</a:effectStyleLst>'
+    '<a:bgFillStyleLst>' + '<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>' * 3 + '</a:bgFillStyleLst>'
+    '</a:fmtScheme></a:themeElements></a:theme>')
+
+
+class Theme:
+    """A kit's theme colours, through its master's colour map, and its shape styles."""
+
+    def __init__(self, data, clr_map):
+        self.data = data
+        root = ElementTree.fromstring(data)
+        base = {}
+        scheme = root.find("a:themeElements/a:clrScheme", NS)
+        for slot in (scheme if scheme is not None else []):
+            if not len(slot):
                 continue
-            properties = picture.find("p:nvPicPr/p:cNvPr", NS)
-            title = (properties.get("descr") or "").strip() if properties is not None else ""
-            if is_placeholder_name(title):
-                title = (properties.get("name") or "").strip() if properties is not None else ""
-            if is_placeholder_name(title):
-                center = shape_center(picture)
-                if center and texts:
-                    title = min(texts, key=lambda item: (item[0][0] - center[0]) ** 2 + (item[0][1] - center[1]) ** 2)[1]
-            if is_placeholder_name(title):
-                title = f"{heading or kit} {number}"
-            yield package.read(target), (".jpg" if suffix == ".jpeg" else suffix), title[:120]
+            color = slot[0]
+            if local(color.tag) == "srgbClr":
+                base[local(slot.tag)] = color.get("val", "000000")
+            elif local(color.tag) == "sysClr":
+                base[local(slot.tag)] = color.get("lastClr", "000000")
+        self.colors = dict(base)
+        for alias, slot in {**DEFAULT_CLR_MAP, **clr_map}.items():
+            if slot in base:
+                self.colors[alias] = base[slot]
+        formats = root.find("a:themeElements/a:fmtScheme", NS)
+
+        def styles(name):
+            found = formats.find(f"a:{name}", NS) if formats is not None else None
+            return list(found) if found is not None else []
+        self.fills, self.lines, self.backgrounds = styles("fillStyleLst"), styles("lnStyleLst"), styles("bgFillStyleLst")
+        self.effects = [style.find("a:effectLst", NS) for style in styles("effectStyleLst")]
 
 
-def servier_files(path):
-    """(data, suffix, title, category) from a PNG, a .pptx kit, or a zip of kits."""
+class Kit:
+    """One slide kit (.pptx): its slides, size and themes."""
+
+    def __init__(self, package, name, file_name):
+        self.package, self.name, self.file_name = package, name, file_name
+        self.names = set(package.namelist())
+        self._rels, self._themes = {}, {}
+        self.size = SLIDE_SIZE
+        if "ppt/presentation.xml" in self.names:
+            size = self.xml("ppt/presentation.xml").find("p:sldSz", NS)
+            if size is not None:
+                self.size = (int(size.get("cx")), int(size.get("cy")))
+
+    def xml(self, name):
+        return ElementTree.fromstring(self.package.read(name))
+
+    def slides(self):
+        return sorted((n for n in self.names if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)),
+                      key=lambda n: int(re.search(r"(\d+)\.xml$", n).group(1)))
+
+    def rels(self, part):
+        """{rId: (relationship type, target part, or None when it is outside the package)}"""
+        if part not in self._rels:
+            name = posixpath.join(posixpath.dirname(part), "_rels", posixpath.basename(part) + ".rels")
+            found = {}
+            if name in self.names:
+                for rel in ElementTree.fromstring(self.package.read(name)):
+                    external = rel.get("TargetMode") == "External"
+                    target = posixpath.normpath(posixpath.join(posixpath.dirname(part), rel.get("Target", "")))
+                    found[rel.get("Id")] = (rel.get("Type", "").rsplit("/", 1)[-1], None if external else target)
+            self._rels[part] = found
+        return self._rels[part]
+
+    def related(self, part, kind):
+        return next((target for rel_kind, target in self.rels(part).values() if rel_kind == kind and target in self.names), None)
+
+    def theme(self, slide):
+        layout = self.related(slide, "slideLayout")
+        master = self.related(layout, "slideMaster") if layout else None
+        if master is None:
+            master = next(iter(sorted(n for n in self.names if re.fullmatch(r"ppt/slideMasters/slideMaster\d+\.xml", n))), None)
+        if master not in self._themes:
+            theme_part = self.related(master, "theme") if master else None
+            data = self.package.read(theme_part) if theme_part else DEFAULT_THEME.encode()
+            clr_map = {}
+            if master:
+                found = self.xml(master).find("p:clrMap", NS)
+                clr_map = dict(found.attrib) if found is not None else {}
+            try:
+                self._themes[master] = Theme(data, clr_map)
+            except ElementTree.ParseError:
+                self._themes[master] = Theme(DEFAULT_THEME.encode(), clr_map)
+        return self._themes[master]
+
+
+def leaves(group):
+    for child in group:
+        kind = local(child.tag)
+        if kind == "grpSp":
+            yield from leaves(child)
+        elif kind in ("sp", "pic", "cxnSp", "graphicFrame"):
+            yield child
+
+
+def preset_of(shape):
+    if local(shape.tag) == "cxnSp":
+        return "line"
+    if shape.find("p:spPr/a:custGeom", NS) is not None:
+        return "custom"
+    preset = shape.find("p:spPr/a:prstGeom", NS)
+    return preset.get("prst", "") if preset is not None else ""
+
+
+def picture_target(kit, slide, picture):
+    """(media part, its suffix) of a picture, preferring its SVG."""
+    rels = kit.rels(slide)
+    for blip in (picture.find(".//asvg:svgBlip", NS), picture.find(".//a:blip", NS)):
+        if blip is not None:
+            _, target = rels.get(blip.get(q("r", "embed")), (None, None))
+            if target in kit.names:
+                return target, Path(target).suffix.lower()
+    return None, ""
+
+
+class Tally:
+    """What an import did, for its summary."""
+
+    def __init__(self):
+        self.added, self.same, self.failed, self.unrendered = [], 0, 0, 0
+        self.skipped = {reason: 0 for reason in SKIP_REASONS}
+
+    def skip(self, reason, count=1):
+        self.skipped[reason] += count
+
+    def merge(self, other):
+        self.added += other.added
+        self.same += other.same
+        self.failed += other.failed
+        self.unrendered += other.unrendered
+        for reason, count in other.skipped.items():
+            self.skipped[reason] += count
+
+    def count(self, ref, new):
+        if new:
+            self.added.append(ref)
+        else:
+            self.same += 1
+
+    def line(self):
+        skipped = sum(self.skipped.values())
+        details = ", ".join(f"{count} {reason}" for reason, count in self.skipped.items() if count)
+        icons_added = f"{len(self.added)} icon{'' if len(self.added) == 1 else 's'} added"
+        text = (f"{icons_added}, {self.same} already in the gallery, {skipped} skipped"
+                f"{f' ({details})' if details else ''}, {self.failed} failed to render")
+        if self.unrendered:
+            text += f", {self.unrendered} vector drawings not imported (LibreOffice unavailable)"
+        return text
+
+
+def slide_items(kit, slide, tally):
+    """The icons on one slide, named by the text nearest to them. Counts what it leaves out in the tally."""
+    data = kit.package.read(slide)
+    register_namespaces(data)
+    tree = ElementTree.fromstring(data).find("p:cSld/p:spTree", NS)
+    if tree is None:
+        return []
+    width, height = kit.size
+    labels, items = [], []
+    # Each drawing's own bytes, to recognise it on the next import without converting it.
+    drawn = [element for element in tree if local(element.tag) in TOP_KINDS]
+    spans = top_spans(data)
+    raw = dict(zip(map(id, drawn), spans)) if len(spans) == len(drawn) else {}
+    for element in tree:
+        kind = local(element.tag)
+        if kind in ("nvGrpSpPr", "grpSpPr", "extLst"):
+            continue
+        rect = element_rect(element)
+        tiny = rect is not None and rect[2] - rect[0] < 0.02 * width and rect[3] - rect[1] < 0.02 * height
+        item = {"element": element, "rect": rect, "slide": slide, "descr": "", "name": "", "raw": raw.get(id(element))}
+        properties = element.find("./*/p:cNvPr", NS)
+        if properties is not None:
+            descr = (properties.get("descr") or "").strip()
+            item["descr"] = "" if AUTO_ALT_TEXT.search(descr) or FILE_NAME.search(descr) or is_placeholder_name(descr) else descr
+            item["name"] = "" if is_placeholder_name(properties.get("name")) else properties.get("name").strip()
+        if kind == "sp":
+            if shape_text(element):
+                placeholder = element.find("p:nvSpPr/p:nvPr/p:ph", NS)
+                title = placeholder is not None and placeholder.get("type") in ("title", "ctrTitle")
+                labels.append((rect, re.sub(r"\s+", " ", shape_text(element)), title))
+                tally.skip("text")
+            elif preset_of(element) != "custom":
+                preset = preset_of(element)
+                tally.skip("lines" if preset in LINE_PRESETS else "arrows" if preset in ARROW_PRESETS else "plain shapes")
+            elif tiny:
+                tally.skip("tiny shapes")
+            else:
+                items.append({**item, "kind": "shape"})
+        elif kind == "cxnSp":
+            tally.skip("lines")
+        elif kind == "grpSp":
+            parts = list(leaves(element))
+            shapes = [part for part in parts if local(part.tag) != "pic"]
+            pictures = [part for part in parts if local(part.tag) == "pic"]
+            if not parts or all(local(part.tag) == "sp" and shape_text(part) for part in parts):
+                tally.skip("text")
+            elif tiny:
+                tally.skip("tiny shapes")
+            elif not pictures and all(preset_of(part) in LINE_PRESETS for part in shapes):
+                tally.skip("lines")
+            elif not pictures and all(preset_of(part) in ARROW_PRESETS for part in shapes):
+                tally.skip("arrows")
+            elif not shapes and all(picture_target(kit, slide, part)[1] in PHOTO_SUFFIXES for part in pictures):
+                tally.skip("photos")
+            else:
+                items.append({**item, "kind": "shape"})
+        elif kind == "pic":
+            target, suffix = picture_target(kit, slide, element)
+            full = rect is not None and rect[2] - rect[0] >= 0.9 * width and rect[3] - rect[1] >= 0.9 * height
+            if suffix in PHOTO_SUFFIXES or (full and suffix in IMAGE_SUFFIXES):
+                tally.skip("photos")
+            elif suffix in VECTOR_PICTURES:
+                items.append({**item, "kind": "shape"})
+            elif suffix in IMAGE_SUFFIXES:
+                items.append({**item, "kind": "picture", "data": kit.package.read(target), "suffix": suffix})
+            else:
+                tally.skip("other")
+        else:
+            tally.skip("other")
+    # The slide's heading: its title placeholder, or else the topmost text when it lies above every drawing.
+    heading = next((label for label in labels if label[2]), None)
+    if heading is None:
+        placed_labels = sorted((label for label in labels if label[0]), key=lambda label: label[0][1])
+        top = min((item["rect"][1] for item in items if item["rect"]), default=None)
+        if placed_labels and top is not None and placed_labels[0][0][3] <= top:
+            heading = placed_labels[0]
+    heading_text = heading[1][:120] if heading else ""
+    labels = [label for label in labels if label is not heading and label[0]]
+    # Labels name icons closest pair first, so a label between two icons goes to the one the other label leaves.
+    # A label further from an icon than the icon is large names nothing.
+    pairs = sorted((rect_distance(rect, item["rect"]), index, number)
+                   for number, (rect, _, _) in enumerate(labels) for index, item in enumerate(items) if item["rect"])
+    named, used = {}, set()
+    for (gap, _), index, number in pairs:
+        rect = items[index]["rect"]
+        if index in named or number in used or math.sqrt(gap) > max(rect[2] - rect[0], rect[3] - rect[1]):
+            continue
+        named[index] = labels[number][1]
+        used.add(number)
+    for number, item in enumerate(items, 1):
+        title = item["descr"] or named.get(number - 1, "") or item["name"]
+        if title and not re.search(r"[^\W\d_]{2}", title):
+            # A label without a word ("30", "B") names the drawing only with the slide's heading.
+            title = f"{heading_text or kit.name} {title}"
+        item["title"] = (title or f"{heading_text or kit.name} {number}")[:120]
+        item["heading"] = heading_text
+    return items
+
+
+def resolve_colors(element, theme):
+    """Theme colours as RGB, keeping their modifiers (lumMod, tint, alpha…), so they look the same in any deck."""
+    for color in list(element.iter(q("a", "schemeClr"))):
+        if color.get("val") in theme.colors:
+            color.tag = q("a", "srgbClr")
+            color.set("val", theme.colors[color.get("val")])
+
+
+def with_color(style, color):
+    """A copy of a theme style with its placeholder colour (phClr) replaced by `color`."""
+    style = copy.deepcopy(style)
+    for parent in style.iter():
+        for index, child in enumerate(list(parent)):
+            if child.tag == q("a", "schemeClr") and child.get("val") == "phClr":
+                if color is None:
+                    replacement = ElementTree.Element(q("a", "srgbClr"), {"val": "000000"})
+                else:
+                    replacement = copy.deepcopy(color)
+                replacement.extend(copy.deepcopy(list(child)))
+                parent[index] = replacement
+    return style
+
+
+def insert_after(parent, element, names):
+    """Inserts `element` after the last child of `parent` named in `names` (or first)."""
+    index = 0
+    for position, child in enumerate(parent):
+        if local(child.tag) in names:
+            index = position + 1
+    parent.insert(index, element)
+
+
+def resolve_style(shape, theme):
+    """Writes a shape's theme style (p:style) out as its own fill, line and effects, then drops it."""
+    style = shape.find("p:style", NS)
+    properties = shape.find("p:spPr", NS)
+    if style is None:
+        return
+    shape.remove(style)
+    if properties is None:
+        return
+
+    def reference(name):
+        found = style.find(f"a:{name}", NS)
+        if found is None:
+            return None, None
+        color = next((child for child in found if local(child.tag) in COLOR_TAGS), None)
+        return found.get("idx", "0"), color
+    geometry = {"xfrm", "custGeom", "prstGeom"}
+    index, color = reference("fillRef")
+    if index is not None and not any(local(child.tag) in FILL_TAGS for child in properties):
+        number = int(index)
+        fill = (ElementTree.Element(q("a", "noFill")) if number == 0
+                else with_color(theme.backgrounds[number - 1001], color) if 1001 <= number < 1001 + len(theme.backgrounds)
+                else with_color(theme.fills[number - 1], color) if 1 <= number <= len(theme.fills) else None)
+        if fill is not None:
+            insert_after(properties, fill, geometry)
+    index, color = reference("lnRef")
+    if index is not None:
+        number = int(index)
+        line = properties.find("a:ln", NS)
+        styled = with_color(theme.lines[number - 1], color) if 1 <= number <= len(theme.lines) else None
+        if line is None:
+            line = styled if styled is not None else ElementTree.Element(q("a", "ln"))
+            insert_after(properties, line, geometry | FILL_TAGS)
+        elif styled is not None:
+            for name, value in styled.attrib.items():
+                line.attrib.setdefault(name, value)
+        groups = [FILL_TAGS, {"prstDash", "custDash"}, {"round", "bevel", "miter"}, {"headEnd"}, {"tailEnd"}, {"extLst"}]
+        children = []
+        for names in groups:
+            own = [child for child in line if local(child.tag) in names]
+            inherited = [child for child in (styled if styled is not None else []) if local(child.tag) in names]
+            chosen = own or [copy.deepcopy(child) for child in inherited]
+            if names is FILL_TAGS and not chosen:
+                chosen = [ElementTree.Element(q("a", "noFill"))]
+            children += chosen
+        for child in list(line):
+            line.remove(child)
+        line.extend(children)
+    index, color = reference("effectRef")
+    if index is not None and 1 <= int(index) <= len(theme.effects) and theme.effects[int(index) - 1] is not None \
+            and properties.find("a:effectLst", NS) is None and properties.find("a:effectDag", NS) is None:
+        insert_after(properties, with_color(theme.effects[int(index) - 1], color), geometry | FILL_TAGS | {"ln"})
+    _, color = reference("fontRef")
+    body = shape.find("p:txBody", NS)
+    if color is not None and body is not None:
+        for paragraph in body.findall("a:p", NS):
+            for run in paragraph:
+                if local(run.tag) in ("r", "fld"):
+                    run_properties = run.find("a:rPr", NS)
+                    if run_properties is None:
+                        run_properties = ElementTree.Element(q("a", "rPr"))
+                        run.insert(0, run_properties)
+                elif local(run.tag) == "endParaRPr":
+                    run_properties = run
+                else:
+                    continue
+                if not any(local(child.tag) in FILL_TAGS for child in run_properties):
+                    fill = ElementTree.Element(q("a", "solidFill"))
+                    fill.append(copy.deepcopy(color))
+                    insert_after(run_properties, fill, {"ln"})
+
+
+class Unportable(Exception):
+    pass
+
+
+def portable_element(kit, slide, element):
+    """A top-level slide element as standalone DrawingML for other decks: theme colours and styles written out,
+    at (0, 0), without shape ids, names, links or connections. Returns (element, {rId: (file name, data)})."""
+    theme = kit.theme(slide)
+    element = copy.deepcopy(element)
+    if next(element.iter(q("p", "style")), None) is not None:
+        for kind in ("sp", "cxnSp", "pic"):
+            for shape in [shape for shape in element.iter(q("p", kind)) if shape.find("p:style", NS) is not None]:
+                resolve_style(shape, theme)
+    resolve_colors(element, theme)
+    rels = kit.rels(slide)
+    media, by_target = {}, {}
+    for blip in [*element.iter(q("a", "blip")), *element.iter(q("asvg", "svgBlip"))]:
+        if blip.get(q("r", "link")):
+            raise Unportable("it links to a file outside the kit")
+        rid = blip.get(q("r", "embed"))
+        if rid is None:
+            continue
+        _, target = rels.get(rid, (None, None))
+        if target not in kit.names:
+            raise Unportable(f"its picture {rid} is missing")
+        if target not in by_target:
+            by_target[target] = f"rIdIcon{len(by_target) + 1}"
+            media[by_target[target]] = (f"media-{len(by_target)}{Path(target).suffix.lower()}", kit.package.read(target))
+        blip.set(q("r", "embed"), by_target[target])
+    # Ids and names are the deck's to give; hyperlinks and connections point at other shapes or parts.
+    for properties in element.iter(q("p", "cNvPr")):
+        for name in ("id", "descr", "title"):
+            properties.attrib.pop(name, None)
+        properties.set("name", "")
+        for child in list(properties):
+            properties.remove(child)
+    dropped = {q("a", "hlinkClick"), q("a", "hlinkMouseOver"), q("a", "stCxn"), q("a", "endCxn"), q("p", "ph")}
+    if any(next(element.iter(tag), None) is not None for tag in dropped):
+        for parent in element.iter():
+            for child in [child for child in parent if child.tag in dropped]:
+                parent.remove(child)
+    xfrm = top_xfrm(element)
+    off = xfrm.find("a:off", NS) if xfrm is not None else None
+    if off is None or xfrm.find("a:ext", NS) is None:
+        raise Unportable("it has no position")
+    off.set("x", "0")
+    off.set("y", "0")
+    return element, media
+
+
+# The top-level drawings of a slide, found in its bytes: a drawing's bytes, without its ids, names and position,
+# recognise it on the next import before anything is converted.
+TOP_KINDS = {"sp", "grpSp", "pic", "cxnSp", "graphicFrame"}
+TOP_TAG = re.compile(rb"<(/?)p:(?:sp|grpSp|pic|cxnSp|graphicFrame)\b[^>]*?(/?)>")
+RAW_PROPERTIES = re.compile(rb"<p:cNvPr\b(?:[^>]*/>|.*?</p:cNvPr>)", re.DOTALL)
+RAW_OFFSET = re.compile(rb"<a:off\b[^>]*/>")
+RAW_EMBED = re.compile(rb'r:embed="([^"]+)"')
+# Relationships other than pictures cannot follow a drawing into another deck.
+OTHER_RELATIONSHIP = re.compile(rb'\sr:(?!embed=)\w+="')
+
+
+def top_spans(data):
+    spans, depth, start = [], 0, 0
+    for match in TOP_TAG.finditer(data):
+        if match.group(1):
+            depth -= 1
+            if depth == 0:
+                spans.append(data[start:match.end()])
+        elif match.group(2):
+            if depth == 0:
+                spans.append(match.group(0))
+        else:
+            if depth == 0:
+                start = match.start()
+            depth += 1
+    return spans
+
+
+def raw_digest(kit, slide, raw):
+    """sha256 of a drawing as it is on the slide (ids, names and position left out), its theme and its pictures."""
+    digest = hashlib.sha256(RAW_OFFSET.sub(b"<a:off/>", RAW_PROPERTIES.sub(b"<p:cNvPr/>", raw), count=1))
+    theme = kit.theme(slide)
+    digest.update(hashlib.sha256(theme.data + json.dumps(theme.colors, sort_keys=True).encode()).digest())
+    rels = kit.rels(slide)
+    for rid in RAW_EMBED.findall(raw):
+        _, target = rels.get(rid.decode(), (None, None))
+        digest.update(hashlib.sha256(kit.package.read(target)).digest() if target in kit.names else b"missing")
+    return digest.hexdigest()
+
+
+def element_bytes(element):
+    return ElementTree.tostring(element, encoding="unicode").encode()
+
+
+def source_digest(xml, media):
+    digest = hashlib.sha256(xml)
+    for rid in sorted(media):
+        digest.update(rid.encode() + hashlib.sha256(media[rid][1]).digest())
+    return digest.hexdigest()
+
+
+def number_shapes(element, start=2):
+    for properties in element.iter(q("p", "cNvPr")):
+        properties.set("id", str(start))
+        start += 1
+    return start
+
+
+# ---- writing .pptx files ----
+
+PACKAGE_RELS = "http://schemas.openxmlformats.org/package/2006/relationships"
+OFFICE_RELS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+PML_TYPE = "application/vnd.openxmlformats-officedocument.presentationml"
+XML_HEAD = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+PML_XMLNS = f'xmlns:a="{NS["a"]}" xmlns:r="{NS["r"]}" xmlns:p="{NS["p"]}"'
+EMPTY_TREE = '<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>'
+MEDIA_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".emf": "image/x-emf", ".wmf": "image/x-wmf",
+               ".svg": "image/svg+xml", ".gif": "image/gif", ".tif": "image/tiff", ".tiff": "image/tiff"}
+
+
+def relationships(*items):
+    return XML_HEAD + f'<Relationships xmlns="{PACKAGE_RELS}">' + "".join(
+        f'<Relationship Id="{rid}" Type="{OFFICE_RELS}/{kind}" Target="{html.escape(target, quote=True)}"/>'
+        for rid, kind, target in items) + "</Relationships>"
+
+
+def text_shape(shape_id, name, x, y, cx, cy, text, size=None, placeholder=""):
+    size_attribute = f' sz="{size}"' if size else ""
+    run = f'<a:rPr lang="en-US"{size_attribute} dirty="0"/>'
+    paragraphs = "".join(f"<a:p><a:r>{run}<a:t>{html.escape(line, quote=False)}</a:t></a:r></a:p>" for line in text.split("\n"))
+    position = (f'<a:xfrm><a:off x="{x}" y="{y}"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
+                if cx else "")
+    shape_properties = '<p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr>' if placeholder else '<p:cNvSpPr txBox="1"/>'
+    return (f'<p:sp><p:nvSpPr><p:cNvPr id="{shape_id}" name="{html.escape(name, quote=True)}"/>{shape_properties}'
+            f'<p:nvPr>{placeholder}</p:nvPr></p:nvSpPr><p:spPr>{position}</p:spPr>'
+            f'<p:txBody><a:bodyPr wrap="square"><a:normAutofit/></a:bodyPr><a:lstStyle/>{paragraphs}</p:txBody></p:sp>')
+
+
+def pptx_package(slides, size, theme=None):
+    """A .pptx with one slide per item of `slides`: {"shapes": XML, "media": {rId: (name, data)}, "notes": text}."""
+    theme = theme or DEFAULT_THEME.encode()
+    notes = any(slide.get("notes") for slide in slides)
+    files = {}
+    types = {".rels": "application/vnd.openxmlformats-package.relationships+xml", ".xml": "application/xml"}
+    overrides = {"/ppt/presentation.xml": f"{PML_TYPE}.presentation.main+xml",
+                 "/ppt/slideMasters/slideMaster1.xml": f"{PML_TYPE}.slideMaster+xml",
+                 "/ppt/slideLayouts/slideLayout1.xml": f"{PML_TYPE}.slideLayout+xml",
+                 "/ppt/theme/theme1.xml": "application/vnd.openxmlformats-officedocument.theme+xml"}
+    files["_rels/.rels"] = relationships(("rId1", "officeDocument", "ppt/presentation.xml"))
+    presentation_rels = [("rId1", "slideMaster", "slideMasters/slideMaster1.xml"), ("rId2", "theme", "theme/theme1.xml")]
+    notes_master = ""
+    if notes:
+        presentation_rels.append(("rId3", "notesMaster", "notesMasters/notesMaster1.xml"))
+        notes_master = '<p:notesMasterIdLst><p:notesMasterId r:id="rId3"/></p:notesMasterIdLst>'
+        overrides["/ppt/notesMasters/notesMaster1.xml"] = f"{PML_TYPE}.notesMaster+xml"
+        overrides["/ppt/theme/theme2.xml"] = "application/vnd.openxmlformats-officedocument.theme+xml"
+        files["ppt/theme/theme2.xml"] = DEFAULT_THEME
+        body = text_shape(2, "Notes Placeholder 1", 685800, 4400550, 5486400, 3600450, "", placeholder='<p:ph type="body" idx="1"/>')
+        files["ppt/notesMasters/notesMaster1.xml"] = (
+            XML_HEAD + f'<p:notesMaster {PML_XMLNS}><p:cSld><p:spTree>{EMPTY_TREE}{body}</p:spTree></p:cSld>'
+            '<p:clrMap bg1="lt1" tx1="dk1" bg2="lt2" tx2="dk2" accent1="accent1" accent2="accent2" accent3="accent3" '
+            'accent4="accent4" accent5="accent5" accent6="accent6" hlink="hlink" folHlink="folHlink"/></p:notesMaster>')
+        files["ppt/notesMasters/_rels/notesMaster1.xml.rels"] = relationships(("rId1", "theme", "../theme/theme2.xml"))
+    slide_ids = []
+    for number, slide in enumerate(slides, 1):
+        rid = f"rId{100 + number}"
+        presentation_rels.append((rid, "slide", f"slides/slide{number}.xml"))
+        slide_ids.append(f'<p:sldId id="{255 + number}" r:id="{rid}"/>')
+        overrides[f"/ppt/slides/slide{number}.xml"] = f"{PML_TYPE}.slide+xml"
+        files[f"ppt/slides/slide{number}.xml"] = (
+            XML_HEAD + f'<p:sld {PML_XMLNS}><p:cSld><p:spTree>{EMPTY_TREE}{slide["shapes"]}</p:spTree></p:cSld>'
+            '<p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>')
+        rels = [("rIdLayout", "slideLayout", "../slideLayouts/slideLayout1.xml")]
+        for media_rid, (name, data) in slide.get("media", {}).items():
+            suffix = Path(name).suffix.lower()
+            types[suffix] = MEDIA_TYPES.get(suffix, "application/octet-stream")
+            files[f"ppt/media/s{number}-{name}"] = data
+            rels.append((media_rid, "image", f"../media/s{number}-{name}"))
+        if slide.get("notes"):
+            rels.append(("rIdNotes", "notesSlide", f"../notesSlides/notesSlide{number}.xml"))
+            overrides[f"/ppt/notesSlides/notesSlide{number}.xml"] = f"{PML_TYPE}.notesSlide+xml"
+            body = text_shape(2, "Notes Placeholder 1", 0, 0, 0, 0, slide["notes"], placeholder='<p:ph type="body" idx="1"/>')
+            files[f"ppt/notesSlides/notesSlide{number}.xml"] = (
+                XML_HEAD + f'<p:notes {PML_XMLNS}><p:cSld><p:spTree>{EMPTY_TREE}{body}</p:spTree></p:cSld>'
+                '<p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:notes>')
+            files[f"ppt/notesSlides/_rels/notesSlide{number}.xml.rels"] = relationships(
+                ("rId1", "notesMaster", "../notesMasters/notesMaster1.xml"), ("rId2", "slide", f"../slides/slide{number}.xml"))
+        files[f"ppt/slides/_rels/slide{number}.xml.rels"] = relationships(*rels)
+    files["ppt/presentation.xml"] = (
+        XML_HEAD + f'<p:presentation {PML_XMLNS}><p:sldMasterIdLst><p:sldMasterId id="2147483648" r:id="rId1"/></p:sldMasterIdLst>'
+        f'{notes_master}<p:sldIdLst>{"".join(slide_ids)}</p:sldIdLst><p:sldSz cx="{size[0]}" cy="{size[1]}"/>'
+        '<p:notesSz cx="6858000" cy="9144000"/></p:presentation>')
+    files["ppt/_rels/presentation.xml.rels"] = relationships(*presentation_rels)
+    files["ppt/slideMasters/slideMaster1.xml"] = (
+        XML_HEAD + f'<p:sldMaster {PML_XMLNS}><p:cSld><p:spTree>{EMPTY_TREE}</p:spTree></p:cSld>'
+        '<p:clrMap bg1="lt1" tx1="dk1" bg2="lt2" tx2="dk2" accent1="accent1" accent2="accent2" accent3="accent3" '
+        'accent4="accent4" accent5="accent5" accent6="accent6" hlink="hlink" folHlink="folHlink"/>'
+        '<p:sldLayoutIdLst><p:sldLayoutId id="2147483649" r:id="rId1"/></p:sldLayoutIdLst></p:sldMaster>')
+    files["ppt/slideMasters/_rels/slideMaster1.xml.rels"] = relationships(
+        ("rId1", "slideLayout", "../slideLayouts/slideLayout1.xml"), ("rId2", "theme", "../theme/theme1.xml"))
+    files["ppt/slideLayouts/slideLayout1.xml"] = (
+        XML_HEAD + f'<p:sldLayout {PML_XMLNS} type="blank" preserve="1"><p:cSld name="Blank"><p:spTree>{EMPTY_TREE}</p:spTree></p:cSld>'
+        '<p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sldLayout>')
+    files["ppt/slideLayouts/_rels/slideLayout1.xml.rels"] = relationships(("rId1", "slideMaster", "../slideMasters/slideMaster1.xml"))
+    files["ppt/theme/theme1.xml"] = theme
+    files["[Content_Types].xml"] = (
+        XML_HEAD + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        + "".join(f'<Default Extension="{suffix[1:]}" ContentType="{kind}"/>' for suffix, kind in types.items())
+        + "".join(f'<Override PartName="{name}" ContentType="{kind}"/>' for name, kind in overrides.items()) + "</Types>")
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as package:
+        package.writestr("[Content_Types].xml", files.pop("[Content_Types].xml"))
+        for name, data in files.items():
+            package.writestr(name, data)
+    return buffer.getvalue()
+
+
+# ---- rendering kits' drawings with LibreOffice ----
+
+RENDER_TIMEOUT = 120
+RENDER_TIMEOUT_PER_FILE = 15
+RENDER_BATCH = 20
+DRAWN_TAGS = {"path", "rect", "circle", "ellipse", "line", "polyline", "polygon", "image", "text", "use"}
+
+
+def render_slide(element, media, theme):
+    """A one-slide .pptx with the element alone in the middle of a blank page a little larger than it.
+    Returns (package, the element's box in the SVG's units, for when the SVG has no bounding boxes)."""
+    element = copy.deepcopy(element)
+    number_shapes(element)
+    xfrm = top_xfrm(element)
+    ext = xfrm.find("a:ext", NS)
+    width, height = max(int(ext.get("cx", 0)), 1), max(int(ext.get("cy", 0)), 1)
+    angle = math.radians(int(xfrm.get("rot", 0)) / 60000)
+    box_width = abs(width * math.cos(angle)) + abs(height * math.sin(angle))
+    box_height = abs(width * math.sin(angle)) + abs(height * math.cos(angle))
+    page = (max(int(box_width * 1.4) + 2, 914400), max(int(box_height * 1.4) + 2, 914400))
+    off = xfrm.find("a:off", NS)
+    off.set("x", str((page[0] - width) // 2))
+    off.set("y", str((page[1] - height) // 2))
+    fallback = [(page[0] - box_width) / 2, (page[1] - box_height) / 2, box_width, box_height]
+    package = pptx_package([{"shapes": element_bytes(element).decode(), "media": media}], page, theme)
+    return package, [value / EMU_PER_SVG_UNIT for value in fallback]
+
+
+def clean_svg(data, fallback):
+    """The drawing out of LibreOffice's presentation SVG: no script or navigation, cropped to what is drawn.
+    None when the SVG cannot be read, b"" when it draws nothing (shapes without fill or line)."""
+    try:
+        root = ElementTree.fromstring(data)
+    except ElementTree.ParseError:
+        return None
+    # The slide's page; the "DummySlide" before it has an empty one.
+    page = next((element for element in root.iter() if element.get("class") == "Page" and len(element)), None)
+    if page is None:
+        return None
+    boxes = []
+    for parent in list(page.iter()):
+        for child in list(parent):
+            if child.get("class") == "BoundingBox":
+                boxes.append([float(child.get(name, 0)) for name in ("x", "y", "width", "height")])
+                parent.remove(child)
+            elif local(child.tag) == "script":
+                parent.remove(child)
+    content = ElementTree.tostring(page, encoding="unicode")
+    referenced = {a or b for a, b in re.findall(r'url\(#([^)]+)\)|href="#([^"]+)"', content)}
+    for element in page.iter():
+        for name in list(element.attrib):
+            if name == "class" or name.startswith("{http://xml.openoffice.org/") or (name == "id" and element.get(name) not in referenced):
+                del element.attrib[name]
+
+    for element in page.iter():
+        if local(element.tag) not in ("text", "tspan", "textPath"):
+            element.text = None if not (element.text or "").strip() else element.text
+            element.tail = None if not (element.tail or "").strip() else element.tail
+
+    def flatten(parent):
+        index = 0
+        while index < len(parent):
+            child = parent[index]
+            flatten(child)
+            if local(child.tag) == "g" and not child.attrib:
+                parent.remove(child)
+                for offset, grandchild in enumerate(list(child)):
+                    parent.insert(index + offset, grandchild)
+                index += len(child)
+            else:
+                index += 1
+    flatten(page)
+    if not any(local(element.tag) in DRAWN_TAGS for element in page.iter()):
+        return b""
+    if boxes:
+        x0, y0 = min(b[0] for b in boxes), min(b[1] for b in boxes)
+        x1, y1 = max(b[0] + b[2] for b in boxes), max(b[1] + b[3] for b in boxes)
+    else:
+        x0, y0, x1, y1 = fallback[0], fallback[1], fallback[0] + fallback[2], fallback[1] + fallback[3]
+    pad = max(x1 - x0, y1 - y0) * 0.01
+    x0, y0, x1, y1 = math.floor(x0 - pad), math.floor(y0 - pad), math.ceil(x1 + pad), math.ceil(y1 + pad)
+    svg = ElementTree.Element(f"{{{SVG_NS}}}svg", {
+        "viewBox": f"{x0} {y0} {x1 - x0} {y1 - y0}", "width": f"{(x1 - x0) / 100:g}mm", "height": f"{(y1 - y0) / 100:g}mm"})
+    for name in ("fill-rule", "stroke-width", "stroke-linejoin"):
+        if root.get(name):
+            svg.set(name, root.get(name))
+    definitions = [copy.deepcopy(element) for defs in root.findall(f"{{{SVG_NS}}}defs") for element in defs
+                   if element.get("id") in referenced]
+    if definitions:
+        defs = ElementTree.SubElement(svg, f"{{{SVG_NS}}}defs")
+        defs.extend(definitions)
+    svg.extend(list(page))
+    return (ElementTree.tostring(svg, encoding="unicode") + "\n").encode()
+
+
+class Renderer:
+    """LibreOffice processes that convert one-icon slides to SVG, in batches, a few at a time."""
+
+    def __init__(self, workers):
+        self.soffice = shutil.which("soffice") or shutil.which("libreoffice")
+        self.workers = max(1, workers)
+        self.reason = None if self.soffice else "LibreOffice (soffice) is not installed in this sandbox"
+        self.temp = None
+        self.profiles = queue.Queue()
+
+    def start(self):
+        """Converts a test slide once, so a LibreOffice that cannot run is found before any kit."""
+        if self.reason or self.temp:
+            return self.reason is None
+        self.temp = Path(tempfile.mkdtemp(prefix="codeflower-sketch-"))
+        for number in range(self.workers):
+            self.profiles.put(self.temp / f"profile-{number}")
+        probe = ElementTree.fromstring(
+            f'<p:sp {PML_XMLNS}><p:nvSpPr><p:cNvPr id="2" name="probe"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm>'
+            '<a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm><a:prstGeom prst="ellipse"><a:avLst/></a:prstGeom>'
+            '<a:solidFill><a:srgbClr val="FF0000"/></a:solidFill></p:spPr></p:sp>')
+        package, box = render_slide(probe, {}, None)
+        result, detail = self.render({"probe": (package, box)}, check=True)
+        if not result.get("probe"):
+            self.reason = f"LibreOffice could not convert a test slide ({detail or 'no output'})"
+        return self.reason is None
+
+    def close(self):
+        if self.temp:
+            shutil.rmtree(self.temp, ignore_errors=True)
+
+    def convert(self, files, outdir):
+        """Runs soffice on the files; when it hangs or crashes, the file it stopped at counts as failed."""
+        pending, detail = list(files), ""
+        while pending:
+            profile = self.profiles.get()
+            try:
+                command = [self.soffice, f"-env:UserInstallation={profile.as_uri()}", "--headless", "--norestore",
+                           "--nolockcheck", "--convert-to", "svg", "--outdir", str(outdir), *map(str, pending)]
+                process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                           start_new_session=True, env={**os.environ, "HOME": str(self.temp)})
+                try:
+                    _, error = process.communicate(timeout=RENDER_TIMEOUT + RENDER_TIMEOUT_PER_FILE * len(pending))
+                    stopped = process.returncode < 0
+                    detail = error.decode(errors="replace").strip()[-300:]
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.communicate()
+                    stopped, detail = True, "timed out"
+            finally:
+                self.profiles.put(profile)
+            left = [path for path in pending if not (outdir / f"{path.stem}.svg").exists()]
+            pending = left[1:] if stopped and left else []
+        return detail
+
+    def render(self, jobs, check=False):
+        """{key: cleaned SVG or None} for {key: (one-slide package, fallback box)}."""
+        work = Path(tempfile.mkdtemp(dir=self.temp))
+        try:
+            paths = {}
+            for index, (key, (package, _)) in enumerate(jobs.items()):
+                paths[key] = work / f"{index:05d}.pptx"
+                paths[key].write_bytes(package)
+            files = list(paths.values())
+            # Several small batches per process, so one slow drawing does not hold up the rest.
+            size = max(1, min(RENDER_BATCH, math.ceil(len(files) / (self.workers * 4))))
+            batches = [files[start:start + size] for start in range(0, len(files), size)]
+            with concurrent.futures.ThreadPoolExecutor(self.workers) as pool:
+                details = list(pool.map(lambda batch: self.convert(batch, work), batches))
+            results = {}
+            for key, path in paths.items():
+                output = path.with_suffix(".svg")
+                results[key] = clean_svg(output.read_bytes(), jobs[key][1]) if output.exists() else None
+            return (results, "; ".join(filter(None, details))) if check else results
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+# ---- importing Servier files ----
+
+def prepare_kit(package, file_name, known, convert=True):
+    """Reads one slide kit: its pictures, and its new drawings (shape groups, EMF pictures) as standalone DrawingML
+    with a one-slide package to render. Drawings already in the gallery are only counted. Returns plain data, so
+    that kits can be read in other processes."""
+    kit = Kit(package, title_from_name(file_name), file_name)
+    tally = Tally()
+    items = [item for slide in kit.slides() for item in slide_items(kit, slide, tally)]
+    base = {"category": kit.name, "license": "CC BY 4.0", "url": "https://smart.servier.com", "importedFrom": file_name}
+    entries = []
+    for item in items:
+        slide_number = re.search(r"(\d+)\.xml$", item["slide"]).group(1)
+        tags = [item["heading"]] if item["heading"] and item["heading"] != item["title"] else []
+        meta = {**base, "title": item["title"], "tags": tags, "slide": f"{file_name}, slide {slide_number}"}
+        if item["kind"] == "picture":
+            entries.append({"kind": "picture", "meta": meta, "data": item["data"],
+                            "suffix": ".jpg" if item["suffix"] == ".jpeg" else item["suffix"]})
+            continue
+        digest = raw_digest(kit, item["slide"], item["raw"]) if item["raw"] else None
+        if digest in known:
+            tally.same += 1
+            continue
+        if not convert:
+            tally.unrendered += 1
+            continue
+        try:
+            element, media = portable_element(kit, item["slide"], item["element"])
+        except Unportable:
+            tally.failed += 1
+            continue
+        xml = element_bytes(element)
+        if OTHER_RELATIONSHIP.search(xml):
+            tally.failed += 1
+            continue
+        digest = digest or source_digest(xml, media)
+        if digest in known:
+            tally.same += 1
+            continue
+        package_data, fallback = render_slide(element, media, kit.theme(item["slide"]).data)
+        entries.append({"kind": "drawing", "meta": meta, "digest": digest, "xml": xml, "media": media,
+                        "package": package_data, "fallback": fallback})
+    return {"name": kit.name, "count": len(items), "entries": entries, "same": tally.same, "failed": tally.failed,
+            "skipped": tally.skipped, "unrendered": tally.unrendered}
+
+
+def read_kit(path, member, file_name, known, convert):
+    """prepare_kit for a .pptx file, or for a kit inside a zip (in a worker process)."""
+    if member is None:
+        with zipfile.ZipFile(path) as package:
+            return prepare_kit(package, file_name, known, convert)
+    with zipfile.ZipFile(path) as archive:
+        data = archive.read(member)
+    with zipfile.ZipFile(io.BytesIO(data)) as package:
+        return prepare_kit(package, file_name, known, convert)
+
+
+def finish_kit(root, prepared, results, known, position, tally_total):
+    """Stores a kit's icons once its drawings are rendered, and prints what it added and left out."""
+    tally = Tally()
+    tally.same, tally.failed, tally.unrendered = prepared["same"], prepared["failed"], prepared.get("unrendered", 0)
+    for reason, count in prepared["skipped"].items():
+        tally.skip(reason, count)
+    tally.same += prepared.get("duplicates", 0)
+    for entry in prepared["entries"]:
+        if entry["kind"] == "picture":
+            tally.count(*add_icon(root, "servier", entry["data"], entry["suffix"], entry["meta"], known))
+            continue
+        if entry["digest"] not in results:
+            continue
+        svg = results[entry["digest"]]
+        if svg == b"":
+            tally.skip("empty")
+            continue
+        if not svg:
+            tally.failed += 1
+            continue
+        media = entry["media"]
+        extras = {"icon.grpsp.xml.gz": gzip.compress(entry["xml"], mtime=0)}
+        extras.update({f"media/{name}": content for name, content in media.values()})
+        meta = {**entry["meta"], "sourceSha256": entry["digest"], "pptx": "icon.grpsp.xml.gz"}
+        if media:
+            meta["pptxMedia"] = {rid: f"media/{name}" for rid, (name, _) in media.items()}
+        ref, new = add_icon(root, "servier", svg, ".svg", meta, known, extras)
+        known[entry["digest"]] = ref
+        tally.count(ref, new)
+    print(f"kit {position}: {prepared['name']}, {prepared['count']} icons\n  {tally.line()}", flush=True)
+    tally_total.merge(tally)
+
+
+def import_kits(root, path, members, known, renderer, tally):
+    """Imports slide kits (`members` of the zip at `path`, or [None] for a .pptx): kits are read in worker
+    processes while LibreOffice renders the drawings of the ones before, and stored in order."""
+    in_flight = set()
+
+    def render(prepared):
+        """Starts rendering a kit's new drawings; a drawing another kit is rendering counts as already there."""
+        jobs = {}
+        prepared["duplicates"] = 0
+        for entry in prepared["entries"]:
+            if entry["kind"] != "drawing":
+                continue
+            if entry["digest"] in known or entry["digest"] in in_flight:
+                prepared["duplicates"] += 1
+            elif not renderer.start():
+                prepared["unrendered"] = prepared.get("unrendered", 0) + 1
+            else:
+                in_flight.add(entry["digest"])
+                jobs[entry["digest"]] = (entry["package"], entry["fallback"])
+            entry["package"] = None
+        return background.submit(renderer.render, jobs) if jobs else None
+
+    def finish(prepared, future, position):
+        finish_kit(root, prepared, future.result() if future else {}, known, position, tally)
+
+    names = [posixpath.basename(member) if member else path.name for member in members]
+    readers = None
+    if len(members) > 1:
+        try:
+            readers = concurrent.futures.ProcessPoolExecutor(renderer.workers)
+        except (OSError, NotImplementedError, ImportError):
+            readers = None
+    with concurrent.futures.ThreadPoolExecutor(1) as background:
+        frozen = frozenset(known)
+        # Without LibreOffice, drawings are only counted.
+        convert = renderer.soffice is not None
+        reading = collections.deque()
+        next_kit = 0
+        waiting = None
+        try:
+            for number in range(len(members)):
+                # A few kits ahead, not all: each holds its drawings until rendered.
+                while readers and next_kit < len(members) and len(reading) < renderer.workers + 1:
+                    reading.append(readers.submit(read_kit, path, members[next_kit], names[next_kit], frozen, convert))
+                    next_kit += 1
+                prepared = (reading.popleft().result() if readers
+                            else read_kit(path, members[number], names[number], frozen, convert))
+                future = render(prepared)
+                if waiting:
+                    finish(*waiting)
+                waiting = (prepared, future, f"{number + 1}/{len(members)}")
+            if waiting:
+                finish(*waiting)
+        finally:
+            if readers:
+                readers.shutdown(cancel_futures=True)
+
+
+def import_servier(root, path, known, renderer, tally, title=None):
     suffix = path.suffix.lower()
     if suffix in IMAGE_SUFFIXES:
-        yield path.read_bytes(), (".jpg" if suffix == ".jpeg" else suffix), title_from_name(path.name), ""
+        meta = {"title": title or title_from_name(path.name), "category": "", "license": "CC BY 4.0",
+                "url": "https://smart.servier.com", "importedFrom": path.name, "tags": []}
+        tally.count(*add_icon(root, "servier", path.read_bytes(), ".jpg" if suffix == ".jpeg" else suffix, meta, known))
     elif suffix == ".pptx":
-        kit = title_from_name(path.name)
-        with zipfile.ZipFile(path) as package:
-            for data, image_suffix, title in slide_pictures(package, kit):
-                yield data, image_suffix, title, kit
+        import_kits(root, path, [None], known, renderer, tally)
     elif suffix == ".zip":
         with zipfile.ZipFile(path) as archive:
-            for member in archive.namelist():
-                if member.lower().endswith(".pptx") and not posixpath.basename(member).startswith("."):
-                    kit = title_from_name(posixpath.basename(member))
-                    with zipfile.ZipFile(io.BytesIO(archive.read(member))) as package:
-                        for data, image_suffix, title in slide_pictures(package, kit):
-                            yield data, image_suffix, title, kit
-                elif Path(member).suffix.lower() in IMAGE_SUFFIXES and not posixpath.basename(member).startswith("."):
-                    image_suffix = Path(member).suffix.lower()
-                    yield archive.read(member), (".jpg" if image_suffix == ".jpeg" else image_suffix), title_from_name(member), ""
+            members = [m for m in archive.namelist() if not posixpath.basename(m).startswith(".")]
+        import_kits(root, path, [m for m in members if m.lower().endswith(".pptx")], known, renderer, tally)
+        with zipfile.ZipFile(path) as archive:
+            for member in members:
+                image_suffix = Path(member).suffix.lower()
+                if image_suffix in IMAGE_SUFFIXES:
+                    meta = {"title": title_from_name(member), "category": "", "license": "CC BY 4.0",
+                            "url": "https://smart.servier.com", "importedFrom": path.name, "tags": []}
+                    tally.count(*add_icon(root, "servier", archive.read(member), ".jpg" if image_suffix == ".jpeg" else image_suffix,
+                                          meta, known))
     else:
-        raise Failure(f"{path}: Servier icons are PNG files, slide kits (.pptx) or the zip of all kits")
+        raise Failure(f"{path}: Servier icons come as PNG files, slide kits (.pptx, whose drawings become SVG icons) "
+                      "or the zip of all kits")
 
 
 def image_suffix(path):
@@ -283,8 +1248,9 @@ def command_find(args):
         for _, ref, meta in scored[:args.limit]:
             kind = Path(meta["filename"]).suffix.lstrip(".").upper()
             category = f" ({meta['category']})" if meta.get("category") else ""
-            print(f"- {ref}: {meta.get('title', '')}{category} [{kind}, {meta.get('license') or 'no license recorded'}]")
-        print("\nInsert one with `codeflower-sketch place REF`.")
+            shapes = ", PowerPoint shapes" if meta.get("pptx") else ""
+            print(f"- {ref}: {meta.get('title', '')}{category} [{kind}{shapes}, {meta.get('license') or 'no license recorded'}]")
+        print("\nInsert one with `codeflower-sketch place REF` (figures) or `codeflower-sketch pptx REF…` (slides).")
     query = " ".join(args.terms)
     if not scored or args.links:
         if not scored:
@@ -311,7 +1277,7 @@ def search_links(query):
 def command_import(args):
     root = gallery_root()
     known = known_digests(root)
-    added, same = [], []
+    tally = Tally()
     source = args.source
     meta = {}
     if source == "scidraw":
@@ -329,26 +1295,35 @@ def command_import(args):
     elif source == "own":
         license_name = normalize_license(args.license) if args.license else None
         meta = {"authors": args.authors, "license": license_name or args.license, "url": args.url, "credit": args.credit}
-    for path in map(Path, args.paths):
+    paths = list(map(Path, args.paths))
+    for path in paths:
         if not path.is_file():
             raise Failure(f"{path} does not exist")
-        if source == "servier":
-            for data, suffix, title, category in servier_files(path):
-                item = {"title": title, "category": category, "license": "CC BY 4.0", "url": "https://smart.servier.com",
-                        "importedFrom": path.name, "tags": [], **({"title": args.title} if args.title and len(args.paths) == 1 and path.suffix.lower() in IMAGE_SUFFIXES else {})}
-                ref, new = add_icon(root, source, data, suffix, item, known)
-                (added if new else same).append(ref)
-        else:
-            item = {**meta, "title": args.title or title_from_name(path.name), "importedFrom": path.name, "tags": args.tag or []}
-            ref, new = add_icon(root, source, path.read_bytes(), image_suffix(path), item, known)
-            (added if new else same).append(ref)
-    for ref in added[:50]:
+    renderer = Renderer(args.jobs)
+    started = time.monotonic()
+    try:
+        for path in paths:
+            if source == "servier":
+                import_servier(root, path, known, renderer, tally, args.title if len(paths) == 1 else None)
+            else:
+                item = {**meta, "title": args.title or title_from_name(path.name), "importedFrom": path.name, "tags": args.tag or []}
+                tally.count(*add_icon(root, source, path.read_bytes(), image_suffix(path), item, known))
+    finally:
+        renderer.close()
+    for ref in tally.added[:50]:
         print(f"added {ref}")
-    if len(added) > 50:
-        print(f"… and {len(added) - 50} more")
-    if same:
-        print(f"{len(same)} image(s) were already in the gallery: {', '.join(sorted(set(same))[:10])}{' …' if len(set(same)) > 10 else ''}")
-    print(f"{len(added)} icon(s) added to the gallery.")
+    if len(tally.added) > 50:
+        print(f"… and {len(tally.added) - 50} more")
+    summary = tally.line()
+    if source == "servier":
+        summary = f"In total: {summary} ({time.monotonic() - started:.0f} s)"
+    print(f"{summary}.")
+    if tally.same and not tally.added:
+        print("Nothing new: everything in these files is already in the gallery.")
+    if tally.unrendered:
+        print(f"WARNING: the vector artwork of the slide kits (shape groups and EMF pictures, {tally.unrendered} drawings) was NOT "
+              f"imported, only their PNG and SVG pictures: {renderer.reason}. Import the kits again in a sandbox with "
+              "LibreOffice to get them.", file=sys.stderr)
     return 0
 
 
@@ -356,7 +1331,8 @@ def command_gallery(args):
     root = gallery_root()
     terms = [term.lower() for term in args.terms]
     chosen = [meta for meta in icons(root)
-              if all(term in " ".join([meta["ref"], meta.get("title", ""), meta.get("category", "")]).lower() for term in terms)]
+              if all(term in " ".join([meta["ref"], meta.get("title", ""), meta.get("category", ""), " ".join(meta.get("tags", []))]).lower()
+                     for term in terms)]
     output = Path(args.output) if args.output else workspace() / "figures" / "icons" / "gallery.html"
     cards, size, left_out = [], 0, 0
     for meta in chosen:
@@ -481,13 +1457,8 @@ def figure_icons(path):
                   for element in tree.iter() if element.get("data-cf-icon")]
 
 
-def command_credits(args):
-    root = gallery_root()
-    path = Path(args.figure)
-    _, used = figure_icons(path)
-    adapted = {}
-    for ref, changed in used:
-        adapted[ref] = adapted.get(ref, False) or changed
+def legend_lines(root, adapted):
+    """The credit lines for the icons {ref: adapted?}, Servier's once for all its images, and the refs not in the gallery."""
     lines, missing = [], []
     servier = [ref for ref in adapted if ref.startswith("servier/")]
     if servier:
@@ -502,6 +1473,17 @@ def command_credits(args):
             missing.append(ref)
             continue
         lines.append(credit_of(meta, adapted[ref]) + ".")
+    return lines, missing
+
+
+def command_credits(args):
+    root = gallery_root()
+    path = Path(args.figure)
+    _, used = figure_icons(path)
+    adapted = {}
+    for ref, changed in used:
+        adapted[ref] = adapted.get(ref, False) or changed
+    lines, missing = legend_lines(root, adapted)
     generated = [ref for ref in adapted if ref.startswith("generated/")]
     if not lines:
         print(f"{path} uses no icons from the gallery (no data-cf-icon attributes): no credit is needed for icons.")
@@ -526,8 +1508,85 @@ def command_credits(args):
     return 0
 
 
-def local(tag):
-    return tag.rsplit("}", 1)[-1]
+DECK_SIZE = (12192000, 6858000)
+
+
+def icon_drawing(meta):
+    """(DrawingML element, {rId: (file name, data)}) that shows an icon on a slide: its PowerPoint shapes when the
+    gallery has them, otherwise a picture (SVG with a PNG copy, which PowerPoint needs, or PNG/JPEG)."""
+    folder = Path(meta["file"]).parent
+    title = html.escape(meta.get("title") or meta["ref"], quote=True)
+    if meta.get("pptx"):
+        data = (folder / meta["pptx"]).read_bytes()
+        element = ElementTree.fromstring(gzip.decompress(data) if meta["pptx"].endswith(".gz") else data)
+        media = {rid: (Path(name).name, (folder / name).read_bytes()) for rid, name in meta.get("pptxMedia", {}).items()}
+        properties = element.find("./*/p:cNvPr", NS)
+        if properties is not None:
+            properties.set("name", meta.get("title") or meta["ref"])
+        return element, media
+    data, suffix = Path(meta["file"]).read_bytes(), Path(meta["file"]).suffix
+    extension = ""
+    if suffix == ".svg":
+        box = svg_box(ElementTree.fromstring(data))
+        size = (box[2], box[3])
+        if not shutil.which("rsvg-convert"):
+            raise Failure(f"{meta['ref']}: rsvg-convert is missing, and PowerPoint needs a PNG copy of an SVG picture.")
+        result = subprocess.run(["rsvg-convert", "--width", "1200", "--keep-aspect-ratio"], input=data, capture_output=True)
+        if result.returncode:
+            raise Failure(f"{meta['ref']}: rsvg-convert failed: {result.stderr.decode(errors='replace').strip()}")
+        media = {"rIdIcon1": ("picture.png", result.stdout), "rIdIcon2": ("picture.svg", data)}
+        extension = f'<a:extLst><a:ext uri="{SVG_BLIP_URI}"><asvg:svgBlip xmlns:asvg="{NS["asvg"]}" r:embed="rIdIcon2"/></a:ext></a:extLst>'
+    else:
+        size = image_size(data, suffix) or (1, 1)
+        media = {"rIdIcon1": (f"picture{suffix}", data)}
+    width = 914400 * 4
+    height = max(1, int(width * size[1] / size[0])) if size[0] else width
+    element = ElementTree.fromstring(
+        f'<p:pic {PML_XMLNS}><p:nvPicPr><p:cNvPr name="{title}" descr="{title}"/><p:cNvPicPr><a:picLocks noChangeAspect="1"/>'
+        f'</p:cNvPicPr><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="rIdIcon1">{extension}</a:blip><a:stretch><a:fillRect/>'
+        f'</a:stretch></p:blipFill><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{width}" cy="{height}"/></a:xfrm>'
+        '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr></p:pic>')
+    return element, media
+
+
+def fit_drawing(element, left, top, width, height):
+    """Scales a drawing (its a:ext only: a group's children follow) to fit the box, centered in it."""
+    xfrm = top_xfrm(element)
+    ext, off = xfrm.find("a:ext", NS), xfrm.find("a:off", NS)
+    cx, cy = max(int(ext.get("cx", 1)), 1), max(int(ext.get("cy", 1)), 1)
+    angle = math.radians(int(xfrm.get("rot", 0)) / 60000)
+    box_width = abs(cx * math.cos(angle)) + abs(cy * math.sin(angle))
+    box_height = abs(cx * math.sin(angle)) + abs(cy * math.cos(angle))
+    scale = min(width / box_width, height / box_height)
+    cx, cy = int(cx * scale), int(cy * scale)
+    ext.set("cx", str(cx))
+    ext.set("cy", str(cy))
+    off.set("x", str(int(left + (width - cx) / 2)))
+    off.set("y", str(int(top + (height - cy) / 2)))
+
+
+def command_pptx(args):
+    root = gallery_root()
+    output = Path(args.out) if args.out else workspace() / "figures" / "icons.pptx"
+    slides = []
+    width, height = DECK_SIZE
+    for ref in args.refs:
+        meta = lookup(root, ref)
+        element, media = icon_drawing(meta)
+        fit_drawing(element, 457200, 1143000, width - 914400, height - 1600200)
+        number = number_shapes(element, 3)
+        title = text_shape(2, "Title", 457200, 228600, width - 914400, 685800, meta.get("title") or ref, size=2800)
+        credit = text_shape(number, "Credit", 457200, height - 457200, width - 914400, 320040, credit_of(meta), size=900)
+        slides.append({"shapes": title + element_bytes(element).decode() + (credit if args.credit_on_slide else ""), "media": media,
+                       "notes": f"{meta.get('title') or ref} ({ref}). {credit_of(meta)}."})
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(pptx_package(slides, DECK_SIZE))
+    lines, _ = legend_lines(root, {ref: False for ref in args.refs})
+    shapes = sum(1 for ref in args.refs if lookup(root, ref).get("pptx"))
+    print(f"{output}: {len(slides)} slide(s), {shapes} as editable PowerPoint shapes and {len(slides) - shapes} as pictures; "
+          "each slide's notes have its credit.")
+    print(f"\nCredit for the deck (on the slides that use the icons, or a credits slide):\n{' '.join(lines)}")
+    return 0
 
 
 def command_check(args):
@@ -685,6 +1744,8 @@ def main():
     importing.add_argument("--model", help="generated: the image model")
     importing.add_argument("--provider", help="generated: who runs the model")
     importing.add_argument("--prompt", help="generated: the prompt")
+    importing.add_argument("--jobs", type=int, default=min(6, os.cpu_count() or 1),
+                           help="servier: LibreOffice processes that convert slide kits (default: up to 6)")
     importing.set_defaults(run=command_import)
 
     gallery = commands.add_parser("gallery", help="write an HTML contact sheet of the gallery to show the user")
@@ -700,6 +1761,12 @@ def main():
     place.add_argument("--id", help="the group's id (default: from the icon's title)")
     place.add_argument("--label", help="the group's data-label (default: the icon's title)")
     place.set_defaults(run=command_place)
+
+    pptx = commands.add_parser("pptx", help="a PowerPoint deck with one icon per slide, as editable shapes where the gallery has them")
+    pptx.add_argument("refs", nargs="+", metavar="REF")
+    pptx.add_argument("--out", help="default: figures/icons.pptx in the workspace")
+    pptx.add_argument("--credit-on-slide", action="store_true", help="also write each icon's credit at the bottom of its slide")
+    pptx.set_defaults(run=command_pptx)
 
     credits = commands.add_parser("credits", help="the attribution for the icons a figure uses")
     credits.add_argument("figure")

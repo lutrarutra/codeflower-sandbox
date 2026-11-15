@@ -35,7 +35,8 @@ rules. Read it the first time icons come up, and explain them briefly to the use
      drop). It arrives as a file in `uploads/`.
    - Import it:
      - Servier: `codeflower-sketch import uploads/FILE --source servier` (a PNG, a .pptx kit, or the
-       zip of all kits).
+       zip of all kits). Kits give SVG icons, one per drawing, and need LibreOffice (in the image);
+       the zip of all kits takes several minutes, so say so before you start it.
      - SciDraw: needs the credit, so ask the user for the authors, license and DOI shown on the
        drawing's page: `codeflower-sketch import uploads/FILE --source scidraw --authors "…" --license "CC BY 4.0" --doi …`.
    - Then offer to delete the upload; the gallery keeps its own copy.
@@ -90,6 +91,27 @@ this skill. Embed the finished SVG with
 the report and comment on its parts; that feedback starts with
 `Feedback on figure N ("…", part …) in reports/….html`. Edit `figures/NAME.svg` and embed it again
 under the same key.
+
+## In slides
+
+Icons from Servier's kits keep their PowerPoint shapes (`find` shows `PowerPoint shapes`). In a deck
+they stay editable: the user can select and recolour their parts.
+
+- `codeflower-sketch pptx REF… --out figures/icons.pptx` writes a deck with one icon per slide, its
+  credit in the slide's notes, and prints the credit line for the deck.
+- In a storyteller deck, put the finished figure on a slide with `d.figure("figures/NAME.svg")`
+  (PowerPoint can convert it to shapes), with the credit line in the slide.
+- In a deck you build with python-pptx yourself, add icons as shapes:
+
+  ```python
+  import sys
+  sys.path.insert(0, "/opt/codeflower/skills/codeflower-sketch")
+  from pptx_icons import add_icon
+  meta = add_icon(slide, "servier/b-lymphocyte", Cm(2), Cm(5), Cm(6))  # left, top, width
+  ```
+
+  Other icons (SciDraw, PNG) go in as pictures, as before. Put the credit line from
+  `codeflower-sketch pptx` (or `credits` on a figure) on the slide or a credits slide.
 
 ## Good to know
 

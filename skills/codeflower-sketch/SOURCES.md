@@ -9,12 +9,23 @@ forbid automated downloads, or ask that their images are not redistributed as a 
 - Site: https://smart.servier.com
 - License: every image is CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/). Commercial use
   and adapting (recoloring, cropping, combining) are allowed, with credit.
-- Formats: PNG, or slide kits (.pptx) with many images each. No SVG.
+- Formats: single images are PNG. The slide kits (.pptx) hold the same drawings as vector shapes,
+  which the import turns into SVG icons, so prefer a kit when the user wants vector art or many icons.
 - How to download:
   - one image: search at `https://smart.servier.com/?s=TERM`, open the image, download the PNG;
   - a kit: https://smart.servier.com/image-kits-by-category/ (each kit is a .pptx of a few MB);
   - all kits at once: the "Download all slide set" link on that page (a zip of about 170 MB).
 - Import: `codeflower-sketch import FILE --source servier` (PNG, .pptx or the zip).
+  - Each drawing on a kit's slides becomes one SVG icon, named after the label next to it, with the
+    slide's heading as a tag and the kit as its category. Text, lines, arrows, tiny shapes and photos
+    are left out; the import says how many of each, per kit.
+  - It needs LibreOffice, which is in the sandbox image. Without it only the kits' PNG pictures are
+    imported, and the import warns that the vector drawings were not.
+  - A kit takes from a few seconds to a minute. The zip of all kits gives about 3,900 icons (about
+    330 MB in the gallery) and takes about 6 minutes on 6 CPUs, longer on fewer: tell the user before
+    starting it. Importing a file again adds only what is new, in about a minute for the zip.
+  - Icons from kits also keep their PowerPoint shapes, so they go into slide decks as editable,
+    recolourable shapes (`codeflower-sketch pptx`).
 - Credit, as Servier asks (https://smart.servier.com/how-to-cite-servier-medical-art/):
   - "Image provided by Servier Medical Art (https://smart.servier.com), licensed under CC BY 4.0
     (https://creativecommons.org/licenses/by/4.0/)."
