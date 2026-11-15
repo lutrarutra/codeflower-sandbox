@@ -15,7 +15,8 @@ export function createActivity(onChange = () => {}, now = Date.now) {
   // Work id -> session id: what a chat's agent does after its turn, e.g. a
   // background command or subagent. The chat works, but takes a prompt.
   const background = new Map();
-  // Agent request id -> { sessionId, waitingFor }.
+  // Agent request id -> { sessionId, waitingFor }: permission, plan,
+  // question, or browser (a handoff, by its own id).
   const requests = new Map();
   // Session id -> tool call id -> kind, from tool_call updates: a permission
   // request may name only the tool call (plan approval is kind switch_mode).
@@ -74,6 +75,13 @@ export function createActivity(onChange = () => {}, now = Date.now) {
 
     question(id, sessionId) {
       requests.set(id, { sessionId, waitingFor: 'question' });
+      onChange();
+    },
+
+    // The agent handed its browser to the user (codeflower-browser handoff),
+    // until they hand it back (answered).
+    handoff(id, sessionId) {
+      requests.set(id, { sessionId, waitingFor: 'browser' });
       onChange();
     },
 
@@ -153,6 +161,7 @@ export function scopedActivity(activity, agent) {
     permission: (id, sessionId, toolCall) => activity.permission(scoped(id), scoped(sessionId), toolCall),
     isPlan: (sessionId, toolCall) => activity.isPlan(scoped(sessionId), toolCall),
     question: (id, sessionId) => activity.question(scoped(id), scoped(sessionId)),
+    handoff: (id, sessionId) => activity.handoff(scoped(id), scoped(sessionId)),
     answered: (id) => activity.answered(scoped(id)),
     busy: (sessionId) => activity.busy(scoped(sessionId)),
     get running() {

@@ -1,0 +1,200 @@
+#!/usr/local/bin/node
+// This chat's browser: a headless Chromium in the sandbox that the user can
+// watch next to the chat and take over (to log in, say). The bridge starts it
+// and says where it is; playwright-cli drives it. Both come in the browser
+// bundle the image pins, which the bridge installs on the first command.
+import { spawn } from 'node:child_process';
+import { createConnection } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+const usage = `Usage: codeflower-browser COMMAND [ARGS...]
+
+Drives this chat's browser, a Chromium in the sandbox. The user can watch it
+in a tab next to the chat and take it over. Each chat has its own browser and
+profile, so logins stay for the chat.
+
+  open [URL]          start the browser (and go to URL); prints the page
+  status              what the browser shows, and whether the user has it
+  install [--from F]  install the browser (the first command does it anyway,
+                      once per project); --from installs an archive the user
+                      put in the sandbox, for a sandbox without the internet
+  handoff "REASON"    ask the user to take over, e.g. to log in or solve a
+                      captcha; then end your turn: you get a message when
+                      they hand it back
+  close               stop the browser (logins stay for the next open)
+
+Every other command is playwright-cli's, run in this chat's browser:
+  goto URL, snapshot, click REF, fill REF TEXT, type TEXT, press KEY,
+  select REF VALUE, hover REF, screenshot [--filename=F], tab-list,
+  tab-select N, go-back, reload, console, requests, eval JS, ...
+Run "codeflower-browser --help COMMAND" for one command's options.
+Refs (e12) come from the latest snapshot and change when the page does.`;
+
+// What playwright-cli does that is this command's, or not for this browser.
+const OWN = new Set(['open', 'status', 'handoff', 'close', 'install']);
+const REFUSED = new Set(['attach', 'detach', 'close-all', 'kill-all', 'install', 'install-browser', 'show']);
+const NOT_ATTACHED = /is not open, please run open first|is not attached|Session .* not found/i;
+
+const args = process.argv.slice(2);
+if (!args.length || args[0] === '-h' || (args[0] === '--help' && args.length === 1)) {
+  console.log(usage);
+  process.exit(args.length ? 0 : 2);
+}
+
+const socketPath = process.env.CODEFLOWER_BROWSER_SOCKET;
+if (!socketPath) {
+  console.error('codeflower-browser only works inside a code flower worker.');
+  process.exit(1);
+}
+// playwright-cli: the bundle's, as the bridge says (a command of its own in tests).
+const cliOverride = process.env.CODEFLOWER_PLAYWRIGHT_CLI;
+let cliScript;
+
+const fail = (message, code = 1) => {
+  console.error(message);
+  process.exit(code);
+};
+
+// One request to the bridge: { action, agent, sessionId, ... } → its answer.
+function ask(action, extra = {}) {
+  return new Promise((resolve) => {
+    const socket = createConnection(socketPath);
+    let reply = '';
+    socket.setEncoding('utf8');
+    socket.on('connect', () => {
+      socket.write(
+        `${JSON.stringify({
+          action,
+          agent: process.env.CODEFLOWER_AGENT_NAME,
+          // What the agents export to their commands: the chat's session id.
+          sessionId: process.env.CLAUDE_CODE_SESSION_ID || process.env.CODEX_THREAD_ID || undefined,
+          ...extra
+        })}\n`
+      );
+    });
+    socket.on('data', (chunk) => (reply += chunk));
+    socket.on('error', (error) => fail(`Could not reach the code flower worker: ${error.message}`));
+    socket.on('end', () => {
+      let result;
+      try {
+        result = JSON.parse(reply);
+      } catch {
+        fail('The code flower worker sent no answer.');
+      }
+      if (result.error) fail(result.error);
+      resolve(result);
+    });
+  });
+}
+
+// playwright-cli in the chat's session; its output is printed unless `quiet`.
+function run(session, cliArgs, { quiet = false } = {}) {
+  return new Promise((resolve) => {
+    const noProxy = [process.env.NO_PROXY || process.env.no_proxy, '127.0.0.1', 'localhost'].filter(Boolean).join(',');
+    const [command, ...prefix] = cliOverride ? [cliOverride] : cliScript ? [process.execPath, cliScript] : ['playwright-cli'];
+    const child = spawn(command, [...prefix, ...cliArgs], {
+      env: {
+        ...process.env,
+        PLAYWRIGHT_CLI_SESSION: session,
+        // Its snapshots and logs stay out of the workspace; files the agent
+        // names (--filename) go where it says.
+        PLAYWRIGHT_MCP_OUTPUT_DIR: process.env.PLAYWRIGHT_MCP_OUTPUT_DIR || join(tmpdir(), 'codeflower-browser', session),
+        // Its daemon's files too: agents that sandbox their commands (dsh) may write only the
+        // workspace and the temp folder, not $HOME/.cache.
+        XDG_CACHE_HOME: join(tmpdir(), 'codeflower-browser', 'cache'),
+        NO_UPDATE_NOTIFIER: '1',
+        NO_PROXY: noProxy,
+        no_proxy: noProxy
+      },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    let output = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => (output += chunk));
+    child.stderr.on('data', (chunk) => (output += chunk));
+    child.on('error', (error) => resolve({ code: 127, output: `Could not run playwright-cli: ${error.message}\n` }));
+    child.on('close', (code) => {
+      if (!quiet) process.stdout.write(output);
+      resolve({ code: code ?? 1, output });
+    });
+  });
+}
+
+const describe = (browser) => {
+  if (!browser.running) return 'The browser is not running: codeflower-browser open [URL] starts it.';
+  const lines = [`Page: ${browser.title || '(no title)'} — ${browser.url || 'about:blank'}`];
+  if (browser.tabs?.length > 1) lines.push(`Tabs: ${browser.tabs.length} (codeflower-browser tab-list)`);
+  if (browser.handoff) lines.push(`Handed to the user: ${browser.handoff.reason}. Wait for their message.`);
+  else if (browser.controlled) lines.push('The user controls it now. Wait for them to hand it back.');
+  return lines.join('\n');
+};
+
+const [command, ...rest] = args;
+
+// The browser bundle, installed if it is not (its download, or an archive the user put in the sandbox).
+if (command === 'install') {
+  const fromIndex = rest.indexOf('--from');
+  const from = fromIndex >= 0 ? rest[fromIndex + 1] : undefined;
+  if (fromIndex >= 0 && !from) fail('--from needs the archive, e.g. codeflower-browser install --from codeflower-browser-….tar.gz', 2);
+  await ask('install', { ...(from ? { from, cwd: process.cwd() } : {}) });
+  console.log("The browser is installed for this project.");
+  process.exit(0);
+}
+// One command's options: playwright-cli's own help, no browser started.
+if (command === '--help') {
+  cliScript = (await ask('install')).cli;
+  const { code } = await run('help', args);
+  process.exit(code);
+}
+if (command === 'status') {
+  const { browser } = await ask('status');
+  console.log(describe(browser));
+  process.exit(0);
+}
+if (command === 'close') {
+  await ask('close');
+  console.log("Closed this chat's browser. Its logins stay for the next open.");
+  process.exit(0);
+}
+if (command === 'handoff') {
+  const reason = rest.join(' ').trim();
+  if (!reason) fail('Say what the user should do, e.g. codeflower-browser handoff "Log in to the LIMS"', 2);
+  const { windows } = await ask('handoff', { reason });
+  console.log(`Handed the browser to the user: ${reason}`);
+  if (!windows) console.log('No window is open on this sandbox now; the user sees the request when they open it.');
+  console.log('End your turn now. When the user hands the browser back you get a message; then take a snapshot.');
+  process.exit(0);
+}
+if (REFUSED.has(command)) fail(`codeflower-browser runs ${command} itself: use open, close or status.`, 2);
+if (args.some((arg) => /^(-s|--session)(=|$)/.test(arg))) fail('Each chat has its own browser session: leave out -s/--session.', 2);
+
+// Everything else runs in the chat's browser, attached first when needed.
+const opened = await ask('open');
+cliScript = opened.cli;
+const session = `cf-${opened.key}`;
+const attach = async () => {
+  const attached = await run(session, ['attach', `--cdp=${opened.cdp}`], { quiet: command !== 'open' });
+  if (attached.code !== 0) {
+    if (command !== 'open') process.stdout.write(attached.output);
+    process.exit(attached.code);
+  }
+};
+if (!opened.attached) await attach();
+
+if (command === 'open') {
+  const url = rest.find((arg) => !arg.startsWith('-'));
+  if (url) process.exit((await run(session, ['goto', url])).code);
+  if (opened.attached) process.exit((await run(session, ['snapshot'])).code);
+  process.exit(0);
+}
+
+let result = await run(session, args, { quiet: true });
+// The CLI's session ended (its daemon stopped) while the browser runs: attach again.
+if (result.code !== 0 && NOT_ATTACHED.test(result.output)) {
+  await attach();
+  result = await run(session, args, { quiet: true });
+}
+process.stdout.write(result.output);
+process.exit(result.code);

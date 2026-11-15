@@ -1,0 +1,9 @@
+{
+  "name": "codeflower-browser-bundle",
+  "private": true,
+  "description": "playwright-cli for codeflower-browser: packed with Chrome's headless shell into the browser bundle (build.mjs), not into the image",
+  "dependencies": {
+    "@playwright/cli": "0.1.23"
+  },
+  "license": "MIT"
+}

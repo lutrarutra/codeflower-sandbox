@@ -63,6 +63,12 @@ exceed what the job may use. The startup snapshot is also at
 `codeflower-env-export` records installed environments, and
 `codeflower-network` checks the isolated network's allowlist and hosts.
 
+`codeflower-browser` drives this chat's browser, a Chromium in the sandbox that the user can
+watch next to the chat and take over: use it to check web apps you serve on 127.0.0.1 and pages
+that need a real browser, and follow the codeflower-browser skill. When a page needs a password,
+2FA or a captcha, hand the browser to the user with `codeflower-browser handoff "what to do"` and
+end your turn; never ask for credentials in the chat.
+
 MCP servers come only from the code flower config on the user's computer
 (`mcp_servers:` in `~/.codeflower/config.yaml`), and apply when the sandbox
 restarts. You cannot add one yourself. When the user wants to connect one, or

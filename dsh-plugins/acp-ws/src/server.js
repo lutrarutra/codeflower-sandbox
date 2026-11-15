@@ -3,11 +3,13 @@ import { createServer as createTlsServer } from 'node:https';
 import { X509Certificate, createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { WebSocket, WebSocketServer } from 'ws';
 import { createActivity, scopedActivity, unscope } from './activity.js';
+import { createBrowsers } from './browser/index.js';
+import { MANIFEST as BROWSER_MANIFEST, createBundle, readManifest } from './browser/bundle.js';
 import { createChatTerminals, terminalSize } from './chat-terminals.js';
 import { createCommands, standardCommandEvents, startCommandOutputServer } from './commands.js';
 import { hookSettings, tailTranscript, transcriptPath } from './agents/claude/mirror.js';
@@ -496,6 +498,11 @@ export async function startBridge(options) {
     // (codeflower-cmd), for agents whose index.js asks for it (`commands.env`).
     commandsSocket = join(tmpdir(), `codeflower-commands-${instanceId}.sock`),
     commandsWrapper = '/opt/codeflower/bin/codeflower-cmd',
+    // `codeflower-browser` reaches the bridge here, for its chat's browser.
+    browserSocket = join(tmpdir(), `codeflower-browser-${instanceId}.sock`),
+    // Chromium from the image's browser bundle, installed on first use; a binary of its own instead in development and tests.
+    browserBinary = workerEnvironment.CODEFLOWER_BROWSER_BIN || undefined,
+    browserManifest = BROWSER_MANIFEST,
     // The project state: only its workspace may be shown or read.
     privateDirectory = sessionsDirectory ? dirname(sessionsDirectory) : undefined,
     // Read-write mounts (/data/output/NAME, /data/code/NAME), where reports may also take comments.
@@ -530,7 +537,20 @@ export async function startBridge(options) {
     throw new Error('CODEFLOWER_PORT must be an integer between 0 and 65535');
   }
 
-  const environment = { ...workerEnvironment, CODEFLOWER_SHOW_SOCKET: showSocket };
+  // The chats' browsers keep their profiles, and the browser bundle, in the project state.
+  const browserDirectory = privateDirectory ? join(privateDirectory, 'browser') : join(tmpdir(), `codeflower-browser-${instanceId}`);
+  const browserManifestRead = browserBinary ? undefined : await readManifest(browserManifest);
+  const browserBundle = browserManifestRead
+    ? createBundle({ manifest: browserManifestRead, directory: join(browserDirectory, 'bundles'), log })
+    : undefined;
+  const browserExecutable = browserBinary ?? browserBundle?.binary;
+  const environment = {
+    ...workerEnvironment,
+    CODEFLOWER_SHOW_SOCKET: showSocket,
+    CODEFLOWER_BROWSER_SOCKET: browserSocket,
+    // Where the browser's Chromium is (once installed), for the agent's own Playwright too (executablePath).
+    ...(browserExecutable ? { CODEFLOWER_BROWSER_BIN: browserExecutable } : {})
+  };
   const fileOptions = { workspace, privateDirectory, writableFolders };
   const uploads = createUploads({ workspace, fileOptions, maxBytes: uploadMaxBytes, log });
   const downloads = createDownloads({ fileOptions, log });
@@ -582,6 +602,24 @@ export async function startBridge(options) {
     const keyed = ({ sessionId, ...chat }) => ({ key: sessionKey(...unscope(sessionId)), ...chat });
     return { chats: chats.map(keyed), working, waiting, ended: ended.map(keyed), turns };
   }
+
+  // The chats' browsers (browser/): each window hears what each shows and
+  // whether it controls it; frames go only to the windows that watch.
+  const browsers = createBrowsers({
+    binary: browserBinary,
+    bundle: browserBundle,
+    directory: browserDirectory,
+    environment: agentEnvironment(environment),
+    log,
+    onChange: (key) => {
+      // On each window's own connection (not again on its agents').
+      for (const target of clients) {
+        if (target.agentName !== undefined) continue;
+        target.send({ jsonrpc: '2.0', method: '_codeflower/browser/changed', params: { browser: browsers.describe(key, target) } });
+      }
+    },
+    onFrame: (target, frame) => target.send({ jsonrpc: '2.0', method: '_codeflower/browser/frame', params: frame })
+  });
 
   // The agents, by name (createRuntime), and the one a chat's key is of.
   const runtimes = new Map();
@@ -3024,6 +3062,8 @@ export async function startBridge(options) {
             commands.clear(loaded);
           }
           await deleteSession(directory, key);
+          // Its browser, with the logins in its profile, goes with it.
+          await browsers.remove(key);
           respond({});
           break;
         }
@@ -3313,6 +3353,22 @@ export async function startBridge(options) {
       // The chats with a turn running or a request waiting, for a wrap-up.
       wrapUpCandidates: () => (agentHost ? [...new Set(activity.snapshot().chats.map((chat) => chat.sessionId))] : []),
       wrapUp: (sessionId, notice, template) => (agentHost ? wrapUpChat(agentHost, sessionId, notice, template) : Promise.resolve()),
+      // The agent handed the chat's browser to the user (codeflower-browser
+      // handoff): the chat waits for them.
+      browserHandoff: (sessionId) => activity.handoff(`browser:${sessionId}`, sessionId),
+      // The user handed it back: the chat hears so as its next prompt.
+      browserHandBack(sessionId, note) {
+        activity.answered(`browser:${sessionId}`);
+        const said = typeof note === 'string' && note.trim() ? `: "${note.trim().slice(0, 1000)}"` : '.';
+        const text = `The user handed the browser back${said} Take a snapshot to see where it is now, then go on.`;
+        try {
+          promptQueue.add(sessionId, { prompt: [{ type: 'text', text }], text, title: 'Browser handed back' });
+        } catch (error) {
+          log(`Could not tell ${sessionKey(agentName, sessionId)} the browser is back: ${error.message}`);
+          return;
+        }
+        drainQueue(sessionId);
+      },
       fromHook,
       startInitialSession,
       async close() {
@@ -3389,6 +3445,7 @@ export async function startBridge(options) {
       self.terminals.clear();
       // The chats' terminals keep running without it, and so do the agents' commands.
       chatTerminals.detachClient(self);
+      browsers.detachViewer(self);
       for (const each of runtimes.values()) each.commands.detachClient(self);
       void uploads.release(self);
       void downloads.release(self);
@@ -3458,6 +3515,11 @@ export async function startBridge(options) {
 
   // What is the worker's is answered here; the rest goes to the agent of the
   // window, of the chat's key, or named by `agent`.
+  const browserKey = (params) => {
+    if (typeof params.key !== 'string') throw new InvalidRequest('Name the chat whose browser this is for (key)');
+    return params.key;
+  };
+
   const handleControl = async (self, message) => {
     const params = protocolObject(message.params) ? message.params : {};
     const respond = (result) => self.send({ jsonrpc: '2.0', id: message.id, result });
@@ -3592,6 +3654,55 @@ export async function startBridge(options) {
         case '_codeflower/reports/comments':
           respond(await saveReportComments(params.path, params.comments, fileOptions));
           break;
+        // ---- the chats' browsers (browser/): watch, take over, hand back ----
+        case '_codeflower/browser/list':
+          respond({
+            available: await browsers.available(),
+            bundle: await browsers.bundleStatus(),
+            browsers: browsers.keys().map((key) => browsers.describe(key, self))
+          });
+          break;
+        case '_codeflower/browser/watch':
+          await browsers.watch(browserKey(params), self, params);
+          respond({ browser: browsers.describe(params.key, self) });
+          break;
+        case '_codeflower/browser/unwatch':
+          await browsers.unwatch(browserKey(params), self);
+          respond({});
+          break;
+        case '_codeflower/browser/ack':
+          browsers.ack(browserKey(params), self, params.frameId);
+          respond({});
+          break;
+        case '_codeflower/browser/control':
+          browsers.control(browserKey(params), self, params.take === true);
+          respond({ browser: browsers.describe(params.key, self) });
+          break;
+        case '_codeflower/browser/input':
+          browsers.controlling(browserKey(params), self).input(params.events);
+          respond({});
+          break;
+        case '_codeflower/browser/navigate':
+          await browsers.controlling(browserKey(params), self).navigate(params.action, params.url);
+          respond({});
+          break;
+        case '_codeflower/browser/dialog':
+          await browsers.controlling(browserKey(params), self).answerDialog(params.accept, params.promptText);
+          respond({});
+          break;
+        // Which tab the view shows, for every window.
+        case '_codeflower/browser/selectTab':
+          await browsers.browserOf(browserKey(params)).selectTab(params.targetId);
+          respond({});
+          break;
+        // The user is done in the browser: the agent gets it back, and a
+        // message if it handed it over.
+        case '_codeflower/browser/handBack': {
+          const chat = browsers.handBack(browserKey(params));
+          if (chat) runtimes.get(chat.agent)?.browserHandBack(chat.sessionId, typeof params.note === 'string' ? params.note : undefined);
+          respond({});
+          break;
+        }
         default: {
           if (message.method === '_codeflower/terminal/start' && params.kind === 'shell') {
             respond(startShellTerminal(params, self));
@@ -3702,6 +3813,63 @@ export async function startBridge(options) {
     log(`codeflower-show is unavailable: ${error.message}`);
   }
 
+  // codeflower-browser: the chat it runs in gets its browser, which the user
+  // may take over. The chat is the one its agent says the command runs for
+  // (the session id agents export to their commands), else the only one
+  // whose turn runs.
+  const browserChat = (agent, sessionId) => {
+    const runtime = typeof agent === 'string' ? runtimes.get(agent) : undefined;
+    if (runtime && typeof sessionId === 'string' && runtime.host?.sessions.has(sessionId)) {
+      return { agent, sessionId, key: sessionKey(agent, sessionId) };
+    }
+    // A chat waiting for the user (e.g. a handoff) may still be in its turn.
+    const working = activity
+      .snapshot()
+      .chats.filter((chat) => chat.turn)
+      .map((chat) => unscope(chat.sessionId))
+      .filter(([name]) => !runtime || name === agent);
+    if (working.length === 1) {
+      const [name, id] = working[0];
+      return { agent: name, sessionId: id, key: sessionKey(name, id) };
+    }
+    throw new InvalidRequest(
+      working.length ? 'Several chats are working, so it is unclear whose browser this is' : "No chat is working: run codeflower-browser in a chat's turn"
+    );
+  };
+  const USER_HAS_IT = "The user controls this chat's browser now. Wait: you get a message when they hand it back.";
+  let browserServer;
+  try {
+    browserServer = await startShowServer(browserSocket, async (request) => {
+      const chat = browserChat(request?.agent, request?.sessionId);
+      switch (request.action) {
+        case 'open':
+          if (browsers.controlled(chat.key)) return { error: USER_HAS_IT };
+          return { key: chat.key, ...(await browsers.open(chat)), ...(browsers.cli ? { cli: browsers.cli } : {}) };
+        // The browser bundle, pinned by the image: downloaded, or from an archive in the sandbox (`from`).
+        case 'install': {
+          const from = typeof request.from === 'string' && request.from ? resolve(typeof request.cwd === 'string' ? request.cwd : workspace, request.from) : undefined;
+          await browsers.install({ from });
+          return { key: chat.key, installed: true, ...(browsers.cli ? { cli: browsers.cli } : {}) };
+        }
+        case 'status':
+          return { key: chat.key, browser: browsers.describe(chat.key) };
+        case 'handoff': {
+          await browsers.open(chat);
+          browsers.handoff(chat.key, request.reason);
+          runtimes.get(chat.agent)?.browserHandoff(chat.sessionId);
+          return { key: chat.key, handoff: true, windows: [...clients].filter((target) => target.agentName === undefined).length };
+        }
+        case 'close':
+          await browsers.stop(chat.key);
+          return { key: chat.key, closed: true };
+        default:
+          return { error: 'Unknown request' };
+      }
+    });
+  } catch (error) {
+    log(`codeflower-browser is unavailable: ${error.message}`);
+  }
+
   // The output of commands that agents run through codeflower-cmd. A run
   // that starts before its tool call reached the bridge waits for it a little.
   if ([...runtimes.values()].some((runtime) => runtime.agent.commands?.env)) {
@@ -3788,6 +3956,8 @@ export async function startBridge(options) {
       await new Promise((resolve) => server.close(resolve));
       sockets.close();
       await showServer?.close();
+      await browserServer?.close();
+      await browsers.closeAll();
       await hookServer?.close();
       await commandsServer?.close();
       await uploads.close();

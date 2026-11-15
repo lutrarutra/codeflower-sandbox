@@ -1,0 +1,29 @@
+{
+  "version": "0.1.23-157.0.8103.15",
+  "chromium": "157.0.8103.15",
+  "playwrightCli": "0.1.23",
+  "binary": "chromium/chrome-headless-shell",
+  "cli": "cli/node_modules/@playwright/cli/playwright-cli.js",
+  "files": {
+    "x64": {
+      "url": "https://github.com/lutrarutra/codeflower-sandbox/releases/download/browser-0.1.23-157.0.8103.15/codeflower-browser-0.1.23-157.0.8103.15-linux-x64.tar.gz",
+      "sha256": "14becc5e1298d92173c373a08f9c01008e1664fd0eefc50d35de573ef48ac7ff",
+      "size": 119595024
+    },
+    "arm64": {
+      "url": "https://github.com/lutrarutra/codeflower-sandbox/releases/download/browser-0.1.23-157.0.8103.15/codeflower-browser-0.1.23-157.0.8103.15-linux-arm64.tar.gz",
+      "sha256": "fd843ab9fc949d485ac53bb01b7510d8098428b72ed23f441d3dc664a2345e30",
+      "size": 121040822
+    }
+  },
+  "sources": {
+    "x64": {
+      "url": "https://cdn.playwright.dev/builds/cft/157.0.8103.15/linux64/chrome-headless-shell-linux64.zip",
+      "sha256": "563526b19c119adaad4fbc603395a905d6dd637541dd8ed70635b18ac1bb8a53"
+    },
+    "arm64": {
+      "url": "https://cdn.playwright.dev/builds/cft/157.0.8103.15/linux-arm64/chrome-headless-shell-linux-arm64.zip",
+      "sha256": "50534c3b82ad736134ff7a02ea5ce238616745759de334209f874c92bf201423"
+    }
+  }
+}

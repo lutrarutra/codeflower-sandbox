@@ -157,6 +157,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice-impress-nogui \
     && rm -rf /var/lib/apt/lists/*
 
+# Each chat's browser (codeflower-browser): Chrome's headless shell and
+# playwright-cli come in the browser bundle (browser/bundle.json pins it), which
+# the bridge installs into the project on first use; the image has only what
+# Chrome needs from the system and cannot be installed without root. Chrome
+# links libgbm but renders without a GPU (SwiftShader, WebGL included), so only
+# libgbm.so.1 is taken from its package: the package would bring Mesa and LLVM
+# (about 190 MB) that Chrome never loads here.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libasound2t64 \
+    libatk-bridge2.0-0t64 \
+    libatk1.0-0t64 \
+    libatspi2.0-0t64 \
+    libdrm2 \
+    libwayland-server0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxkbcommon0 \
+    libxrandr2 \
+    && cd /tmp && apt-get download libgbm1 \
+    && dpkg-deb -x libgbm1_*.deb gbm \
+    && cp -a gbm/usr/lib/*/libgbm.so.1* /usr/local/lib/ \
+    && ldconfig \
+    && rm -rf gbm libgbm1_*.deb /var/lib/apt/lists/*
+
 COPY --from=ghcr.io/astral-sh/uv:0.13.6@sha256:af22a52f5eafef3d78e551599d405c02df61919d18028f0cea8eda93bc9986d0 /uv /uvx /usr/local/bin/
 COPY --from=dsh-runtime /usr/local/bin/node /usr/local/bin/node
 COPY --from=dsh-runtime /opt/codeflower/runtime /opt/codeflower/runtime
@@ -176,6 +201,7 @@ COPY profile.d/codeflower.sh /etc/profile.d/codeflower.sh
 COPY bin /opt/codeflower/bin
 COPY templates /opt/codeflower/templates
 COPY skills /opt/codeflower/skills
+COPY browser/bundle.json /opt/codeflower/browser/bundle.json
 # Licenses of what the image includes without them (OpenCode's npm builds).
 COPY licenses /opt/codeflower/licenses
 # Reports dsh's token counts to the bridge (agents.js adds it with --patch).
