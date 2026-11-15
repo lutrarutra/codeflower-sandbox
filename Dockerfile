@@ -83,7 +83,9 @@ WORKDIR /opt/codeflower
 
 # The system layer first: it changes least, so new releases mostly reuse it.
 # libglib2.0-0, libsm6, libxext6 and libxrender1 are for pip wheels that expect
-# them (e.g. opencv-python).
+# them (e.g. opencv-python). The command-line tools after them are ones agents
+# and the user's shells expect and cannot install without root (about 45 MB);
+# ping, dig and nc show why a host is out of reach under network isolation.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     bzip2 \
@@ -100,6 +102,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-client \
     procps \
     ripgrep \
+    bc \
+    dnsutils \
+    file \
+    htop \
+    iputils-ping \
+    jq \
+    less \
+    lsof \
+    nano \
+    ncdu \
+    netcat-openbsd \
+    parallel \
+    pigz \
+    rsync \
+    sqlite3 \
+    strace \
+    time \
+    tmux \
+    tree \
+    vim-tiny \
+    wget \
+    xxd \
     && rm -rf /var/lib/apt/lists/* \
     && arch=$(uname -m) \
     && case "$arch" in \
@@ -114,14 +138,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm /tmp/miniforge.sh /opt/conda/micromamba \
     && /opt/conda/bin/python -c 'import sys; assert sys.version_info[:2] == (3, 14), sys.version' \
     && /opt/conda/bin/conda clean --all --force-pkgs-dirs --yes \
-    && ln -s /opt/conda/etc/profile.d/conda.sh /etc/profile.d/conda.sh
+    && ln -s /opt/conda/etc/profile.d/conda.sh /etc/profile.d/conda.sh \
+    && ln -s /usr/bin/vim.tiny /usr/local/bin/vim
 
 # R from Debian, with the headers the most common source builds need (CRAN
 # packages without a binary, Bioconductor, GitHub). The image's R packages go to
 # the site library, from a dated Package Manager snapshot; the agent's go to the
 # project's (R_LIBS_USER). ggplot2 and the devices for publication figures,
 # pak for installs from CRAN, GitHub and Bioconductor, renv for pinned project
-# environments, BiocManager for Bioconductor's own installer.
+# environments, BiocManager for Bioconductor's own installer. The libraries
+# after r-recommended are ones common packages link, which the agent cannot
+# install without root even for Package Manager's binaries: HDF5 (hdf5r, for
+# Seurat and .h5 files), GLPK (igraph), GSL, cairo (Cairo), udunits (units),
+# SQLite and PostgreSQL clients.
 ARG R_PACKAGES_DATE=2026-11-02
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
@@ -140,6 +169,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     r-base-core \
     r-base-dev \
     r-recommended \
+    libcairo2-dev \
+    libglpk-dev \
+    libgsl-dev \
+    libhdf5-dev \
+    libpq-dev \
+    libsqlite3-dev \
+    libudunits2-dev \
     zlib1g-dev \
     && rm -rf /var/lib/apt/lists/* \
     && Rscript -e 'pkgs <- c("ggplot2", "ragg", "svglite", "patchwork", "pak", "renv", "BiocManager", "remotes")' \
