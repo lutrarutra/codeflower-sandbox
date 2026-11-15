@@ -924,6 +924,50 @@ test('shows the files the agent asks for and lets the client read them', async (
   await closeSocket(socket);
 });
 
+test('shows files in the window that has the chat they come from, which notes them there', async (t) => {
+  const workspaceDirectory = await mkdtemp(join(tmpdir(), 'codeflower-workspace-'));
+  t.after(() => rm(workspaceDirectory, { recursive: true, force: true }));
+  const showSocket = join(workspaceDirectory, 'show.sock');
+  const { bridge } = await startTestBridge(t, { workspace: workspaceDirectory, showSocket });
+  const showCommand = fileURLToPath(new URL('../../../bin/codeflower-show', import.meta.url));
+  // As an agent's command runs: Claude Code exports the session id to it.
+  const showFrom = (sessionId) =>
+    new Promise((resolve) => {
+      const env = { ...process.env, CODEFLOWER_SHOW_SOCKET: showSocket, CODEFLOWER_AGENT_NAME: 'claude', CLAUDE_CODE_SESSION_ID: sessionId };
+      delete env.CODEX_THREAD_ID;
+      execFile(process.execPath, [showCommand, 'report.md'], { cwd: workspaceDirectory, env }, (error, stdout, stderr) =>
+        resolve({ code: error?.code ?? 0, stdout, stderr })
+      );
+    });
+  await writeFile(join(workspaceDirectory, 'report.md'), '# Report');
+  const showsIn = (socket) => inboxes.get(socket).messages.filter((message) => message.method === '_codeflower/show');
+
+  const first = await openSocket(bridge.address);
+  t.after(() => closeSocket(first));
+  await initialize(first);
+  const a = (await call(first, 'session/new', { cwd: workspaceDirectory, mcpServers: [] })).result.sessionId;
+  // The newest window, with another chat: it used to get every show.
+  const second = await openSocket(bridge.address);
+  t.after(() => closeSocket(second));
+  await initialize(second);
+  const b = (await call(second, 'session/new', { cwd: workspaceDirectory, mcpServers: [] })).result.sessionId;
+
+  assert.equal((await showFrom(a)).code, 0);
+  const forA = await receive(first, (message) => message.method === '_codeflower/show');
+  assert.equal(forA.params.sessionId, a);
+  assert.ok(forA.params.files[0].path.endsWith('/report.md'));
+  assert.equal((await showFrom(b)).code, 0);
+  assert.equal((await receive(second, (message) => message.method === '_codeflower/show')).params.sessionId, b);
+
+  // A chat the bridge does not know, and no turn working: the newest window
+  // picks the chat itself.
+  assert.equal((await showFrom('unknown-session')).code, 0);
+  const unnamed = await receive(second, (message) => message.method === '_codeflower/show');
+  assert.equal(unnamed.params.sessionId, undefined);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.deepEqual(showsIn(first), []);
+});
+
 test('takes files attached to messages in chunks, into the workspace uploads folder only', async (t) => {
   const workspaceDirectory = await mkdtemp(join(tmpdir(), 'codeflower-workspace-'));
   t.after(() => rm(workspaceDirectory, { recursive: true, force: true }));

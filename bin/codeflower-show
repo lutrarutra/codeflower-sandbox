@@ -67,7 +67,19 @@ const socket = createConnection(socketPath);
 let reply = '';
 socket.setEncoding('utf8');
 socket.on('connect', () => {
-  socket.write(`${JSON.stringify({ paths, cwd: process.cwd(), title, message, ...(linkOnly ? { linkOnly: true } : {}) })}\n`);
+  socket.write(
+    `${JSON.stringify({
+      paths,
+      cwd: process.cwd(),
+      title,
+      message,
+      // The chat the files are for, so they are noted in it and not in the
+      // one the user looks at: the agent, and the session id it exports to its commands.
+      agent: process.env.CODEFLOWER_AGENT_NAME,
+      sessionId: process.env.CLAUDE_CODE_SESSION_ID || process.env.CODEX_THREAD_ID || undefined,
+      ...(linkOnly ? { linkOnly: true } : {})
+    })}\n`
+  );
 });
 socket.on('data', (chunk) => (reply += chunk));
 socket.on('error', (error) => {

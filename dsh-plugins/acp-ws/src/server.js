@@ -903,17 +903,35 @@ export async function startBridge(options) {
     latestLinkBase = linkBase;
   };
 
-  // The chat a show is for: the only one with a turn working (the agent calls
-  // codeflower-show in a turn), if exactly one is.
-  const showingChat = () => {
-    const working = activity.snapshot().chats.filter((chat) => chat.state === 'working' && chat.turn);
-    return working.length === 1 ? sessionKey(...unscope(working[0].sessionId)) : undefined;
+  // The chat a show is for: the one its agent says codeflower-show runs for
+  // (the session id agents export to their commands), else the only one with a
+  // turn working (the agent calls codeflower-show in a turn), if exactly one is.
+  const showingChat = (agent, sessionId) => {
+    const runtime = typeof agent === 'string' ? runtimes.get(agent) : undefined;
+    if (runtime && typeof sessionId === 'string' && runtime.host?.sessions.has(sessionId)) {
+      return { agent, sessionId, key: sessionKey(agent, sessionId) };
+    }
+    const working = activity
+      .snapshot()
+      .chats.filter((chat) => chat.state === 'working' && chat.turn)
+      .map((chat) => unscope(chat.sessionId))
+      .filter(([name]) => !runtime || name === agent);
+    if (working.length !== 1) return undefined;
+    const [name, id] = working[0];
+    return { agent: name, sessionId: id, key: sessionKey(name, id) };
+  };
+
+  // The window to show a chat's files in: the one that sent its latest prompt,
+  // else the newest that has it open.
+  const chatWindow = ({ agent, sessionId }) => {
+    const opened = (target) => target.agentName === agent && target.sessions.has(sessionId);
+    const prompter = runtimes.get(agent)?.host?.prompters.get(sessionId);
+    return clients.has(prompter) && opened(prompter) ? prompter : [...clients].reverse().find(opened);
   };
 
   // Links that open the files in the user's browser, none without a base.
   // They hold no secret: the agent sees them in its tool's output.
-  const fileLinks = (files) => {
-    const chat = showingChat();
+  const fileLinks = (files, chat) => {
     const base = (chat && chatTerminals.byKey(chat)?.linkBase) || latestLinkBase;
     if (!base) return [];
     const query = chat ? `?chat=${encodeURIComponent(chat)}` : '';
@@ -1207,7 +1225,9 @@ export async function startBridge(options) {
           ...startedSubagentEnv,
           ...pluginEnvironment,
           ...(usageFd ? { CODEFLOWER_USAGE_FD: String(usageFd) } : {}),
-          ...commandsEnvironment()
+          ...commandsEnvironment(),
+          // Which agent its commands run for (codeflower-browser finds its chat with it).
+          CODEFLOWER_AGENT_NAME: agentName
         }),
         stdio: usageFd ? ['pipe', 'pipe', 'inherit', ...Array(usageFd - 3).fill('ignore'), 'pipe'] : ['pipe', 'pipe', 'inherit']
       });
@@ -3653,7 +3673,8 @@ export async function startBridge(options) {
       // Links for the user's browser, from a terminal attached here
       // (`codeflower attach`): the agent's tool prints them, which its
       // terminal UI shows. `codeflower-open` asks for the links only.
-      const links = fileLinks(files);
+      const chat = showingChat(request.agent, request.sessionId);
+      const links = fileLinks(files, chat?.key);
       if (request.linkOnly === true) {
         if (!links.length) return { error: 'No terminal with links is attached to this worker (codeflower attach); the files are in the sandbox' };
         return { links };
@@ -3665,13 +3686,16 @@ export async function startBridge(options) {
           ...(typeof request.message === 'string' ? { message: request.message.slice(0, 2000) } : {})
         });
       }
-      // One window opens them: the one that sent the latest prompt, else the newest.
-      const target = clients.has(lastPrompter) ? lastPrompter : newestClient();
+      // One window opens them and notes them in the chat: one that has the
+      // chat open. Without one, the window that sent the latest prompt, else
+      // the newest, which picks a chat itself.
+      const owner = chat && chatWindow(chat);
+      const target = owner ?? (clients.has(lastPrompter) ? lastPrompter : newestClient());
       if (!target) {
         if (links.length) return { shown: [], links };
         return { error: 'No window is connected to this worker, so nobody can see the files now' };
       }
-      sendShow(target, files, request);
+      sendShow(target, files, { title: request.title, message: request.message, sessionId: owner ? chat.sessionId : undefined });
       return { shown: files.map((file) => file.path), ...(links.length ? { links } : {}) };
     });
   } catch (error) {
