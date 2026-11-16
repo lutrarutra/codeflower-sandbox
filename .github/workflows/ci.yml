@@ -66,9 +66,9 @@ jobs:
           filters: |
             image:
               - Dockerfile
-      - reproduce.sh
-      - lib/**
-      - python/**
+              - reproduce.sh
+              - lib/**
+              - python/**
               - entrypoint.sh
               - bin/**
               - templates/**
