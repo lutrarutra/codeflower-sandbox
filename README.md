@@ -49,7 +49,12 @@ Releases are published for linux/amd64 and linux/arm64, tagged `X.Y.Z`, `X.Y`, `
   Single-cell best practices book in `skills/`)
 - `bin/`: commands for the agent: `codeflower-show`, `codeflower-pty`, `codeflower-env-export`,
   `codeflower-network`, `codeflower-doctor` (the worker's resources and, when isolated, its
-  allowlist) and `codeflower-inventory` (describes the mounted data: formats, shapes, columns)
+  allowlist), `codeflower-inventory` (describes the mounted data: formats, shapes, columns),
+  `codeflower-repro` (reproducible pipeline archives) and `snakemake` (run with the project's Python)
+- `reproduce.sh` and `lib/`: the entrypoint `codeflower reproduce` starts instead of `entrypoint.sh`:
+  it restores a pipeline archive's environment, runs it without network and compares the results,
+  with no agent or bridge; `lib/env-setup.sh` is the environment setup both share
+- `python/snakemake.txt`: Snakemake's hash-pinned requirements (its own venv in the image)
 - `templates/`: the agent instructions copied into a new workspace, and those of `codeflower task`
   (`TASK.md`, `task/continue.md`, `task/wrap-up.md`)
 - `dsh-plugins/acp-ws/`: the bridge: ACP over WebSocket, session recording, sign-in relay

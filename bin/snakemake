@@ -1,0 +1,11 @@
+#!/bin/sh
+# Snakemake, from its own venv in the image (/opt/codeflower/snakemake), run with the project's
+# Python: a pipeline's Python steps (script:) run with the interpreter that runs Snakemake, so they
+# see the project's packages. Snakemake's own packages come last on the path, so the project's
+# versions win where both have one.
+# Snakemake asks for the user's name, which the sandbox's uid has none of (/etc/passwd).
+export USER="${USER:-${LOGNAME:-codeflower}}" LOGNAME="${LOGNAME:-${USER:-codeflower}}"
+site=${CODEFLOWER_SNAKEMAKE_SITE:-$(echo /opt/codeflower/snakemake/lib/python3*/site-packages)}
+python="${VIRTUAL_ENV:-/codeflower-state/env/venv}/bin/python"
+[ -x "$python" ] || python=/opt/codeflower/snakemake/bin/python
+exec "$python" -c 'import sys; sys.path.append(sys.argv.pop(1)); sys.argv[0] = "snakemake"; from snakemake.cli import main; sys.exit(main())' "$site" "$@"

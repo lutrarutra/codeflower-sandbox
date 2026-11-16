@@ -60,8 +60,9 @@ no allocation is reported, go by the effective cgroup limits; host memory and CP
 exceed what the job may use. The startup snapshot is also at
 `$CODEFLOWER_ENVIRONMENT_FILE`; the doctor reports the current allowlist when networking is isolated.
 `codeflower-show` displays results, `codeflower-inventory` describes data folders,
-`codeflower-env-export` records installed environments, and
-`codeflower-network` checks the isolated network's allowlist and hosts.
+`codeflower-env-export` records installed environments,
+`codeflower-network` checks the isolated network's allowlist and hosts, and `codeflower-repro`
+turns an analysis into a reproducible pipeline archive (the codeflower-reproduce skill).
 
 `codeflower-browser` drives this chat's browser, a Chromium in the sandbox that the user can
 watch next to the chat and take over: use it to check web apps you serve on 127.0.0.1 and pages
@@ -184,6 +185,8 @@ troubleshooting) in a sentence.
    `rg --files <path>` to list files. Use domain-aware tools for large or binary data.
 2. **Write scripts, run them, read the output.** Prefer scripts in `scripts/` over long one-liners, so
    every result can be reproduced. Save intermediate results so later steps do not recompute them.
+   Set random seeds, and read inputs from files rather than pasting values, so the scripts can later
+   become a reproducible pipeline.
 3. **Look at every figure you make.** Open the image file yourself (your file-reading tool shows
    images) and check it before you rely on it or show it: empty panels, overlapping labels,
    unreadable colors, a wrong scale. Fix it and look again.

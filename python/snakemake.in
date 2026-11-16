@@ -1,0 +1,6 @@
+# Snakemake for codeflower-repro: installed in its own venv (/opt/codeflower/snakemake), run with the
+# project venv's Python (bin/snakemake). Regenerate snakemake.txt with:
+#   uv pip compile --python-version 3.14 --python-platform linux --generate-hashes snakemake.in -o snakemake.txt
+# and once more with --python-platform aarch64-unknown-linux-gnu to check both resolve the same.
+snakemake==9.27.2
+pyyaml==6.0.3

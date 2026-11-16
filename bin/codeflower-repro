@@ -1,0 +1,1450 @@
+#!/opt/conda/bin/python3
+"""Reproducible pipelines: a project's analysis as a Snakemake workflow that reruns anywhere.
+
+A pipeline is a folder, by convention pipelines/NAME in the workspace:
+
+  codeflower-repro.yaml   the manifest: image, platform, workflow, determinism, resources
+  workflow/               Snakefile, config.yaml (parameters, seeds) and scripts/
+  env/                    hash-pinned lockfiles of the project's environment (freeze writes them)
+  data/                   inputs: manifest.tsv lists each with its sha256 and, unless bundled in the archive, its URL
+  expected/checksums.tsv  the results and how each is compared (freeze writes it)
+
+Paths in the workflow are relative to a work directory that holds workflow/, data/, and what the
+pipeline writes: results/ (compared), logs/ and benchmarks/. `pack` writes the archive, and
+`codeflower reproduce ARCHIVE --output DIR` on the user's computer reruns it in a new sandbox
+without any agent and compares the results with expected/checksums.tsv.
+"""
+
+import argparse
+import csv
+import glob
+import gzip
+import hashlib
+import io
+import json
+import math
+import os
+import platform
+import re
+import resource
+import shlex
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.request
+from pathlib import Path
+
+MANIFEST = "codeflower-repro.yaml"
+SCHEMA = 1
+STATE = Path("/codeflower-state")
+DATA_MANIFEST = "data/manifest.tsv"
+EXPECTED = "expected/checksums.tsv"
+SUMS = "SHA256SUMS"
+# source: where a bundled input came from, e.g. the full dataset and the script that slimmed it.
+DATA_COLUMNS = ["path", "url", "sha256", "size", "source"]
+EXPECTED_COLUMNS = ["path", "sha256", "size", "compare", "options"]
+COMPARATORS = ("exact", "text", "table", "image", "exists")
+# What a run may leave in its work directory besides workflow/ and data/.
+RUN_OUTPUTS = ("results", "logs", "benchmarks")
+# Never packed: what runs write (at the top of the pipeline), caches and version control (anywhere).
+SKIP_TOP = {"results", "logs", "benchmarks", ".snakemake", ".repro"}
+SKIP_DIRS = {"__pycache__", ".git", ".ipynb_checkpoints", ".pytest_cache", ".snakemake"}
+SMALL_DATA_BYTES = 50 * 1024 * 1024
+# A bundled input this large is worth slimming to what the pipeline reads.
+LARGE_BUNDLE_BYTES = 100 * 1024 * 1024
+TABLE_SUFFIXES = {".csv": ",", ".tsv": "\t", ".tab": "\t"}
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp"}
+# Paths that exist only in the authoring sandbox or on someone's computer.
+LOCAL_PATH = re.compile(r"(?<![\w.])(/codeflower-state\b|/data/(?:input|output|code|skills)\b|/home/\w|/Users/\w|/tmp/\w|\b[A-Z]:\\)")
+URL = re.compile(r"\b(?:https?|ftp)://", re.I)
+FRAGILE_URL = re.compile(r"dropbox\.com|drive\.google\.com|docs\.google\.com|X-Amz-Signature|onedrive\.live|1drv\.ms|sharepoint\.com", re.I)
+SCRIPT_DIRECTIVE = re.compile(r"^\s*(?:script|notebook)\s*:\s*(?:\n\s*)?(?:f)?([\"'])(.+?)\1", re.M)
+DEFAULT_DETERMINISM = {
+    "PYTHONHASHSEED": "0",
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "NUMBA_NUM_THREADS": "1",
+    "TZ": "UTC",
+    "LC_ALL": "C.UTF-8",
+}
+
+
+class Failure(Exception):
+    def __init__(self, message, status=1):
+        super().__init__(message)
+        self.status = status
+
+
+def yaml_module():
+    try:
+        import yaml
+    except ImportError:
+        # The image has PyYAML in Snakemake's venv, not in the conda base.
+        sys.path.extend(glob.glob("/opt/codeflower/snakemake/lib/python3*/site-packages"))
+        try:
+            import yaml
+        except ImportError:
+            raise Failure("PyYAML is missing: run this in a code flower sandbox")
+    return yaml
+
+
+def read_manifest(pipeline):
+    path = pipeline / MANIFEST
+    if not path.is_file():
+        raise Failure(f"{path} is missing: create the pipeline with `codeflower-repro init`")
+    try:
+        manifest = yaml_module().safe_load(path.read_text())
+    except Exception as error:
+        raise Failure(f"{path} is not valid YAML: {error}")
+    if not isinstance(manifest, dict):
+        raise Failure(f"{path} is not a mapping")
+    return manifest
+
+
+def write_manifest(pipeline, manifest):
+    text = yaml_module().safe_dump(manifest, sort_keys=False, allow_unicode=True, width=100)
+    (pipeline / MANIFEST).write_text(text)
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def read_tsv(path, columns):
+    if not path.is_file():
+        return []
+    rows = []
+    with open(path, newline="") as stream:
+        for row in csv.DictReader(stream, delimiter="\t"):
+            rows.append({column: (row.get(column) or "").strip() for column in columns})
+    return rows
+
+
+def write_tsv(path, columns, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="") as stream:
+        writer = csv.DictWriter(stream, columns, delimiter="\t", lineterminator="\n", extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def parse_options(text):
+    options = {}
+    for part in filter(None, (text or "").split(",")):
+        key, _, value = part.partition("=")
+        options[key.strip()] = float(value) if value.strip() else True
+    return options
+
+
+def format_options(options):
+    return ",".join(f"{key}={value:.3g}" if isinstance(value, float) else f"{key}={value}" for key, value in options.items())
+
+
+def data_path_problem(path):
+    parts = Path(path).parts
+    if not path.startswith("data/") or Path(path).is_absolute() or ".." in parts or len(parts) < 2:
+        return f"data path {path!r} must be relative and start with data/"
+    return None
+
+
+def snakefile_of(pipeline, manifest):
+    workflow = manifest.get("workflow") or {}
+    return pipeline / str(workflow.get("snakefile") or "workflow/Snakefile")
+
+
+def snakemake_command():
+    """Snakemake: CODEFLOWER_SNAKEMAKE (a command line) or the image's bin/snakemake."""
+    given = os.environ.get("CODEFLOWER_SNAKEMAKE")
+    if given:
+        return shlex.split(given)
+    found = shutil.which("snakemake")
+    if not found:
+        raise Failure("snakemake is not installed")
+    return [found]
+
+
+def determinism_env(manifest, cores=None):
+    env = dict(os.environ)
+    settings = dict(DEFAULT_DETERMINISM)
+    settings.update({str(k): str(v) for k, v in ((manifest.get("determinism") or {}).get("env") or {}).items()})
+    env.update(settings)
+    env.setdefault("MPLBACKEND", "Agg")
+    # Snakemake asks for the user's name; the sandbox's uid has none.
+    env.setdefault("USER", env.get("LOGNAME") or "codeflower")
+    env.setdefault("LOGNAME", env["USER"])
+    return env
+
+
+def platform_name():
+    machine = platform.machine().lower()
+    return "linux/" + {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(machine, machine)
+
+
+def output_dir_default():
+    """The single output folder the app mounted, if there is exactly one."""
+    root = Path("/data/output")
+    folders = [entry for entry in root.iterdir() if entry.is_dir()] if root.is_dir() else []
+    return folders[0] if len(folders) == 1 else None
+
+
+# --- the work directory ----------------------------------------------------------------------
+
+def build_workdir(pipeline, workdir, data_dir=None):
+    """Links workflow/ and the inputs into a new work directory. Returns the inputs not found."""
+    workdir.mkdir(parents=True, exist_ok=True)
+    workflow = workdir / "workflow"
+    if not workflow.exists():
+        workflow.symlink_to((pipeline / "workflow").resolve())
+    listed = {row["path"]: row for row in read_tsv(pipeline / DATA_MANIFEST, DATA_COLUMNS)}
+    sources = {}
+    data = pipeline / "data"
+    if data.is_dir():
+        for path in sorted(data.rglob("*")):
+            relative = path.relative_to(pipeline).as_posix()
+            if relative == DATA_MANIFEST or not path.is_file():
+                continue
+            sources[relative] = path
+    missing = []
+    for relative in listed:
+        candidates = ([Path(data_dir) / relative] if data_dir else []) + [pipeline / relative]
+        found = next((candidate for candidate in candidates if candidate.is_file()), None)
+        if found:
+            sources[relative] = found
+        else:
+            missing.append(relative)
+    for relative, source in sources.items():
+        target = workdir / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.is_symlink() or target.exists():
+            target.unlink()
+        target.symlink_to(Path(os.path.abspath(source)))
+    return missing
+
+
+def run_workflow(pipeline, manifest, workdir, cores, force=False, extra=(), capture=False, env_override=None, wrap=()):
+    """env_override: variables to set (test's own environment); wrap: a command to run it in (unshare)."""
+    workflow = manifest.get("workflow") or {}
+    engine = workflow.get("engine", "snakemake")
+    env = determinism_env(manifest)
+    env.update(env_override or {})
+    if engine == "snakemake":
+        snakefile = workdir / snakefile_of(pipeline, manifest).relative_to(pipeline)
+        command = snakemake_command() + ["--snakefile", str(snakefile), "--directory", str(workdir),
+                                         "--cores", str(cores), "--printshellcmds", "--show-failed-logs", "--nolock"]
+        if force:
+            command.append("--forceall")
+        command += list(extra)
+    elif engine == "command":
+        if extra:
+            return subprocess.run(["true"])
+        command = ["bash", "-euo", "pipefail", "-c", str(workflow.get("command") or "")]
+        env["CODEFLOWER_REPRO_CORES"] = str(cores)
+    else:
+        raise Failure(f"unknown workflow engine {engine!r}: use snakemake or command")
+    return subprocess.run(list(wrap) + command, cwd=workdir, env=env, text=True,
+                          stdout=subprocess.PIPE if capture else None, stderr=subprocess.STDOUT if capture else None)
+
+
+def stray_outputs(workdir):
+    allowed = {"workflow", "data", ".snakemake", *RUN_OUTPUTS}
+    return sorted(entry.name for entry in workdir.iterdir() if entry.name not in allowed)
+
+
+def run_once(pipeline, manifest, workdir, cores, data_dir=None, quiet=False, env_override=None, wrap=()):
+    """A clean run in workdir; returns its record (time, memory)."""
+    missing = build_workdir(pipeline, workdir, data_dir)
+    if missing:
+        raise Failure("inputs not found: " + ", ".join(missing) + " (download them with `codeflower-repro data fetch`)")
+    started = time.monotonic()
+    result = run_workflow(pipeline, manifest, workdir, cores, force=True, capture=quiet, env_override=env_override, wrap=wrap)
+    wall = time.monotonic() - started
+    if result.returncode != 0:
+        if quiet and result.stdout:
+            sys.stderr.write(result.stdout[-6000:])
+        raise Failure(f"the pipeline failed in {workdir} (exit status {result.returncode})", status=3)
+    stray = stray_outputs(workdir)
+    if stray:
+        raise Failure("the pipeline wrote outside results/, logs/ and benchmarks/: " + ", ".join(stray))
+    if not (workdir / "results").is_dir():
+        raise Failure("the pipeline wrote no results/ folder")
+    peak = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    peak_mb = peak / 1024 if sys.platform != "darwin" else peak / 1024 / 1024
+    return {"wall_seconds": round(wall, 1), "peak_rss_mb": round(peak_mb), "cores": cores}
+
+
+def result_files(root):
+    results = root / "results"
+    if not results.is_dir():
+        return []
+    return sorted(path.relative_to(root).as_posix() for path in results.rglob("*") if path.is_file())
+
+
+# --- comparing results -----------------------------------------------------------------------
+
+def read_table(path):
+    delimiter = TABLE_SUFFIXES.get(path.suffix.lower(), ",")
+    with open(path, newline="", errors="replace") as stream:
+        return list(csv.reader(stream, delimiter=delimiter))
+
+
+def as_number(text):
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def table_difference(expected, actual):
+    """(problem, largest relative difference, largest absolute difference) of two tables."""
+    a, b = read_table(expected), read_table(actual)
+    if len(a) != len(b):
+        return f"{len(b)} rows, expected {len(a)}", None, None
+    rel = abs_ = 0.0
+    for row_number, (row_a, row_b) in enumerate(zip(a, b), 1):
+        if len(row_a) != len(row_b):
+            return f"row {row_number} has {len(row_b)} columns, expected {len(row_a)}", None, None
+        for column, (cell_a, cell_b) in enumerate(zip(row_a, row_b), 1):
+            if cell_a == cell_b:
+                continue
+            x, y = as_number(cell_a), as_number(cell_b)
+            if x is None or y is None:
+                return f"row {row_number}, column {column}: {cell_b!r}, expected {cell_a!r}", None, None
+            if math.isnan(x) and math.isnan(y):
+                continue
+            if math.isinf(x) or math.isinf(y) or math.isnan(x) or math.isnan(y):
+                return f"row {row_number}, column {column}: {cell_b}, expected {cell_a}", None, None
+            difference = abs(x - y)
+            abs_ = max(abs_, difference)
+            rel = max(rel, difference / max(abs(x), abs(y)))
+    return None, rel, abs_
+
+
+def image_difference(expected, actual):
+    """(problem, largest channel difference 0-255, fraction of pixels that differ)."""
+    try:
+        from PIL import Image, ImageChops
+    except ImportError:
+        return "Pillow is missing", None, None
+    with Image.open(expected) as a, Image.open(actual) as b:
+        if a.size != b.size:
+            return f"size {b.size[0]}x{b.size[1]}, expected {a.size[0]}x{a.size[1]}", None, None
+        difference = ImageChops.difference(a.convert("RGBA"), b.convert("RGBA"))
+    largest = max(high for _, high in difference.getextrema())
+    histogram = difference.convert("L").histogram()
+    pixels = sum(histogram)
+    fraction = (pixels - histogram[0]) / pixels if pixels else 0.0
+    return None, largest, fraction
+
+
+def compare_file(entry, root, reference=None):
+    """None when the file matches, otherwise what differs. reference: the expected file, if at hand."""
+    path = root / entry["path"]
+    if not path.is_file():
+        return "missing"
+    compare = entry.get("compare") or "exact"
+    options = parse_options(entry.get("options"))
+    if compare == "exists":
+        return None
+    digest = sha256_file(path)
+    if digest == entry.get("sha256"):
+        return None
+    if compare == "exact":
+        return f"sha256 {digest[:12]}…, expected {entry.get('sha256', '')[:12]}…"
+    if reference is None:
+        return f"differs (sha256 {digest[:12]}…) and no reference file to compare with"
+    if compare == "text":
+        same = reference.read_text(errors="replace").replace("\r\n", "\n") == path.read_text(errors="replace").replace("\r\n", "\n")
+        return None if same else "text differs"
+    if compare == "table":
+        problem, rel, abs_ = table_difference(reference, path)
+        if problem:
+            return problem
+        rtol, atol = options.get("rtol", 0.0), options.get("atol", 0.0)
+        if rel <= rtol or abs_ <= atol:
+            return None
+        return f"numbers differ by up to {rel:.3g} (relative), {abs_:.3g} (absolute); allowed rtol={rtol:.3g}, atol={atol:.3g}"
+    if compare == "image":
+        problem, largest, fraction = image_difference(reference, path)
+        if problem:
+            return problem
+        if largest <= options.get("max_diff", 0) and fraction <= options.get("max_fraction", 0):
+            return None
+        return f"pixels differ by up to {largest} in {fraction:.2%} of the image"
+    return f"unknown comparison {compare!r}"
+
+
+def choose_comparator(first, second):
+    """From two clean runs of the same file: (compare, options, warning)."""
+    if sha256_file(first) == sha256_file(second):
+        return "exact", {}, None
+    suffix = first.suffix.lower()
+    if suffix in TABLE_SUFFIXES:
+        problem, rel, abs_ = table_difference(first, second)
+        if not problem:
+            if rel > 1e-3:
+                return "table", {"rtol": rel * 10}, f"numbers differ by up to {rel:.3g} between two runs: set seeds and threads"
+            return "table", {"rtol": max(rel * 10, 1e-12), "atol": max(abs_ * 10, 1e-12)}, None
+    if suffix in IMAGE_SUFFIXES:
+        problem, largest, fraction = image_difference(first, second)
+        if not problem:
+            warning = f"pixels differ between two runs ({fraction:.2%} of the image)" if fraction > 0.01 else None
+            return "image", {"max_diff": float(largest), "max_fraction": fraction * 2 + 1e-6}, warning
+    return "exists", {}, "differs between two runs, so it is only checked to exist (embedded dates or random order?)"
+
+
+# --- checks ----------------------------------------------------------------------------------
+
+def workflow_files(pipeline):
+    root = pipeline / "workflow"
+    if not root.is_dir():
+        return []
+    return sorted(path for path in root.rglob("*")
+                  if path.is_file() and not set(path.relative_to(root).parts) & SKIP_DIRS)
+
+
+def referenced_scripts(snakefiles):
+    found = {}
+    for snakefile in snakefiles:
+        for match in SCRIPT_DIRECTIVE.finditer(snakefile.read_text(errors="replace")):
+            found[(snakefile.parent / match.group(2)).resolve()] = snakefile
+    return found
+
+
+def check_locks(pipeline, environment, errors, warnings):
+    python = environment.get("python")
+    if python:
+        path = pipeline / python
+        if not path.is_file():
+            errors.append(f"{python} is missing")
+        else:
+            text = path.read_text().replace("\\\n", " ")
+            for line in text.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                words = line.split()
+                name = words[1] if words[0] in ("-e", "--editable") and len(words) > 1 else re.split(r"[=<>!~;\[ @]", words[0])[0]
+                if line.startswith("-e") or "file://" in line or name.startswith((".", "/")):
+                    errors.append(f"{python}: {name} is a local or editable install, which cannot be rebuilt")
+                elif "git+" in line and not re.search(r"@[0-9a-f]{40}", line):
+                    errors.append(f"{python}: {name} comes from git without a commit")
+                elif "--hash=" not in line:
+                    errors.append(f"{python}: {name} has no hash (run freeze)")
+    r = environment.get("r")
+    if r:
+        path = pipeline / r
+        try:
+            packages = json.loads(path.read_text()).get("Packages", {})
+        except (OSError, ValueError) as error:
+            errors.append(f"{r} cannot be read: {error}")
+            packages = {}
+        for name, record in packages.items():
+            source = record.get("Source", "")
+            if source in ("Repository", "Bioconductor"):
+                continue
+            if source in ("GitHub", "GitLab", "Bitbucket", "git") and record.get("RemoteSha"):
+                continue
+            errors.append(f"{r}: {name} has source {source or 'unknown'} and cannot be reinstalled")
+    for conda in environment.get("conda") or []:
+        path = pipeline / conda
+        if not path.is_file():
+            errors.append(f"{conda} is missing")
+            continue
+        for line in path.read_text().splitlines():
+            if line.startswith(("http", "file:")) and "#" not in line:
+                errors.append(f"{conda}: {line.rsplit('/', 1)[-1]} has no checksum")
+            if line.startswith("file:"):
+                errors.append(f"{conda}: {line.rsplit('/', 1)[-1]} is a local package")
+
+
+# Randomness, and what shows a seed was set, by language.
+PY_RANDOM = re.compile(r"\b(?:np|numpy)\.random\.(?!default_rng\(\s*\w)|\brandom\.(?:random|randint|choice|choices|sample|shuffle|uniform|gauss)\("
+                       r"|default_rng\(\s*\)|\btorch\.(?:rand|randn|randint|randperm)\b|random_state\s*=\s*None")
+PY_SEEDED = re.compile(r"seed|random_state\s*=")
+R_RANDOM = re.compile(r"\b(?:sample|rnorm|runif|rbinom|rpois|kmeans|slice_sample|sample_n|sample_frac|irlba|RunUMAP|RunTSNE)\(")
+R_SEEDED = re.compile(r"set\.seed\(|seed(?:\.use)?\s*=")
+
+
+def randomness_warnings(path, text):
+    """A script that draws random numbers without a seed it is given gives other results on every run."""
+    code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    if path.suffix == ".py":
+        if re.search(r"random_state\s*=\s*None", code):
+            return [f"{path.name}: random_state=None draws a new seed on every run; pass the seed from config.yaml"]
+        if PY_RANDOM.search(code) and not PY_SEEDED.search(code):
+            return [f"{path.name} uses randomness but sets no seed; take one from config.yaml (snakemake.params.seed)"]
+    elif path.suffix in (".R", ".r", ".Rmd"):
+        if R_RANDOM.search(code) and not R_SEEDED.search(code):
+            return [f"{path.name} uses randomness but sets no seed; call set.seed(snakemake@params$seed)"]
+    return []
+
+
+def lint_warnings(text):
+    """snakemake --lint's findings, one per line, without the advice to use conda or containers:
+    the sandbox is the environment."""
+    found, where = [], "the workflow"
+    for line in text.splitlines():
+        stripped = line.strip()
+        match = re.match(r"Lints for (rule \S+|snakefile \S+)", stripped)
+        if match:
+            where = match.group(1).rstrip(":")
+        elif stripped.startswith("*") and "conda environment or container" not in stripped:
+            found.append(f"snakemake --lint, {where}: {stripped.lstrip('* ').rstrip(':')}")
+    return found
+
+
+def check_pipeline(pipeline, data_dir=None, packed=False, dry_run=True):
+    errors, warnings = [], []
+    try:
+        manifest = read_manifest(pipeline)
+    except Failure as failure:
+        return [str(failure)], warnings
+    if manifest.get("codeflower_repro") != SCHEMA:
+        errors.append(f"{MANIFEST}: codeflower_repro must be {SCHEMA}")
+    workflow = manifest.get("workflow") or {}
+    engine = workflow.get("engine", "snakemake")
+    snakefiles = []
+    if engine == "snakemake":
+        snakefile = snakefile_of(pipeline, manifest)
+        if not snakefile.is_file():
+            errors.append(f"{snakefile.relative_to(pipeline)} is missing")
+        else:
+            snakefiles = [snakefile] + [path for path in workflow_files(pipeline) if path.suffix == ".smk"]
+    elif engine == "command":
+        if not workflow.get("command"):
+            errors.append(f"{MANIFEST}: workflow.command is empty")
+    else:
+        errors.append(f"{MANIFEST}: unknown workflow engine {engine!r}")
+
+    image = manifest.get("image") or {}
+    if not (image.get("digest") or image.get("id")):
+        warnings.append("the image is not recorded: run freeze in a code flower sandbox")
+    elif not image.get("digest"):
+        warnings.append("the image is a local build, not a published one: others cannot pull it")
+    if not manifest.get("platform"):
+        warnings.append("the platform is not recorded: run freeze")
+
+    # SHA256SUMS describes an unpacked archive; in the pipeline folder pack rewrites it.
+    sums = pipeline / SUMS
+    if packed and sums.is_file():
+        listed = {}
+        for line in sums.read_text().splitlines():
+            digest, _, name = line.partition("  ")
+            listed[name] = digest
+        for name, digest in listed.items():
+            path = pipeline / name
+            if not path.is_file():
+                errors.append(f"{SUMS}: {name} is missing")
+            elif sha256_file(path) != digest:
+                errors.append(f"{SUMS}: {name} changed after packing")
+        if packed:
+            extra = sorted(set(packable_files(pipeline, include_sums=False)) - set(listed))
+            errors.extend(f"{name} is not in {SUMS}" for name in extra)
+    elif packed:
+        errors.append(f"{SUMS} is missing: create the archive with `codeflower-repro pack`")
+
+    # Scripts: each one a rule uses exists, each one in workflow/ is used or imported by one.
+    scripts = referenced_scripts(snakefiles)
+    for script, snakefile in scripts.items():
+        if not script.is_file():
+            errors.append(f"{snakefile.relative_to(pipeline)}: script {os.path.relpath(script, pipeline)} is missing")
+    # workflow/prepare/ documents how bundled inputs were made from data on the author's machine: no rule
+    # runs it, so it may name that data.
+    texts = {path: path.read_text(errors="replace") for path in workflow_files(pipeline)
+             if path.stat().st_size < 2_000_000 and "prepare" not in path.relative_to(pipeline / "workflow").parts[:1]}
+    for path in texts:
+        if engine == "snakemake" and path.suffix in (".py", ".R", ".r", ".sh", ".jl", ".Rmd", ".ipynb") \
+                and path.resolve() not in scripts and "lib" not in path.relative_to(pipeline / "workflow").parts \
+                and not any(path.stem in text for other, text in texts.items() if other != path):
+            warnings.append(f"{path.relative_to(pipeline)} is not used by any rule")
+    for path, text in texts.items():
+        warnings.extend(randomness_warnings(path, text))
+        for number, line in enumerate(text.splitlines(), 1):
+            match = LOCAL_PATH.search(line)
+            if match and not line.lstrip().startswith("#"):
+                errors.append(f"{path.relative_to(pipeline)}:{number}: {match.group(1)} exists only on this machine; "
+                              "use paths relative to the work directory (data/, results/)")
+            if URL.search(line) and not line.lstrip().startswith("#"):
+                warnings.append(f"{path.relative_to(pipeline)}:{number}: a URL; the pipeline runs without network, "
+                                "so list downloads in data/manifest.tsv instead")
+
+    check_locks(pipeline, manifest.get("environment") or {}, errors, warnings)
+    if not (manifest.get("environment") or {}):
+        warnings.append("no environment is recorded: run freeze")
+
+    rows = read_tsv(pipeline / DATA_MANIFEST, DATA_COLUMNS)
+    listed = set()
+    for row in rows:
+        listed.add(row["path"])
+        problem = data_path_problem(row["path"])
+        if problem:
+            errors.append(f"{DATA_MANIFEST}: {problem}")
+        if not row["url"]:
+            # Bundled: packed into the archive instead of downloaded.
+            local_file = pipeline / row["path"]
+            if not local_file.is_file():
+                errors.append(f"{DATA_MANIFEST}: {row['path']} is bundled (no URL) but missing")
+            elif local_file.stat().st_size > LARGE_BUNDLE_BYTES:
+                warnings.append(f"{row['path']} is bundled at {local_file.stat().st_size // 2**20} MB: bundle only what the "
+                                "pipeline reads (the layers, columns and rows it uses) in a compact format")
+        elif not URL.match(row["url"]):
+            errors.append(f"{DATA_MANIFEST}: {row['path']}: {row['url']!r} is not a URL")
+        elif FRAGILE_URL.search(row["url"]):
+            warnings.append(f"{DATA_MANIFEST}: {row['path']}: {row['url'].split('/')[2]} links break; prefer Zenodo, "
+                            "GEO, SRA, ArrayExpress or another archive with persistent identifiers")
+        if not re.fullmatch(r"[0-9a-f]{64}", row["sha256"]):
+            errors.append(f"{DATA_MANIFEST}: {row['path']} has no sha256 (run freeze)")
+        local = pipeline / row["path"]
+        if not packed and local.is_file() and row["sha256"] and sha256_file(local) != row["sha256"]:
+            warnings.append(f"{row['path']} changed since freeze")
+    data = pipeline / "data"
+    if data.is_dir():
+        for path in sorted(data.rglob("*")):
+            relative = path.relative_to(pipeline).as_posix()
+            if path.is_file() and relative != DATA_MANIFEST and relative not in listed:
+                if path.stat().st_size > SMALL_DATA_BYTES:
+                    warnings.append(f"{relative} ({path.stat().st_size // 2**20} MB) is packed but not listed: "
+                                    "`codeflower-repro data add` records its checksum (add --url to download it instead)")
+                elif path.is_symlink():
+                    warnings.append(f"{relative} is a link; the file it points to is packed")
+
+    expected = read_tsv(pipeline / EXPECTED, EXPECTED_COLUMNS)
+    if not expected:
+        errors.append(f"{EXPECTED} is missing or empty: run freeze")
+    for row in expected:
+        if row["compare"] not in COMPARATORS:
+            errors.append(f"{EXPECTED}: {row['path']}: unknown comparison {row['compare']!r}")
+        if not row["path"].startswith("results/"):
+            errors.append(f"{EXPECTED}: {row['path']} is not in results/")
+
+    if dry_run and engine == "snakemake" and snakefiles and not errors:
+        with tempfile.TemporaryDirectory(prefix="codeflower-repro-check-") as scratch:
+            workdir = Path(scratch)
+            missing = build_workdir(pipeline, workdir, data_dir)
+            try:
+                lint = run_workflow(pipeline, manifest, workdir, 1, extra=["--lint", "text"], capture=True)
+            except Failure as failure:
+                warnings.append(str(failure))
+                lint = None
+            if lint is not None and lint.returncode != 0:
+                text = (lint.stdout or "").strip()
+                if "Lints for" in text:
+                    warnings.extend(lint_warnings(text))
+                else:
+                    errors.append("the Snakefile does not load:\n" + text[-3000:])
+            if missing:
+                warnings.append("not dry-run, inputs missing: " + ", ".join(missing))
+            elif lint is not None and not errors:
+                dry = run_workflow(pipeline, manifest, workdir, 1, force=True, extra=["--dry-run", "--quiet"], capture=True)
+                if dry.returncode != 0:
+                    errors.append("the dry run fails:\n" + (dry.stdout or "").strip()[-3000:])
+    return errors, warnings
+
+
+# --- environment -----------------------------------------------------------------------------
+
+def venv_python():
+    venv = Path(os.environ.get("VIRTUAL_ENV") or STATE / "env" / "venv")
+    return venv / "bin" / "python"
+
+
+def r_library():
+    value = os.environ.get("R_LIBS_USER", "")
+    if not value or not shutil.which("Rscript"):
+        return None
+    result = subprocess.run(["Rscript", "--no-init-file", "-e",
+                             'cat(path.expand(base:::.expand_R_libs_env_var(strsplit(Sys.getenv("R_LIBS_USER"), ":")[[1]][1])))'],
+                            capture_output=True, text=True)
+    return Path(result.stdout.strip()) if result.returncode == 0 and result.stdout.strip() else None
+
+
+def freeze_python(pipeline):
+    python = venv_python()
+    if not python.exists() or not shutil.which("uv"):
+        return None
+    frozen = subprocess.run(["uv", "pip", "freeze", "--quiet", "--exclude-editable", "--python", str(python)],
+                            capture_output=True, text=True)
+    if frozen.returncode != 0:
+        raise Failure("uv pip freeze failed: " + frozen.stderr.strip())
+    pins = [line for line in frozen.stdout.splitlines() if line.strip() and not line.startswith(("-e", "#"))]
+    lock = pipeline / "env" / "requirements.lock"
+    if not pins:
+        lock.unlink(missing_ok=True)
+        return None
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as stream:
+        stream.write("\n".join(pins) + "\n")
+    try:
+        compiled = subprocess.run(["uv", "pip", "compile", "--quiet", "--no-deps", "--generate-hashes", "--no-header", "--no-annotate",
+                                   "--python", str(python), stream.name, "-o", str(lock)], capture_output=True, text=True)
+    finally:
+        os.unlink(stream.name)
+    if compiled.returncode != 0:
+        raise Failure("could not pin the Python packages with hashes (packages from files or other indexes?):\n"
+                      + compiled.stderr.strip())
+    return "env/requirements.lock"
+
+
+def freeze_r(pipeline):
+    library = r_library()
+    lock = pipeline / "env" / "R-library.lock"
+    if not library or not library.is_dir() or not any(entry.is_dir() for entry in library.iterdir()):
+        lock.unlink(missing_ok=True)
+        return None
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(["Rscript", "--no-init-file", "-e",
+                             'args <- commandArgs(TRUE); renv::snapshot(project = tempfile(), library = args[1], '
+                             'lockfile = args[2], type = "all", prompt = FALSE, force = TRUE)',
+                             str(library), str(lock)], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise Failure("could not write the R lockfile:\n" + result.stderr.strip()[-2000:])
+    return "env/R-library.lock"
+
+
+def freeze_conda(pipeline):
+    root = Path(os.environ.get("CONDA_ENVS_DIRS") or STATE / "env" / "conda")
+    locks = []
+    for old in (pipeline / "env").glob("conda-*.lock"):
+        old.unlink()
+    if not root.is_dir() or not shutil.which("conda"):
+        return locks
+    for prefix in sorted(root.iterdir()):
+        if (prefix / "conda-meta").is_dir():
+            result = subprocess.run(["conda", "list", "--explicit", "--md5", "-p", str(prefix)], capture_output=True, text=True)
+            if result.returncode != 0:
+                raise Failure(f"conda list failed for {prefix}: {result.stderr.strip()}")
+            name = f"env/conda-{prefix.name}.lock"
+            (pipeline / name).parent.mkdir(parents=True, exist_ok=True)
+            (pipeline / name).write_text(result.stdout)
+            locks.append(name)
+    return locks
+
+
+# --- commands --------------------------------------------------------------------------------
+
+SNAKEFILE_TEMPLATE = '''\
+# Each rule makes files from files with one script. Paths are relative to the work directory:
+# data/ holds the inputs, results/ what the pipeline makes (compared when reproduced), logs/ the
+# logs. Parameters and seeds are in config.yaml; scripts read them from `snakemake`.
+configfile: "workflow/config.yaml"
+
+
+rule all:
+    input:
+        "results/example.csv",
+
+
+rule example:
+    input:
+        "data/example.csv",
+    output:
+        "results/example.csv",
+    params:
+        seed=config["seed"],
+    log:
+        "logs/example.log",
+    script:
+        "scripts/example.py"
+'''
+
+EXAMPLE_SCRIPT = '''\
+# An example step: replace it. In Python, `snakemake` holds input, output, params, config and log;
+# in R it is the S4 object `snakemake` (snakemake@input[[1]], snakemake@params$seed).
+import csv
+import random
+
+random.seed(snakemake.params.seed)
+with open(snakemake.input[0], newline="") as source, open(snakemake.output[0], "w", newline="") as target:
+    rows = list(csv.reader(source))
+    csv.writer(target).writerows(rows)
+'''
+
+CONFIG_TEMPLATE = '''\
+# Parameters of the pipeline; scripts read them as snakemake.config (or a rule's params).
+# Every random step takes its seed from here: name the step and the function each seed goes to.
+seed: 0  # e.g. leiden(random_state), umap(random_state), sample(seed)
+'''
+
+README_TEMPLATE = '''\
+# {title}
+
+What this pipeline reproduces: (the figures and tables, and the paper they belong to).
+
+## Reproduce with code flower
+
+```sh
+codeflower reproduce {name}.tar.gz --output results-{name}
+```
+
+It downloads the data, rebuilds the environment from `env/`, runs the workflow without network
+and compares every result with `expected/checksums.tsv`.
+
+## Determinism
+
+Every random step has a fixed seed, set in `workflow/config.yaml`:
+
+| Step | Function | Seed |
+| --- | --- | --- |
+| (rule) | (e.g. `sc.tl.leiden(random_state=…)`) | `seed` |
+
+Threads are fixed to 1 (`determinism.env` in `codeflower-repro.yaml`), with `PYTHONHASHSEED`, `TZ`,
+`LC_ALL` and `SOURCE_DATE_EPOCH`. Two clean runs (1 core and several) gave identical results; results
+compared with a tolerance are marked in `expected/checksums.tsv`.
+
+## Without code flower
+
+1. Install the image's tools (see `codeflower-repro.yaml`, `image`) or Python and R of the same
+   versions, then `uv pip install --require-hashes -r env/requirements.lock` and, in R,
+   `renv::restore(lockfile = "env/R-library.lock")`.
+2. Download each file in `data/manifest.tsv` to its path and check its sha256.
+3. Run `snakemake --cores 4 --snakefile workflow/Snakefile` in this folder.
+'''
+
+
+def command_init(args):
+    pipeline = Path(args.path)
+    if pipeline.exists() and any(pipeline.iterdir()):
+        raise Failure(f"{pipeline} exists and is not empty")
+    name = pipeline.name
+    for folder in ("workflow/scripts", "env", "data", "expected"):
+        (pipeline / folder).mkdir(parents=True, exist_ok=True)
+    (pipeline / "workflow" / "config.yaml").write_text(CONFIG_TEMPLATE)
+    if args.bare:
+        (pipeline / "workflow" / "Snakefile").write_text(SNAKEFILE_TEMPLATE.split("\n\n\nrule all")[0] + "\n")
+    else:
+        (pipeline / "workflow" / "Snakefile").write_text(SNAKEFILE_TEMPLATE)
+        (pipeline / "workflow" / "scripts" / "example.py").write_text(EXAMPLE_SCRIPT)
+        (pipeline / "data" / "example.csv").write_text("gene,count\nCD3E,12\nMS4A1,7\n")
+    write_tsv(pipeline / DATA_MANIFEST, DATA_COLUMNS, [])
+    (pipeline / "README.md").write_text(README_TEMPLATE.format(title=args.title or name, name=name))
+    (pipeline / ".gitignore").write_text("results/\nlogs/\nbenchmarks/\n.snakemake/\n.repro/\n")
+    manifest = {
+        "codeflower_repro": SCHEMA,
+        "title": args.title or name,
+        "description": "",
+        "workflow": {"engine": "snakemake", "snakefile": "workflow/Snakefile", "cores": 4},
+        "determinism": {"env": {**DEFAULT_DETERMINISM, "SOURCE_DATE_EPOCH": str(int(time.time()))}},
+    }
+    write_manifest(pipeline, manifest)
+    print(f"Created the pipeline in {pipeline}. Replace the example rule and script, list downloaded inputs "
+          "with `codeflower-repro data add`, then run `codeflower-repro run --clean`.")
+    return 0
+
+
+def command_data(args):
+    pipeline = Path(args.pipeline)
+    rows = read_tsv(pipeline / DATA_MANIFEST, DATA_COLUMNS)
+    if args.data_command == "add":
+        problem = data_path_problem(args.path)
+        if problem:
+            raise Failure(problem)
+        local = pipeline / args.path
+        if args.download and not args.url:
+            raise Failure("--download needs --url")
+        if not local.is_file():
+            if not args.download:
+                raise Failure(f"{local} is missing: put the file there (or a link to it), or pass --download")
+            download(args.url, local)
+        row = {"path": args.path, "url": args.url or "", "sha256": sha256_file(local), "size": str(local.stat().st_size),
+               "source": args.source or ""}
+        rows = [existing for existing in rows if existing["path"] != args.path] + [row]
+        write_tsv(pipeline / DATA_MANIFEST, DATA_COLUMNS, sorted(rows, key=lambda r: r["path"]))
+        how = f"downloaded from {args.url}" if args.url else "bundled in the archive"
+        print(f"{args.path}: {row['size']} bytes, sha256 {row['sha256']}, {how}")
+        return 0
+    # fetch
+    target = Path(args.data) if args.data else pipeline
+    for row in rows:
+        path = target / row["path"]
+        if not row["url"] or (path.is_file() and sha256_file(path) == row["sha256"]):
+            continue
+        print(f"Downloading {row['path']} from {row['url']}…", file=sys.stderr)
+        download(row["url"], path)
+        digest = sha256_file(path)
+        if row["sha256"] and digest != row["sha256"]:
+            raise Failure(f"{row['path']}: sha256 {digest}, expected {row['sha256']}")
+    return 0
+
+
+def download(url, path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    partial = path.with_name(path.name + ".part")
+    request = urllib.request.Request(url, headers={"User-Agent": "codeflower-repro"})
+    with urllib.request.urlopen(request, timeout=60) as response, open(partial, "wb") as stream:
+        shutil.copyfileobj(response, stream, 1 << 20)
+    partial.replace(path)
+
+
+def command_check(args):
+    pipeline = Path(args.path)
+    errors, warnings = check_pipeline(pipeline, data_dir=args.data, packed=args.packed, dry_run=not args.no_dry_run)
+    report = {"ok": not errors, "errors": errors, "warnings": warnings}
+    if args.json_out:
+        Path(args.json_out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.json_out).write_text(json.dumps(report, indent=2) + "\n")
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        for error in errors:
+            print(f"error: {error}")
+        for warning in warnings:
+            print(f"warning: {warning}")
+        print("The pipeline passes the checks." if not errors else f"{len(errors)} error(s).")
+    return 0 if not errors else 1
+
+
+def command_run(args):
+    pipeline = Path(args.path).resolve()
+    manifest = read_manifest(pipeline)
+    cores = args.cores or (manifest.get("workflow") or {}).get("cores") or 4
+    if args.clean or args.workdir:
+        workdir = Path(args.workdir) if args.workdir else Path(tempfile.mkdtemp(prefix="run-", dir=ensure(pipeline / ".repro")))
+        record = run_once(pipeline, manifest, workdir, cores, data_dir=args.data)
+    else:
+        # In place: the pipeline folder is the work directory, as while developing it.
+        started = time.monotonic()
+        result = run_workflow(pipeline, manifest, pipeline, cores)
+        if result.returncode != 0:
+            raise Failure(f"the pipeline failed (exit status {result.returncode})", status=3)
+        workdir = pipeline
+        record = {"wall_seconds": round(time.monotonic() - started, 1), "cores": cores}
+    if args.copy_to:
+        target = Path(args.copy_to)
+        for name in RUN_OUTPUTS:
+            if (workdir / name).is_dir():
+                shutil.copytree(workdir / name, target / name, dirs_exist_ok=True)
+    if args.record:
+        Path(args.record).write_text(json.dumps(record, indent=2) + "\n")
+    print(f"Done in {record['wall_seconds']} s; results in {(Path(args.copy_to) if args.copy_to else workdir) / 'results'}")
+    return 0
+
+
+def ensure(path):
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def command_freeze(args):
+    pipeline = Path(args.path).resolve()
+    manifest = read_manifest(pipeline)
+    warnings = []
+
+    image = {key: os.environ.get(variable) for key, variable in
+             (("ref", "CODEFLOWER_IMAGE_REF"), ("digest", "CODEFLOWER_IMAGE_DIGEST"), ("id", "CODEFLOWER_IMAGE_ID"))}
+    image = {key: value for key, value in image.items() if value}
+    if image:
+        manifest["image"] = image
+    else:
+        warnings.append("the app did not say which image this is (CODEFLOWER_IMAGE_*): the archive is not pinned to it")
+    manifest["platform"] = platform_name()
+
+    print("Pinning the environment…", file=sys.stderr)
+    environment = {}
+    python = freeze_python(pipeline)
+    if python:
+        environment["python"] = python
+    r = freeze_r(pipeline)
+    if r:
+        environment["r"] = r
+    conda = freeze_conda(pipeline)
+    if conda:
+        environment["conda"] = conda
+    old = manifest.get("environment") or {}
+    if old.get("snapshot"):
+        warnings.append("the environment snapshot was dropped: run pack --with-env again")
+    manifest["environment"] = environment
+
+    rows = read_tsv(pipeline / DATA_MANIFEST, DATA_COLUMNS)
+    for row in rows:
+        local = pipeline / row["path"]
+        if local.is_file():
+            row["sha256"], row["size"] = sha256_file(local), str(local.stat().st_size)
+        elif not row["sha256"]:
+            raise Failure(f"{row['path']} is missing and has no checksum yet: put it there and freeze again")
+    if rows:
+        write_tsv(pipeline / DATA_MANIFEST, DATA_COLUMNS, rows)
+
+    if args.skip_runs:
+        write_manifest(pipeline, manifest)
+        print("Pinned the environment and data; the expected results were left as they were.")
+        return 0
+
+    cores = args.cores or (manifest.get("workflow") or {}).get("cores") or 4
+    runs = ensure(pipeline / ".repro")
+    first_dir, second_dir = Path(tempfile.mkdtemp(prefix="freeze-1-", dir=runs)), Path(tempfile.mkdtemp(prefix="freeze-2-", dir=runs))
+    print("First clean run (1 core)…", file=sys.stderr)
+    run_once(pipeline, manifest, first_dir, 1, quiet=not args.verbose)
+    print(f"Second clean run ({cores} cores)…", file=sys.stderr)
+    record = run_once(pipeline, manifest, second_dir, cores, quiet=not args.verbose)
+
+    first, second = result_files(first_dir), result_files(second_dir)
+    if first != second:
+        only = sorted(set(first) ^ set(second))
+        raise Failure("the two clean runs made different files: " + ", ".join(only))
+    expected = []
+    for relative in first:
+        compare, options, warning = choose_comparator(first_dir / relative, second_dir / relative)
+        if warning:
+            warnings.append(f"{relative}: {warning}")
+        path = first_dir / relative
+        expected.append({"path": relative, "sha256": sha256_file(path), "size": str(path.stat().st_size),
+                         "compare": compare, "options": format_options(options)})
+    if not expected:
+        raise Failure("the pipeline made no files in results/")
+    write_tsv(pipeline / EXPECTED, EXPECTED_COLUMNS, expected)
+    # The reference copies of results that may differ, for verify; packed with the archive.
+    reference = pipeline / "expected" / "reference"
+    shutil.rmtree(reference, ignore_errors=True)
+    for row in expected:
+        if row["compare"] in ("table", "image", "text"):
+            target = reference / row["path"]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(first_dir / row["path"], target)
+
+    # Results the author's own run made in the pipeline folder, against the clean run.
+    differs = []
+    for row in expected:
+        own = pipeline / row["path"]
+        if own.is_file() and compare_file(row, pipeline, reference / row["path"] if (reference / row["path"]).exists() else first_dir / row["path"]):
+            differs.append(row["path"])
+    manifest["resources"] = record
+    write_manifest(pipeline, manifest)
+    for directory in (first_dir, second_dir):
+        shutil.rmtree(directory, ignore_errors=True)
+
+    counts = {}
+    for row in expected:
+        counts[row["compare"]] = counts.get(row["compare"], 0) + 1
+    print(f"Froze {len(expected)} results (" + ", ".join(f"{n} {kind}" for kind, n in sorted(counts.items())) + "); "
+          f"{record['wall_seconds']} s on {record['cores']} cores, peak memory {record.get('peak_rss_mb', '?')} MB.")
+    if differs:
+        warnings.append("these differ from the results in the pipeline folder (an older run?): " + ", ".join(differs))
+    for warning in warnings:
+        print(f"warning: {warning}")
+    return 0
+
+
+def verify_results(pipeline, root):
+    expected = read_tsv(pipeline / EXPECTED, EXPECTED_COLUMNS)
+    if not expected:
+        raise Failure(f"{EXPECTED} is missing or empty", status=2)
+    rows = []
+    for entry in expected:
+        reference = pipeline / "expected" / "reference" / entry["path"]
+        problem = compare_file(entry, root, reference if reference.is_file() else None)
+        rows.append({"path": entry["path"], "compare": entry["compare"], "ok": problem is None, "detail": problem})
+    listed = {entry["path"] for entry in expected}
+    unexpected = [path for path in result_files(root) if path not in listed]
+    return rows, unexpected
+
+
+def command_verify(args):
+    pipeline = Path(args.path)
+    manifest = read_manifest(pipeline)
+    root = Path(args.dir)
+    rows, unexpected = verify_results(pipeline, root)
+    failed = [row for row in rows if not row["ok"]]
+    report = {"title": manifest.get("title"), "ok": not failed, "checked": len(rows), "matched": len(rows) - len(failed),
+              "results": rows, "unexpected": unexpected, "image": manifest.get("image"), "platform": platform_name(),
+              "recorded_platform": manifest.get("platform")}
+    record = root / "run.json"
+    if record.is_file():
+        report["run"] = json.loads(record.read_text())
+    lines = [f"# Reproduction of {manifest.get('title') or pipeline.name}", "",
+             f"{report['matched']} of {report['checked']} results match." if not failed else
+             f"**{len(failed)} of {report['checked']} results differ.**", ""]
+    if report["platform"] != report["recorded_platform"]:
+        lines += [f"Platform {report['platform']}; the archive was made on {report['recorded_platform']}.", ""]
+    lines += ["| Result | Comparison | Outcome |", "| --- | --- | --- |"]
+    lines += [f"| `{row['path']}` | {row['compare']} | {'matches' if row['ok'] else row['detail']} |" for row in rows]
+    if unexpected:
+        lines += ["", "Results the archive does not list: " + ", ".join(f"`{path}`" for path in unexpected)]
+    if args.report:
+        base = Path(args.report)
+        base.with_suffix(".json").write_text(json.dumps(report, indent=2) + "\n")
+        base.with_suffix(".md").write_text("\n".join(lines) + "\n")
+    print("\n".join(lines))
+    return 0 if not failed else 1
+
+
+def command_restore(args):
+    pipeline = Path(args.path)
+    manifest = read_manifest(pipeline)
+    environment = manifest.get("environment") or {}
+    if args.snapshot:
+        snapshot = environment.get("snapshot") or {}
+        if snapshot.get("sha256") and sha256_file(args.snapshot) != snapshot["sha256"]:
+            raise Failure("the environment snapshot does not match the archive's checksum", status=2)
+        if snapshot.get("platform") and snapshot["platform"] != platform_name():
+            raise Failure(f"the environment snapshot is for {snapshot['platform']}, this is {platform_name()}: "
+                          "reproduce without --snapshot to rebuild it from the lockfiles", status=2)
+        print("Unpacking the environment snapshot…", file=sys.stderr)
+        for folder in ("venv", "R", "conda"):
+            shutil.rmtree(STATE / "env" / folder, ignore_errors=True)
+        with tarfile.open(args.snapshot) as archive:
+            for member in archive.getmembers():
+                if not member.name.startswith("env/"):
+                    raise Failure(f"the snapshot holds {member.name}, outside env/", status=2)
+            archive.extractall(STATE, filter="tar")
+        print("Restored the environment from the snapshot.")
+        return 0
+    python = environment.get("python")
+    if python:
+        print("Installing the Python packages…", file=sys.stderr)
+        result = subprocess.run(["uv", "pip", "install", "--require-hashes", "--no-deps", "--python", str(venv_python()),
+                                 "-r", str(pipeline / python)])
+        if result.returncode != 0:
+            raise Failure("the Python packages could not be installed from " + python, status=4)
+    r = environment.get("r")
+    if r:
+        print("Installing the R packages…", file=sys.stderr)
+        library = r_library()
+        if not library:
+            raise Failure("R or R_LIBS_USER is missing", status=4)
+        library.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(["Rscript", "--no-init-file", "-e",
+                                 'args <- commandArgs(TRUE); renv::restore(project = tempfile(), lockfile = args[1], '
+                                 'library = args[2], prompt = FALSE)', str(pipeline / r), str(library)])
+        if result.returncode != 0:
+            raise Failure("the R packages could not be installed from " + r, status=4)
+    for lock in environment.get("conda") or []:
+        name = Path(lock).stem.removeprefix("conda-")
+        prefix = Path(os.environ.get("CONDA_ENVS_DIRS") or STATE / "env" / "conda") / name
+        print(f"Creating the conda environment {name}…", file=sys.stderr)
+        result = subprocess.run(["conda", "create", "--yes", "--quiet", "-p", str(prefix), "--file", str(pipeline / lock)])
+        if result.returncode != 0:
+            raise Failure(f"the conda environment {name} could not be created", status=4)
+    if python:
+        frozen = subprocess.run(["uv", "pip", "freeze", "--quiet", "--exclude-editable", "--python", str(venv_python())],
+                                capture_output=True, text=True).stdout
+        installed = {line.split("==")[0].lower() for line in frozen.splitlines() if "==" in line}
+        locked = {line.split("==")[0].strip().lower() for line in (pipeline / python).read_text().splitlines()
+                  if "==" in line and not line.lstrip().startswith("#")}
+        if locked - installed:
+            raise Failure("not installed: " + ", ".join(sorted(locked - installed)), status=4)
+    print("Restored the environment from the lockfiles.")
+    return 0
+
+
+def unpack_archive(archive, target):
+    """Extracts a pipeline archive into target and returns its pipeline folder."""
+    with tarfile.open(archive) as stream:
+        tops = {Path(member.name).parts[0] for member in stream.getmembers() if member.name not in ("", ".")}
+        if len(tops) != 1:
+            raise Failure(f"{archive} must hold one folder, not {len(tops)}", status=2)
+        stream.extractall(target, filter="data")
+    return target / tops.pop()
+
+
+def network_cut():
+    """The command that runs a program without network, when the sandbox allows it (user namespaces)."""
+    wrap = ["unshare", "--user", "--net", "--map-current-user"]
+    if shutil.which("unshare") and subprocess.run(wrap + ["true"], capture_output=True).returncode == 0:
+        return wrap
+    return []
+
+
+def test_root(given):
+    if given:
+        return ensure(Path(given))
+    cache = STATE / "cache"
+    return ensure(cache / "repro-test") if cache.is_dir() and os.access(cache, os.W_OK) else Path(tempfile.gettempdir())
+
+
+def command_test(args):
+    """What codeflower reproduce does on the user's computer, as far as a sandbox can: the packed archive,
+    a new environment from its lockfiles, no network while it runs, and the comparison."""
+    archive = Path(args.archive).resolve()
+    root = Path(tempfile.mkdtemp(prefix="repro-test-", dir=test_root(args.workdir)))
+    started = time.monotonic()
+    try:
+        print(f"Unpacking {archive.name}…", file=sys.stderr)
+        pipeline = unpack_archive(archive, root / "archive")
+        manifest = read_manifest(pipeline)
+        rows = read_tsv(pipeline / DATA_MANIFEST, DATA_COLUMNS)
+        downloads = root / "downloads"
+        for row in rows:
+            if (pipeline / row["path"]).is_file():
+                continue
+            if not row["url"]:
+                raise Failure(f"{row['path']} is bundled (no URL) but not in the archive", status=2)
+            print(f"Downloading {row['path']} from {row['url']}…", file=sys.stderr)
+            download(row["url"], downloads / row["path"])
+            if sha256_file(downloads / row["path"]) != row["sha256"]:
+                raise Failure(f"{row['path']} from {row['url']} does not match its sha256", status=2)
+
+        errors, warnings = check_pipeline(pipeline, data_dir=downloads, packed=True)
+        for warning in warnings:
+            print(f"warning: {warning}")
+        if errors:
+            for error in errors:
+                print(f"error: {error}")
+            raise Failure("the archive is not valid", status=2)
+
+        # A new environment from the lockfiles only: the project's venv, R library and conda
+        # environments stay out of it.
+        environment = manifest.get("environment") or {}
+        venv = root / "venv"
+        print("Creating a new environment from the lockfiles…", file=sys.stderr)
+        subprocess.run(["uv", "venv", "--quiet", "--system-site-packages", "--python", "/opt/conda/bin/python"
+                        if Path("/opt/conda/bin/python").exists() else sys.executable, str(venv)], check=True)
+        if environment.get("python"):
+            installed = subprocess.run(["uv", "pip", "install", "--quiet", "--require-hashes", "--no-deps",
+                                        "--python", str(venv / "bin" / "python"), "-r", str(pipeline / environment["python"])])
+            if installed.returncode != 0:
+                raise Failure("the Python packages do not install from " + environment["python"], status=4)
+        library = ensure(root / "R")
+        if environment.get("r"):
+            restored = subprocess.run(["Rscript", "--no-init-file", "-e",
+                                       'args <- commandArgs(TRUE); renv::restore(project = tempfile(), lockfile = args[1], '
+                                       'library = args[2], prompt = FALSE)', str(pipeline / environment["r"]), str(library)],
+                                      env={**os.environ, "R_LIBS_USER": str(library)})
+            if restored.returncode != 0:
+                raise Failure("the R packages do not install from " + environment["r"], status=4)
+        conda = ensure(root / "conda")
+        for lock in environment.get("conda") or []:
+            name = Path(lock).stem.removeprefix("conda-")
+            created = subprocess.run(["conda", "create", "--yes", "--quiet", "-p", str(conda / name), "--file", str(pipeline / lock)])
+            if created.returncode != 0:
+                raise Failure(f"the conda environment {name} does not install from {lock}", status=4)
+        project_bins = {str(STATE / "env" / "venv" / "bin"), str(venv_python().parent)}
+        path = ":".join([str(venv / "bin")] + [entry for entry in os.environ.get("PATH", "").split(":") if entry not in project_bins])
+        isolated = {"VIRTUAL_ENV": str(venv), "PATH": path, "R_LIBS_USER": str(library), "CONDA_ENVS_DIRS": str(conda)}
+
+        wrap = network_cut()
+        if not wrap:
+            print("warning: this sandbox cannot cut the network (no user namespaces): the run may still reach it")
+        cores = args.cores or (manifest.get("workflow") or {}).get("cores") or 4
+        print(f"Running the pipeline without network ({cores} cores)…", file=sys.stderr)
+        record = run_once(pipeline, manifest, root / "work", cores, data_dir=downloads, quiet=not args.verbose,
+                          env_override=isolated, wrap=wrap)
+        results, unexpected = verify_results(pipeline, root / "work")
+        failed = [row for row in results if not row["ok"]]
+        print(f"{'Passed' if not failed else 'Failed'}: {len(results) - len(failed)} of {len(results)} results match "
+              f"(the run took {record['wall_seconds']} s; the whole test {round(time.monotonic() - started)} s).")
+        for row in failed:
+            print(f"  {row['path']} ({row['compare']}): {row['detail']}")
+        if unexpected:
+            print("Results the archive does not list: " + ", ".join(unexpected))
+        if not wrap:
+            print("Not tested here: a run without network.")
+        print("Tested here: the archive as packed, a new environment from its lockfiles, the results. "
+              "`codeflower reproduce` on the user's computer also tests the image and a fresh sandbox.")
+        return 0 if not failed else 1
+    finally:
+        if args.keep:
+            print(f"Kept the test in {root}", file=sys.stderr)
+        else:
+            shutil.rmtree(root, ignore_errors=True)
+
+
+def packable_files(pipeline, include_sums=True, bundle_data=False):
+    """The files an archive holds: inputs with a URL only with bundle_data."""
+    downloaded = set() if bundle_data else \
+        {row["path"] for row in read_tsv(pipeline / DATA_MANIFEST, DATA_COLUMNS) if row["url"]}
+    files = []
+    for path in sorted(pipeline.rglob("*")):
+        relative = path.relative_to(pipeline)
+        if relative.parts[0] in SKIP_TOP or set(relative.parts) & SKIP_DIRS or not path.is_file():
+            continue
+        name = relative.as_posix()
+        if name in downloaded or (name == SUMS and not include_sums) or (len(relative.parts) == 1 and name.endswith((".tar.gz", ".tgz"))):
+            continue
+        files.append(name)
+    return files
+
+
+def deterministic_tar(target, root_name, entries, epoch, follow=False):
+    """entries: (name in the archive, source path), in order. gzip and tar without times or owners.
+    follow: pack what links point to, not the links."""
+    with open(target, "wb") as raw, gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed, \
+            tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as archive:
+        for name, source in entries:
+            source = Path(source).resolve() if follow else source
+            info = archive.gettarinfo(str(source), arcname=f"{root_name}/{name}" if root_name else name)
+            info.mtime, info.uid, info.gid, info.uname, info.gname = epoch, 0, 0, "", ""
+            info.pax_headers = {}
+            if info.isfile():
+                info.mode = 0o755 if os.access(source, os.X_OK) else 0o644
+                with open(source, "rb") as stream:
+                    archive.addfile(info, stream)
+            else:
+                archive.addfile(info)
+
+
+def environment_entries():
+    entries = []
+    folders = [STATE / "env" / "venv"]
+    library = r_library()
+    if library and library.is_dir():
+        folders.append(library)
+    conda = Path(os.environ.get("CONDA_ENVS_DIRS") or STATE / "env" / "conda")
+    if conda.is_dir():
+        folders.append(conda)
+    for folder in folders:
+        if not folder.exists():
+            continue
+        for path in sorted([folder, *folder.rglob("*")]):
+            if "__pycache__" in path.parts:
+                continue
+            entries.append((path.relative_to(STATE).as_posix(), path))
+    return entries
+
+
+def command_pack(args):
+    pipeline = Path(args.path).resolve()
+    manifest = read_manifest(pipeline)
+    errors, warnings = check_pipeline(pipeline, dry_run=not args.no_dry_run)
+    for warning in warnings:
+        print(f"warning: {warning}")
+    if errors:
+        for error in errors:
+            print(f"error: {error}")
+        raise Failure("fix the errors above before packing")
+    out = Path(args.out) if args.out else (output_dir_default() or pipeline.parent)
+    out.mkdir(parents=True, exist_ok=True)
+    name = pipeline.name
+    epoch = int((manifest.get("determinism") or {}).get("env", {}).get("SOURCE_DATE_EPOCH") or 0)
+
+    environment = manifest.setdefault("environment", {})
+    if args.with_env:
+        arch = platform_name().split("/")[1]
+        snapshot = out / f"{name}-env-{arch}.tar.gz"
+        print(f"Packing the environment into {snapshot}…", file=sys.stderr)
+        deterministic_tar(snapshot, "", environment_entries(), epoch)
+        environment["snapshot"] = {"file": snapshot.name, "sha256": sha256_file(snapshot), "platform": platform_name()}
+    else:
+        environment.pop("snapshot", None)
+    write_manifest(pipeline, manifest)
+
+    rows = read_tsv(pipeline / DATA_MANIFEST, DATA_COLUMNS)
+    if args.bundle_data:
+        missing = [row["path"] for row in rows if not (pipeline / row["path"]).is_file()]
+        if missing:
+            raise Failure("not here to bundle: " + ", ".join(missing) + " (run `codeflower-repro data fetch` first)")
+    files = packable_files(pipeline, include_sums=False, bundle_data=args.bundle_data)
+    bundled = [row for row in rows if row["path"] in files]
+    (pipeline / SUMS).write_text("".join(f"{sha256_file(pipeline / f)}  {f}\n" for f in files))
+    archive = out / f"{name}.tar.gz"
+    deterministic_tar(archive, name, [(f, pipeline / f) for f in files + [SUMS]], epoch, follow=True)
+    size = archive.stat().st_size
+    print(f"Packed {len(files)} files into {archive} ({size / 2**20:.1f} MB), sha256 {sha256_file(archive)}.")
+    downloads = [row for row in rows if row not in bundled]
+    for row in bundled:
+        size = int(row["size"] or 0)
+        note = "  <- large: bundle only what the pipeline reads?" if size > LARGE_BUNDLE_BYTES else ""
+        print(f"  bundled {row['path']}: {size / 2**20:.1f} MB{note}")
+    if rows:
+        print(f"Inputs: {len(bundled)} bundled ({sum(int(r['size'] or 0) for r in bundled) / 2**20:.1f} MB), "
+              f"{len(downloads)} downloaded when reproduced.")
+    if size > 2 * 2**30:
+        print("warning: the archive is over 2 GB; consider depositing the largest inputs and listing their URLs")
+    if args.with_env:
+        print(f"Environment snapshot: {out / environment['snapshot']['file']}")
+    print(f"Test it here with: codeflower-repro test {archive}")
+    print("Then on the user's computer: codeflower reproduce <archive> --output <folder>")
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="codeflower-repro", description=__doc__.split("\n\n")[0],
+                                     epilog="Run `codeflower-repro COMMAND --help` for each command.")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    init = commands.add_parser("init", help="create a pipeline folder with an example rule")
+    init.add_argument("path")
+    init.add_argument("--title")
+    init.add_argument("--bare", action="store_true", help="without the example rule, script and input")
+    init.set_defaults(run=command_init)
+
+    data = commands.add_parser("data", help="list downloaded inputs (add) or download them (fetch)")
+    data_commands = data.add_subparsers(dest="data_command", required=True)
+    add = data_commands.add_parser("add", help="list an input in data/manifest.tsv with its URL and checksum")
+    add.add_argument("pipeline")
+    add.add_argument("path", help="where the workflow reads it, e.g. data/raw/counts.h5ad")
+    add.add_argument("--url", help="a persistent URL to download it from; without one, the file is bundled in the archive")
+    add.add_argument("--download", action="store_true", help="download it there first")
+    add.add_argument("--source", help="where it came from, e.g. the full dataset and the script that slimmed it "
+                                      "(workflow/prepare/…)")
+    add.set_defaults(run=command_data)
+    fetch = data_commands.add_parser("fetch", help="download the listed inputs that are missing")
+    fetch.add_argument("pipeline")
+    fetch.add_argument("--data", help="download into this folder instead of the pipeline")
+    fetch.set_defaults(run=command_data)
+
+    check = commands.add_parser("check", help="validate the pipeline: files, paths, locks, data, expected results")
+    check.add_argument("path")
+    check.add_argument("--data", help="a folder with the downloaded inputs (default: the pipeline's data/)")
+    check.add_argument("--packed", action="store_true", help="it is an unpacked archive: SHA256SUMS must cover every file")
+    check.add_argument("--no-dry-run", action="store_true", help="skip snakemake --lint and the dry run")
+    check.add_argument("--json", action="store_true")
+    check.add_argument("--json-out", help="also write the result as JSON to this file")
+    check.set_defaults(run=command_check)
+
+    run = commands.add_parser("run", help="run the pipeline, in place or from scratch (--clean)")
+    run.add_argument("path")
+    run.add_argument("--clean", action="store_true", help="in a new work directory under .repro/, from scratch")
+    run.add_argument("--workdir", help="the new work directory (implies --clean)")
+    run.add_argument("--data", help="a folder with the downloaded inputs")
+    run.add_argument("--cores", type=int)
+    run.add_argument("--copy-to", help="copy results/, logs/ and benchmarks/ here afterwards")
+    run.add_argument("--record", help="write time and memory use as JSON to this file")
+    run.set_defaults(run=command_run)
+
+    freeze = commands.add_parser("freeze", help="pin the environment and data, run twice from scratch and record the results")
+    freeze.add_argument("path")
+    freeze.add_argument("--cores", type=int, help="cores of the second run (default: the manifest's)")
+    freeze.add_argument("--skip-runs", action="store_true", help="only pin the environment and the data")
+    freeze.add_argument("--verbose", action="store_true", help="show Snakemake's output")
+    freeze.set_defaults(run=command_freeze)
+
+    verify = commands.add_parser("verify", help="compare a run's results with the expected ones")
+    verify.add_argument("path")
+    verify.add_argument("--dir", required=True, help="the folder that holds the run's results/")
+    verify.add_argument("--report", help="write REPORT.json and REPORT.md")
+    verify.set_defaults(run=command_verify)
+
+    restore = commands.add_parser("restore", help="install the locked environment into this sandbox")
+    restore.add_argument("path")
+    restore.add_argument("--snapshot", help="unpack this environment snapshot instead")
+    restore.set_defaults(run=command_restore)
+
+    testing = commands.add_parser("test", help="test a packed archive as codeflower reproduce would: new environment, "
+                                                "no network, compare the results")
+    testing.add_argument("archive", help="NAME.tar.gz")
+    testing.add_argument("--cores", type=int)
+    testing.add_argument("--workdir", help="where to test (default: the project's cache, removed afterwards)")
+    testing.add_argument("--keep", action="store_true", help="keep the test folder")
+    testing.add_argument("--verbose", action="store_true", help="show Snakemake's output")
+    testing.set_defaults(run=command_test)
+
+    pack = commands.add_parser("pack", help="check the pipeline and write NAME.tar.gz")
+    pack.add_argument("path")
+    pack.add_argument("--out", help="default: the mounted output folder, else next to the pipeline")
+    pack.add_argument("--with-env", action="store_true", help="also pack the installed environment (NAME-env-ARCH.tar.gz)")
+    pack.add_argument("--bundle-data", action="store_true",
+                      help="also pack the inputs that have a URL, so reproducing downloads nothing")
+    pack.add_argument("--no-dry-run", action="store_true")
+    pack.set_defaults(run=command_pack)
+
+    args = parser.parse_args()
+    try:
+        return args.run(args)
+    except Failure as failure:
+        print(f"codeflower-repro: {failure}", file=sys.stderr)
+        return failure.status
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

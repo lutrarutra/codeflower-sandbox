@@ -5,6 +5,9 @@ on:
     branches: [main]
     paths: &paths
       - Dockerfile
+      - reproduce.sh
+      - lib/**
+      - python/**
       - entrypoint.sh
       - bin/**
       - test/**
@@ -63,6 +66,9 @@ jobs:
           filters: |
             image:
               - Dockerfile
+      - reproduce.sh
+      - lib/**
+      - python/**
               - entrypoint.sh
               - bin/**
               - templates/**
@@ -123,4 +129,9 @@ jobs:
             test -s /tmp/smoke.pdf -a -s /tmp/smoke.png
             # Without fonts the text is missing and the PNG is blank.
             python -c "from PIL import Image; assert Image.open(\"/tmp/smoke.png\").convert(\"L\").getextrema()[0] < 128, \"the text did not render\""
+            snakemake --version
+            test -x /opt/codeflower/reproduce.sh -a -f /opt/codeflower/lib/env-setup.sh
+            codeflower-repro init /tmp/pipeline
+            codeflower-repro run /tmp/pipeline --clean
+            codeflower-repro check /tmp/pipeline --no-dry-run | grep -q "expected/checksums.tsv is missing"
           '

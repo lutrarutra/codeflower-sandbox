@@ -219,6 +219,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf gbm libgbm1_*.deb /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:0.13.6@sha256:af22a52f5eafef3d78e551599d405c02df61919d18028f0cea8eda93bc9986d0 /uv /uvx /usr/local/bin/
+
+# Snakemake runs reproducible pipelines (codeflower-repro). It has a venv of its own, so its
+# dependencies do not change the conda base that project venvs see; bin/snakemake runs it with the
+# project's Python, so a pipeline's Python steps see the project's packages.
+COPY python/snakemake.txt /tmp/snakemake.txt
+RUN uv venv --quiet --python /opt/conda/bin/python /opt/codeflower/snakemake \
+    && uv pip install --quiet --no-cache --require-hashes --python /opt/codeflower/snakemake/bin/python -r /tmp/snakemake.txt \
+    && rm /tmp/snakemake.txt \
+    && /opt/codeflower/snakemake/bin/snakemake --version
 COPY --from=dsh-runtime /usr/local/bin/node /usr/local/bin/node
 COPY --from=dsh-runtime /opt/codeflower/runtime /opt/codeflower/runtime
 COPY --from=dsh-runtime /opt/codeflower/acp-ws /opt/codeflower/acp-ws
@@ -232,7 +241,8 @@ RUN pip install --no-cache-dir pillow==13.0.0 markdown-it-py==4.2.0 mdurl==0.1.2
         python-pptx==1.0.2 lxml==6.1.3 XlsxWriter==3.3.1 typing-extensions==4.16.0 pypdfium2==5.14.0 \
     && python -c "import sys; sys.path.insert(0, '/opt/codeflower/src/storyteller/src'); import storyteller, storyteller.deck"
 
-COPY entrypoint.sh /opt/codeflower/entrypoint.sh
+COPY entrypoint.sh reproduce.sh /opt/codeflower/
+COPY lib /opt/codeflower/lib
 COPY profile.d/codeflower.sh /etc/profile.d/codeflower.sh
 COPY bin /opt/codeflower/bin
 COPY templates /opt/codeflower/templates
@@ -246,10 +256,11 @@ COPY dsh-plugins/usage /opt/codeflower/dsh-usage
 # Bind targets must exist in the image on Apptainer installs without underlay.
 # The user's folders are mounted one level below /data/{input,output,code,skills},
 # which such installs cannot create: they need underlay (Apptainer's default).
-# /data/icons is the user's icon gallery (codeflower-sketch). Claude Code goes to
+# /data/icons is the user's icon gallery (codeflower-sketch); /repro/* are reproduce.sh's folders. Claude Code goes to
 # /opt/codeflower/agents/claude and its SDK into the empty folder in node_modules;
 # `claude` on the PATH is its CLI.
 RUN mkdir -p /codeflower-state /codeflower-net /data/input /data/output /data/code /data/skills /data/icons \
+        /repro/pipeline /repro/data /repro/work /repro/out \
         /opt/codeflower/agents/claude \
     && ln -s /opt/codeflower/agents/claude/claude /opt/codeflower/bin/claude
 

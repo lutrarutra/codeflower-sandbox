@@ -2,44 +2,8 @@
 # Prepares the project's persistent environment, then starts the ACP bridge.
 set -eu
 
-state=/codeflower-state
-if [ -n "${CODEFLOWER_PREPEND_PATH:-}" ]; then
-  PATH="$CODEFLOWER_PREPEND_PATH:$PATH"
-  export PATH
-fi
-# For login shells, which /etc/profile gives a PATH of its own (profile.d/codeflower.sh).
-CODEFLOWER_SANDBOX_PATH="$PATH"
-export CODEFLOWER_SANDBOX_PATH
-venv="${VIRTUAL_ENV:-$state/env/venv}"
-workspace="${CODEFLOWER_WORKSPACE:-$state/workspace}"
-
-# The steps that can take a while say so, so whoever watches the start (the
-# app's page, a terminal) tells a slow start from a stuck one. A terminal UI
-# draws over its terminal, so it gets none.
-step() {
-  [ "${CODEFLOWER_TUI:-}" = 1 ] || echo "  sandbox  $*" >&2
-}
-
-# Packages the agent installs go into the project, not into the read-only
-# image, so every worker on the project sees the same environment.
-# Seeding downloads pip; without a network (an isolated sandbox) the venv
-# starts without it: `uv pip install` works, and pip is added by a later
-# start that has a network.
-if [ ! -x "$venv/bin/python" ]; then
-  step "Creating the project's Python environment in $venv (first start)…"
-  if ! uv venv --quiet --seed --system-site-packages --python /opt/conda/bin/python "$venv" 2>/dev/null; then
-    rm -rf "$venv"
-    uv venv --quiet --system-site-packages --python /opt/conda/bin/python "$venv"
-  fi
-fi
-# `pip install` must reach the venv, not the image's conda base; older
-# projects' venvs were made without pip. Without a network this waits for later.
-if [ ! -x "$venv/bin/pip" ] && [ "${CODEFLOWER_NETWORK:-}" != isolated ]; then
-  step "Adding pip to the project's Python environment…"
-  uv pip install --quiet --python "$venv/bin/python" pip || echo "Could not add pip to $venv" >&2
-fi
-# R creates its project library (R_LIBS_USER) itself: /etc/R/Rprofile.site.
-mkdir -p "${CONDA_ENVS_DIRS:-$state/env/conda}"
+# PATH, the project's Python environment and step(): shared with reproduce.sh.
+. /opt/codeflower/lib/env-setup.sh
 
 # Each harness reads its own instructions file. Copy the defaults, and update
 # them with a new image unless the user edited them (a copy of what was
@@ -127,6 +91,7 @@ if [ -f /opt/codeflower/browser/bundle.json ] || [ -x "${CODEFLOWER_BROWSER_BIN:
   link_skill /opt/codeflower/skills/codeflower-browser
 fi
 link_skill /opt/codeflower/skills/single-cell-best-practices
+link_skill /opt/codeflower/skills/codeflower-reproduce
 if [ -f "$storyteller/skill/SKILL.md" ]; then
   link_skill "$storyteller/skill" storyteller
 fi
