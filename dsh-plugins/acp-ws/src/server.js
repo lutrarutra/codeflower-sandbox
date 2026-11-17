@@ -1006,8 +1006,8 @@ export async function startBridge(options) {
     };
   };
 
-  // Asks the chats with a turn running or a request waiting, of every agent,
-  // and not already wrapping up, to wrap up; returns how many, and a promise
+  // Asks the chats whose agent or a subagent works (a turn or background work
+  // runs), of every agent, and not already wrapping up, to wrap up; returns how many, and a promise
   // of their end.
   const wrapUpChats = (reason, minutes) => {
     const template = reason === 'quit' ? wrapUpQuitTemplate : wrapUpTemplate;
@@ -1021,13 +1021,14 @@ export async function startBridge(options) {
     const notice = wrapUpNotice(reason, minutes);
     log(
       reason === 'quit'
-        ? `The client is quitting; asking ${chats.length} working chat(s) to wrap up`
+        ? `The sandbox is stopping; asking ${chats.length} working chat(s) to wrap up`
         : `The job ends at ${notice.end}; asking ${chats.length} working chat(s) to wrap up`
     );
     wrapUpReason = reason;
     wrapUpAsked += chats.length;
     for (const { key } of chats) wrappingUp.add(key);
-    broadcast({ jsonrpc: '2.0', method: '_codeflower/wrapUp', params: { ...notice, chats: chats.length } });
+    // With no chat to ask, the windows have nothing to show.
+    if (chats.length) broadcast({ jsonrpc: '2.0', method: '_codeflower/wrapUp', params: { ...notice, chats: chats.length } });
     const done = Promise.all(
       chats.map(({ runtime, sessionId, key }) => runtime.wrapUp(sessionId, notice, template).finally(() => wrappingUp.delete(key)))
     );
@@ -3350,8 +3351,9 @@ export async function startBridge(options) {
       },
       flush: () => recorder?.flush(),
       commands,
-      // The chats with a turn running or a request waiting, for a wrap-up.
-      wrapUpCandidates: () => (agentHost ? [...new Set(activity.snapshot().chats.map((chat) => chat.sessionId))] : []),
+      // The chats whose agent or a subagent works, for a wrap-up: idle ones,
+      // even those waiting for the user, have nothing to wrap up.
+      wrapUpCandidates: () => (agentHost ? activity.active() : []),
       wrapUp: (sessionId, notice, template) => (agentHost ? wrapUpChat(agentHost, sessionId, notice, template) : Promise.resolve()),
       // The agent handed the chat's browser to the user (codeflower-browser
       // handoff): the chat waits for them.

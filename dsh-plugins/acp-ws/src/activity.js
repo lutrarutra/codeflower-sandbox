@@ -97,6 +97,15 @@ export function createActivity(onChange = () => {}, now = Date.now) {
       return turns.size > 0;
     },
 
+    /**
+     * Session ids of the chats whose agent works: a turn runs, or work after
+     * it (a background subagent or command). A chat that only waits for the
+     * user, e.g. on a browser handoff, is idle.
+     */
+    active() {
+      return [...new Set([...turns.values(), ...background.values()])];
+    },
+
     /** Whether a turn runs whose id `belongs` takes. */
     runningWhere(belongs) {
       return [...turns.keys()].some(belongs);
@@ -167,6 +176,7 @@ export function scopedActivity(activity, agent) {
     get running() {
       return activity.runningWhere(mine);
     },
+    active: () => activity.active().filter(mine).map(own),
     clear: () => activity.clear(mine),
     snapshot() {
       const { chats, ended, turns } = activity.snapshot();

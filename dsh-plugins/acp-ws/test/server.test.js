@@ -632,6 +632,27 @@ test('asks working chats to wrap up when the client quits', async (t) => {
   await closeSocket(socket);
 });
 
+test('a wrap-up on request with no chat working asks none and is done at once', async (t) => {
+  const { bridge, sessionsDirectory } = await startTestBridge(t, {
+    wrapUpQuitTemplate: 'wrap up: the client quits, at most {{minutes}} minutes\n'
+  });
+  const socket = await openSocket(bridge.address);
+  await initialize(socket);
+  const idle = (await call(socket, 'session/new', { cwd: '/workspace', mcpServers: [] })).result.sessionId;
+  const notices = [];
+  socket.on('message', (data) => {
+    const message = JSON.parse(data.toString());
+    if (message.method === '_codeflower/wrapUp') notices.push(message);
+  });
+  assert.deepEqual(await wrapUp(bridge.address, { reason: 'quit', minutes: 10 }), { code: 202, body: { chats: 0 } });
+  assert.deepEqual((await status(bridge.address)).body.wrapUp, { reason: 'quit', state: 'done', chats: 0 });
+  // The windows hear of no wrap-up, and the idle chat gets no prompt.
+  await call(socket, '_codeflower/status');
+  assert.deepEqual(notices, []);
+  assert.deepEqual(await readTranscript(sessionsDirectory, sessionKey('claude', idle)), []);
+  await closeSocket(socket);
+});
+
 test('refuses a wrap-up on request without its template', async (t) => {
   const { bridge } = await startTestBridge(t);
   assert.equal((await wrapUp(bridge.address, { reason: 'quit', minutes: 10 })).code, 501);

@@ -1,5 +1,5 @@
-(From code flower, not the user.) The user is quitting the code flower client that started this
-sandbox. The sandbox stops as soon as you are done, at the latest in about {{minutes}} minutes, and
+(From code flower, not the user.) The user is stopping this sandbox, from the terminal or the code
+flower client that started it. The sandbox stops as soon as you are done, at the latest in about {{minutes}} minutes, and
 anything not saved to a file is lost; your last step was stopped for this.
 
 Do not start new work, and do not restart long computations. Within a few minutes:
