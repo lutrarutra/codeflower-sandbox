@@ -132,6 +132,53 @@ export function vscodeLink(workerLine) {
   return `vscode://codeflower.codeflower/connect?address=${encodeURIComponent(workerLine)}`;
 }
 
+/**
+ * Links as rows of a table: each label padded to the longest, then its link,
+ * alone up to the line's end so a terminal's Ctrl+click takes all of it.
+ * The app's tunnel block (internal/cli/background.go) prints the same way.
+ */
+export function linkRows(rows) {
+  const width = Math.max(...rows.map(([label]) => label.length));
+  return rows.map(([label, link]) => `  ${label.padEnd(width)}   ${link}`);
+}
+
+/**
+ * What the worker prints once it is ready: its links, one a row (linkRows).
+ * localLine is the codeflower:// line VS Code on this node reaches it by
+ * (loopback), when there is one; page the chat page's link with --server;
+ * appLinks that the app prints the links, so only the ready line is left.
+ */
+export function readyMessage({ agents, workerLine, localLine, page, appLinks }) {
+  const ready = `code flower worker ready (${agents.join(', ')}).`;
+  // The app prints the links itself (CODEFLOWER_APP_LINKS), in one table
+  // with its tunnel's: printOpenLinks in app/internal/cli/background.go.
+  if (appLinks) return `\n${ready}\n`;
+  const rows = [
+    page ? ['Browser', page] : ['Browser (app running)', clientLink(workerLine)],
+    ...(localLine ? [['VS Code here', vscodeLink(localLine)]] : []),
+    [localLine && localLine !== workerLine ? 'VS Code elsewhere' : 'VS Code (paste)', workerLine]
+  ];
+  return [
+    '',
+    ready,
+    '',
+    ...linkRows(rows),
+    '',
+    'In VS Code, Ctrl+click a link, or run "code flower: Connect to worker" and paste the codeflower:// line.',
+    ...(page
+      ? [
+          'The page is plain HTTP: its traffic and the key in the link are not encrypted. On a shared',
+          'network, listen on 127.0.0.1 (--host 127.0.0.1) behind a TLS reverse proxy such as nginx,',
+          'or reach it through ssh -L.'
+        ]
+      : []),
+    'Anyone with these links can control the agents. Keep job logs private,',
+    'e.g. sbatch --output=$HOME/.codeflower-logs/%j.out with that directory chmod 700.',
+    '',
+    ''
+  ].join('\n');
+}
+
 /** The chat page the worker serves (`--server`), with its key; like Jupyter's link. */
 export function pageLink(host, port, token) {
   const address = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
@@ -196,6 +243,7 @@ export function agentEnvironment(environment, harnessEnvironment = {}) {
   delete result.CODEFLOWER_ADVERTISE_HOST;
   delete result.CODEFLOWER_PORT;
   delete result.CODEFLOWER_LISTEN_SOCKET;
+  delete result.CODEFLOWER_APP_LINKS;
   delete result.CODEFLOWER_EGRESS_SOCKET;
   delete result.CODEFLOWER_APP_PID;
   delete result.CODEFLOWER_INSTANCE_ID;

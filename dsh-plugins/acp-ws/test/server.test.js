@@ -14,7 +14,7 @@ import { createActivity } from '../src/activity.js';
 import { readActions } from '../src/actions.js';
 import { createAgents, loadRegistry } from '../src/agents.js';
 import { writeCommentsSlot } from '../src/files.js';
-import { agentEnvironment, certificateFingerprint, clientLink, connectionUrl, pageLink, startBridge, vscodeLink } from '../src/server.js';
+import { agentEnvironment, certificateFingerprint, clientLink, connectionUrl, linkRows, pageLink, readyMessage, startBridge, vscodeLink } from '../src/server.js';
 import { parseMcpServers } from '../src/mcp.js';
 import { createPlugins } from '../src/plugins.js';
 import { listSessions, readTranscript, sessionKey } from '../src/sessions.js';
@@ -2023,6 +2023,28 @@ test('prints a link that connects VS Code to the worker', () => {
   assert.equal(link.host, 'codeflower.codeflower');
   assert.equal(link.pathname, '/connect');
   assert.equal(link.searchParams.get('address'), line);
+});
+
+test('prints links as a table, each alone to the end of its line', () => {
+  assert.deepEqual(linkRows([['Browser', 'http://a'], ['VS Code here', 'vscode://b']]), [
+    '  Browser        http://a',
+    '  VS Code here   vscode://b'
+  ]);
+});
+
+test('the ready message names VS Code\'s local line and the line to paste elsewhere', () => {
+  const workerLine = connectionUrl('10.0.0.5', 4100, 'k');
+  const localLine = connectionUrl('127.0.0.1', 4100, 'k');
+  const message = readyMessage({ agents: ['Claude Code'], workerLine, localLine });
+  assert.match(message, /code flower worker ready \(Claude Code\)/);
+  assert.ok(message.includes(`  VS Code here            ${vscodeLink(localLine)}\n`));
+  assert.ok(message.includes(`  VS Code elsewhere       ${workerLine}\n`));
+  assert.ok(message.includes(`  Browser (app running)   ${clientLink(workerLine)}\n`));
+});
+
+test('the ready message leaves the links to the app when it prints them', () => {
+  const workerLine = connectionUrl('10.0.0.5', 4100, 'k');
+  assert.equal(readyMessage({ agents: ['Codex'], workerLine, appLinks: true }), '\ncode flower worker ready (Codex).\n');
 });
 
 test('serves TLS with the run\'s certificate, whose fingerprint its line carries', async (t) => {

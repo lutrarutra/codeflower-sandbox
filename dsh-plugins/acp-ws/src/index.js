@@ -6,7 +6,7 @@ import { MCP_SERVERS_VARIABLE, parseMcpServers } from './mcp.js';
 import { PLUGINS_FETCH_VARIABLE, PLUGINS_VARIABLE, createPlugins, parsePlugins, runFetch } from './plugins.js';
 import { startEgressForwarder } from './egress.js';
 import { PAGE_DIRECTORY } from './page.js';
-import { clientLink, connectionUrl, pageLink, startBridge, vscodeLink } from './server.js';
+import { connectionUrl, pageLink, readyMessage, startBridge } from './server.js';
 import { EXIT_CODES, runTask } from './task.js';
 import { parseResume, runTui } from './tui.js';
 
@@ -262,17 +262,6 @@ const bridge = await startBridge({
 });
 
 const workerLine = connectionUrl(bridge.address.host, bridge.address.port, bridge.address.token, bridge.address.fingerprint);
-const opening = SERVE_PAGE
-  ? [
-      'Open in a browser:',
-      '',
-      `  ${pageLink(bridge.address.host, bridge.address.port, bridge.address.token)}`,
-      '',
-      'The page is plain HTTP: its traffic and the key in the link are not encrypted.',
-      'On a shared network, listen on 127.0.0.1 (--host 127.0.0.1) behind a TLS reverse',
-      'proxy such as nginx, or reach it through ssh -L.'
-    ]
-  : ['With the code flower app running on your computer, open:', '', `  ${clientLink(workerLine)}`];
 // VS Code on this node, or connected to it over Remote-SSH, reaches the
 // worker on loopback, which its network address may not be from the node itself.
 const LOOPBACK = ['127.0.0.1', 'localhost', '::1'];
@@ -281,32 +270,14 @@ const localLine = LOOPBACK.includes(bridge.address.host)
   : !process.env.CODEFLOWER_LISTEN_SOCKET && ['0.0.0.0', '::', '127.0.0.1', 'localhost'].includes(listenHost)
     ? connectionUrl('127.0.0.1', bridge.address.port, bridge.address.token, bridge.address.fingerprint)
     : undefined;
-const vscodeLines = localLine
-  ? [
-      'Or in VS Code on this computer, or connected to it over Remote-SSH, open:',
-      '',
-      `  ${vscodeLink(localLine)}`,
-      '',
-      localLine === workerLine
-        ? 'Or run "code flower: Connect to worker" and paste:'
-        : 'From VS Code elsewhere, run "code flower: Connect to worker" and paste:'
-    ]
-  : ['Or in VS Code, run "code flower: Connect to worker" and paste:'];
 process.stderr.write(
-  [
-    '',
-    `code flower worker ready (${AGENT_NAMES.filter((name) => !agents[name].unavailable).map((name) => agents[name].label).join(', ')}). ${opening[0]}`,
-    ...opening.slice(1),
-    '',
-    ...vscodeLines,
-    '',
-    `  ${workerLine}`,
-    '',
-    `Anyone with ${SERVE_PAGE ? 'these links' : 'this line'} can control the agents. Keep job logs private,`,
-    'e.g. sbatch --output=$HOME/.codeflower-logs/%j.out with that directory chmod 700.',
-    '',
-    ''
-  ].join('\n')
+  readyMessage({
+    agents: AGENT_NAMES.filter((name) => !agents[name].unavailable).map((name) => agents[name].label),
+    workerLine,
+    localLine,
+    page: SERVE_PAGE ? pageLink(bridge.address.host, bridge.address.port, bridge.address.token) : undefined,
+    appLinks: process.env.CODEFLOWER_APP_LINKS === '1'
+  })
 );
 
 let stopping;
