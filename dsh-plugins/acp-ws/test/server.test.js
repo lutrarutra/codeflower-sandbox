@@ -2584,3 +2584,11 @@ test("tells a chat's windows of the commands the agent runs, and lets them watch
   assert.equal(ended.params.commands[0].exitCode, 0);
   await closeSocket(socket);
 });
+
+test('/status reports the versions of the sandbox, when it has them', async (t) => {
+  const versions = { app: 'v0.40.0', image: '0.33.0', agents: { claude: '2.1.310' } };
+  const { bridge } = await startTestBridge(t, { versions });
+  assert.deepEqual((await status(bridge.address)).body.versions, versions);
+  const { bridge: older } = await startTestBridge(t);
+  assert.equal((await status(older.address)).body.versions, undefined);
+});

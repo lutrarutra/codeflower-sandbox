@@ -561,6 +561,8 @@ export async function startBridge(options) {
     // The chat page, served on the bridge's own port (`--server`): false, or
     // { directory, version }. onQuit stops the worker when the page quits.
     page: pageOptions = false,
+    // The versions of the sandbox's parts (versions.js), which /status reports.
+    versions,
     onQuit = () => {}
   } = options;
 
@@ -718,6 +720,7 @@ export async function startBridge(options) {
       chats: snapshot.chats.map(titled),
       ended: snapshot.ended.map(titled),
       turns: snapshot.turns,
+      ...(versions ? { versions } : {}),
       ...(wrapUpReason
         ? { wrapUp: { reason: wrapUpReason, state: wrappingUp.size ? 'running' : 'done', chats: wrapUpAsked } }
         : {})

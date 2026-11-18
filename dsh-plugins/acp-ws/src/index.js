@@ -9,6 +9,7 @@ import { PAGE_DIRECTORY } from './page.js';
 import { connectionUrl, pageLink, readyMessage, startBridge } from './server.js';
 import { EXIT_CODES, runTask } from './task.js';
 import { parseResume, runTui } from './tui.js';
+import { readVersions } from './versions.js';
 
 const RUNTIME_MODULES = '/opt/codeflower/runtime/node_modules';
 const STATE = '/codeflower-state';
@@ -250,6 +251,7 @@ const bridge = await startBridge({
   actions: await readActions(`${TEMPLATES}/actions`),
   wrapUpTemplate: await readFile(`${TEMPLATES}/wrap-up.md`, 'utf8'),
   wrapUpQuitTemplate: await readFile(`${TEMPLATES}/wrap-up-quit.md`, 'utf8'),
+  versions: await readVersions({ runtimeModules: RUNTIME_MODULES, pageDirectory: PAGE_DIRECTORY }),
   ptyHelper: ['/opt/conda/bin/python3', '/opt/codeflower/bin/codeflower-pty'],
   // Output and code folders: reports there take comments, like those in the workspace.
   writableFolders: mounts()
