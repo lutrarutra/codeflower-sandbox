@@ -48,7 +48,7 @@ Releases are published for linux/amd64 and linux/arm64, tagged `X.Y.Z`, `X.Y`, `
 - `licenses/`: the licenses of what the image includes without them (OpenCode's binaries, the
   Single-cell best practices book in `skills/`)
 - `bin/`: commands for the agent: `codeflower-show`, `codeflower-pty`, `codeflower-env-export`,
-  `codeflower-network`, `codeflower-doctor` (the worker's resources and, when isolated, its
+  `codeflower-network`, `codeflower-doctor` (the worker's resources, whether batch jobs can be submitted and, when isolated, its
   allowlist), `codeflower-inventory` (describes the mounted data: formats, shapes, columns),
   `codeflower-repro` (reproducible pipeline archives) and `snakemake` (run with the project's Python)
 - `reproduce.sh` and `lib/`: the entrypoint `codeflower reproduce` starts instead of `entrypoint.sh`:

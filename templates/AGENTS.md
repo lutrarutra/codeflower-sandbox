@@ -53,7 +53,8 @@ Python packages. OpenCV, ffmpeg, extra native libraries and GPU tooling are not 
 before relying on them, and install what you need in a project environment.
 
 At the start of a task, run `codeflower-doctor` for this worker's startup facts and current CPU,
-memory, disk, GPU and network information. Its allocation section is what the batch job (or the
+memory, disk, GPU and network information, and whether batch jobs (e.g. Slurm's `sbatch`) can be
+submitted from here: follow its batch-jobs section before submitting any. Its allocation section is what the batch job (or the
 user) granted, including when the job ends and the worker is stopped: size threads, worker pools,
 in-memory data and long computations to fit it, and save intermediate results before the end. Where
 no allocation is reported, go by the effective cgroup limits; host memory and CPU affinity may

@@ -1,6 +1,6 @@
 #!/usr/local/bin/node --no-warnings
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, statfsSync, writeFileSync } from 'node:fs';
+import { accessSync, constants, existsSync, readFileSync, statfsSync, statSync, writeFileSync } from 'node:fs';
 import { availableParallelism, freemem, totalmem } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -130,6 +130,57 @@ function resources() {
   return lines;
 }
 
+// Batch schedulers' submit commands. They are not in the image: a site may
+// mount them into the container (e.g. an OCI hook for Slurm under Podman).
+const schedulers = [
+  ['sbatch', 'Slurm'],
+  ['qsub', 'PBS or Grid Engine'],
+  ['bsub', 'LSF'],
+  ['condor_submit', 'HTCondor']
+];
+
+function onPath(command) {
+  for (const dir of (process.env.PATH ?? '').split(':')) {
+    if (!dir) continue;
+    const file = join(dir, command);
+    try {
+      accessSync(file, constants.X_OK);
+      if (statSync(file).isFile()) return file;
+    } catch {
+      // not here
+    }
+  }
+  return null;
+}
+
+// Whether the agent can submit batch jobs from the sandbox, and what that means.
+function batchJobs() {
+  const found = schedulers
+    .map(([command, name]) => ({ command, name, file: onPath(command) }))
+    .filter((scheduler) => scheduler.file);
+  if (!found.length) {
+    return ['- No batch scheduler commands (sbatch, qsub, bsub, condor_submit) here: jobs cannot be submitted from this sandbox.'];
+  }
+  const lines = found.map((scheduler) => `- ${scheduler.name}: \`${scheduler.command}\` at ${scheduler.file}`);
+  if (found.some((scheduler) => scheduler.command === 'sbatch')) {
+    try {
+      const jobs = execFileSync('squeue', ['--me', '--noheader', '--format=%i'],
+        { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+      const count = jobs ? jobs.split('\n').length : 0;
+      lines.push(`- Slurm controller: reachable; ${count} of the user's jobs queued or running (\`squeue --me\`), this worker's own included if it runs as a job`);
+    } catch (error) {
+      const reason = error.code === 'ENOENT' ? 'squeue not found'
+        : error.stderr?.toString().trim().split('\n').pop() || error.message;
+      lines.push(`- Slurm controller: not reachable (${reason}); submitting will likely fail`);
+    }
+  }
+  lines.push(
+    '- Submitted jobs run on the cluster as the user, outside this sandbox: sandbox paths (/data/…, /codeflower-state) and the environments installed here do not exist there. Give job scripts host paths (`codeflower-path PATH`) and software the cluster provides (modules, or a container). Jobs can reach everything the user\'s account can, not only the mounted folders, and they keep running after this worker stops.',
+    '- Ask the user before submitting jobs, follow any skill about this cluster, and tell the user which jobs are still queued or running when you finish.'
+  );
+  return lines;
+}
+
 function launchFacts() {
   const lines = [
     '# Sandbox environment at worker startup',
@@ -160,7 +211,8 @@ function launchFacts() {
   } catch (error) {
     lines.push(`- Mount metadata unavailable: ${error.message}`);
   }
-  lines.push('', '## Allocation', ...allocation(), '', '## Resources at startup', ...resources(), '');
+  lines.push('', '## Allocation', ...allocation(), '', '## Resources at startup', ...resources(), '',
+    '## Batch jobs', ...batchJobs(), '');
   return lines.join('\n');
 }
 
@@ -183,6 +235,7 @@ try {
     }
     console.log('\n## Current allocation\n' + allocation().join('\n'));
     console.log('\n## Current resources\n' + resources().join('\n'));
+    console.log('\n## Batch jobs\n' + batchJobs().join('\n'));
     if (process.env.CODEFLOWER_NETWORK === 'isolated') {
       console.log('\n## Current network allowlist');
       try {
