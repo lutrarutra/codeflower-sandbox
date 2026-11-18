@@ -99,6 +99,10 @@ socket.on('end', () => {
     process.exit(1);
   }
   for (const path of result.shown ?? []) console.log(`Opened ${path} for the user.`);
+  // No window is connected: the chat lists the files, for when the user opens it.
+  for (const path of result.noted ?? []) {
+    console.log(`No window is connected now: noted ${path} in the chat's shown files, where the user finds it later.`);
+  }
   // Links open the files in the user's browser: they work in a terminal UI.
   for (const link of result.links ?? []) console.log(`${linkOnly ? '' : 'Link for the user: '}${link.url}`);
 });

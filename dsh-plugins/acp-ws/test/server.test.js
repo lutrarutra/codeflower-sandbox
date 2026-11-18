@@ -989,6 +989,73 @@ test('shows files in the window that has the chat they come from, which notes th
   assert.deepEqual(showsIn(first), []);
 });
 
+test('notes the files shown in their chat itself, also with no window connected, and only once', async (t) => {
+  const workspaceDirectory = await mkdtemp(join(tmpdir(), 'codeflower-workspace-'));
+  t.after(() => rm(workspaceDirectory, { recursive: true, force: true }));
+  const showSocket = join(workspaceDirectory, 'show.sock');
+  const { bridge } = await startTestBridge(t, { workspace: workspaceDirectory, showSocket });
+  const showCommand = fileURLToPath(new URL('../../../bin/codeflower-show', import.meta.url));
+  const showFrom = (sessionId, ...args) =>
+    new Promise((resolve) => {
+      const env = { ...process.env, CODEFLOWER_SHOW_SOCKET: showSocket, CODEFLOWER_AGENT_NAME: 'claude', CLAUDE_CODE_SESSION_ID: sessionId };
+      delete env.CODEX_THREAD_ID;
+      execFile(process.execPath, [showCommand, ...args], { cwd: workspaceDirectory, env }, (error, stdout, stderr) =>
+        resolve({ code: error?.code ?? 0, stdout, stderr })
+      );
+    });
+  await writeFile(join(workspaceDirectory, 'report.md'), '# Report');
+  await writeFile(join(workspaceDirectory, 'umap.png'), 'png');
+  const shows = (entries) => entries.filter((entry) => entry.kind === 'show').map(({ files, message }) => ({ files, message }));
+  const transcript = async (socket, key) => (await call(socket, '_codeflower/sessions/transcript', { key })).result.entries;
+
+  const first = await openSocket(bridge.address);
+  await initialize(first);
+  const a = (await call(first, 'session/new', { cwd: workspaceDirectory, mcpServers: [] })).result.sessionId;
+  const key = sessionKey('claude', a);
+  await closeSocket(first);
+
+  // Nobody is connected: the chat lists the file for later, and the agent hears so.
+  const alone = await showFrom(a, '--message', 'Clusters', 'umap.png');
+  assert.equal(alone.code, 0, alone.stderr);
+  assert.match(alone.stdout, /No window is connected now: noted .*umap\.png in the chat's shown files/);
+
+  const owner = await openSocket(bridge.address);
+  t.after(() => closeSocket(owner));
+  await initialize(owner);
+  await waitFor(async () => shows(await transcript(owner, key)).length === 1);
+  const [noted] = shows(await transcript(owner, key));
+  assert.ok(noted.files[0].endsWith('/umap.png'));
+  assert.equal(noted.message, 'Clusters');
+
+  // Two windows with the chat open: one opens the file, the other hears it was shown.
+  assert.ok((await call(owner, 'session/resume', { sessionId: a, cwd: workspaceDirectory, mcpServers: [] })).result);
+  const watcher = await openSocket(bridge.address);
+  t.after(() => closeSocket(watcher));
+  await initialize(watcher);
+  assert.ok((await call(watcher, 'session/resume', { sessionId: a, cwd: workspaceDirectory, mcpServers: [] })).result);
+  // The window that sent the latest prompt opens them.
+  assert.equal((await call(owner, 'session/prompt', { sessionId: a, prompt: [{ type: 'text', text: 'say hello' }] })).result.stopReason, 'end_turn');
+  assert.equal((await showFrom(a, 'report.md')).code, 0);
+  const opened = await receive(owner, (message) => message.method === '_codeflower/show');
+  assert.equal(opened.params.key, key);
+  assert.equal(opened.params.noted, true);
+  const heard = await receive(watcher, (message) => message.method === '_codeflower/shown');
+  assert.equal(heard.params.key, key);
+  assert.ok(heard.params.files[0].endsWith('/report.md'));
+  assert.equal(inboxes.get(watcher).messages.filter((message) => message.method === '_codeflower/show').length, 0);
+
+  // An older window notes the same files again: they are listed once.
+  assert.deepEqual((await call(owner, '_codeflower/sessions/record', { sessionId: a, entry: { kind: 'show', files: opened.params.files.map((file) => file.path) } })).result, {});
+  // A show of the window's own (no agent asked) is noted.
+  assert.deepEqual((await call(owner, '_codeflower/sessions/record', { sessionId: a, entry: { kind: 'show', files: [noted.files[0]] } })).result, {});
+  await waitFor(async () => shows(await transcript(owner, key)).length === 3);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.deepEqual(
+    shows(await transcript(owner, key)).map((show) => show.files.map((file) => file.split('/').at(-1))),
+    [['umap.png'], ['report.md'], ['umap.png']]
+  );
+});
+
 test('takes files attached to messages in chunks, into the workspace uploads folder only', async (t) => {
   const workspaceDirectory = await mkdtemp(join(tmpdir(), 'codeflower-workspace-'));
   t.after(() => rm(workspaceDirectory, { recursive: true, force: true }));

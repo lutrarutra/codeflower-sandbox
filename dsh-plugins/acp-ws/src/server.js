@@ -1161,6 +1161,41 @@ export async function startBridge(options) {
         if (target !== except && target.sessions.has(sessionId)) target.send(message);
       }
     };
+    // Files the agent showed in a chat (codeflower-show), noted in its
+    // transcript here, so also while no window has the chat open, and sent to
+    // the windows that have it open but `except` (the one that opens them).
+    // Windows that note them themselves (`sessions/record`, as they did before
+    // the bridge did) are not noted again: the shows of the last minute.
+    const recentShows = new Map();
+    const showSignature = (files, message) => JSON.stringify([files, message || null]);
+    async function noteShown(sessionId, paths, message, except) {
+      if (!recorder || !(await recorder.isOpen(sessionId))) return false;
+      const files = paths.slice(0, 20).map((file) => file.slice(0, 4096));
+      const note = typeof message === 'string' && message ? message.slice(0, 2000) : undefined;
+      recorder.record(sessionId, { kind: 'show', files, ...(note ? { message: note } : {}) });
+      const since = Date.now() - 60_000;
+      for (const [id, shows] of recentShows) {
+        const kept = shows.filter((show) => show.at > since);
+        if (kept.length) recentShows.set(id, kept);
+        else recentShows.delete(id);
+      }
+      recentShows.set(sessionId, [...(recentShows.get(sessionId) ?? []), { signature: showSignature(files, note), at: Date.now() }]);
+      toSession(
+        sessionId,
+        { jsonrpc: '2.0', method: '_codeflower/shown', params: { key: sessionKey(agentName, sessionId), sessionId, files, ...(note ? { message: note } : {}) } },
+        except
+      );
+      return true;
+    }
+    // Whether a window's `sessions/record` of a show repeats one noted above.
+    const notedAlready = (sessionId, files, message) => {
+      const shows = recentShows.get(sessionId) ?? [];
+      const signature = showSignature(files, message);
+      const at = shows.findIndex((show) => show.signature === signature && show.at > Date.now() - 60_000);
+      if (at < 0) return false;
+      shows.splice(at, 1);
+      return true;
+    };
     // The prompts waiting for each chat's turn to end, from any window
     // (prompt-queue.js). Outside the agent's host: they outlive its restarts.
     const promptQueue = createPromptQueue({
@@ -3133,11 +3168,12 @@ export async function startBridge(options) {
           if (!recorder || !(typeof sessionId === 'string' && (await recorder.isOpen(sessionId)))) {
             throw new InvalidRequest('The session is not open on this worker');
           }
-          recorder.record(sessionId, {
-            kind: 'show',
-            files: files.map((file) => file.slice(0, 4096)),
-            ...(typeof entry.message === 'string' ? { message: entry.message.slice(0, 2000) } : {})
-          });
+          const noted = files.map((file) => file.slice(0, 4096));
+          const note = typeof entry.message === 'string' ? entry.message.slice(0, 2000) : undefined;
+          // A show the bridge noted itself, which older windows note again.
+          if (!notedAlready(sessionId, noted, note)) {
+            recorder.record(sessionId, { kind: 'show', files: noted, ...(note !== undefined ? { message: note } : {}) });
+          }
           respond({});
           break;
         }
@@ -3398,6 +3434,7 @@ export async function startBridge(options) {
         return account;
       },
       flush: () => recorder?.flush(),
+      noteShown,
       commands,
       // The chats whose agent or a subagent works, for a wrap-up: idle ones,
       // even those waiting for the user, have nothing to wrap up.
@@ -3809,13 +3846,17 @@ export async function startBridge(options) {
   });
 
   // Files to look at, for a window to open and note in the chat (its Shown tab).
-  function sendShow(target, files, { title, message, sessionId } = {}) {
+  // `key` names the chat also to a window of another agent; `noted`: the
+  // bridge noted the files in it, so the window does not.
+  function sendShow(target, files, { title, message, sessionId, key, noted } = {}) {
     target.send({
       jsonrpc: '2.0',
       method: '_codeflower/show',
       params: {
         files,
         ...(sessionId !== undefined ? { sessionId } : {}),
+        ...(key !== undefined ? { key } : {}),
+        ...(noted ? { noted: true } : {}),
         ...(typeof title === 'string' ? { title: title.slice(0, 200) } : {}),
         ...(typeof message === 'string' ? { message: message.slice(0, 2000) } : {})
       }
@@ -3847,17 +3888,35 @@ export async function startBridge(options) {
           ...(typeof request.message === 'string' ? { message: request.message.slice(0, 2000) } : {})
         });
       }
-      // One window opens them and notes them in the chat: one that has the
-      // chat open. Without one, the window that sent the latest prompt, else
-      // the newest, which picks a chat itself.
+      // One window opens them: one that has the chat open. Without one, the
+      // window that sent the latest prompt, else the newest. The bridge notes
+      // them in the chat, whether a window is connected or not; for a chat it
+      // does not know, the window picks one and notes them there.
       const owner = chat && chatWindow(chat);
       const target = owner ?? (clients.has(lastPrompter) ? lastPrompter : newestClient());
+      const shownPaths = files.map((file) => file.path);
+      let noted = false;
+      if (chat) {
+        try {
+          noted = (await runtimes.get(chat.agent)?.noteShown(chat.sessionId, shownPaths, request.message, target)) === true;
+        } catch (error) {
+          log(`Could not note the files shown in ${chat.key}: ${error.message}`);
+        }
+      }
       if (!target) {
+        if (noted) return { shown: [], noted: shownPaths, ...(links.length ? { links } : {}) };
         if (links.length) return { shown: [], links };
         return { error: 'No window is connected to this worker, so nobody can see the files now' };
       }
-      sendShow(target, files, { title: request.title, message: request.message, sessionId: owner ? chat.sessionId : undefined });
-      return { shown: files.map((file) => file.path), ...(links.length ? { links } : {}) };
+      sendShow(target, files, {
+        title: request.title,
+        message: request.message,
+        // Older windows take the chat from `sessionId` and their own agent.
+        sessionId: chat && (owner || target.agentName === chat.agent) ? chat.sessionId : undefined,
+        key: chat?.key,
+        noted
+      });
+      return { shown: shownPaths, ...(links.length ? { links } : {}) };
     });
   } catch (error) {
     log(`codeflower-show is unavailable: ${error.message}`);
