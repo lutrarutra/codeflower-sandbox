@@ -3299,6 +3299,14 @@ export async function startBridge(options) {
           respond({ sent: true });
           break;
         }
+        // All the waiting prompts in the next turn, as one, or one per turn.
+        case '_codeflower/queue/together': {
+          const { sessionId } = queuedChat();
+          if (typeof params.together !== 'boolean') throw new InvalidRequest('together must be true or false');
+          promptQueue.setTogether(sessionId, params.together);
+          respond(promptQueue.snapshot(sessionId));
+          break;
+        }
         case '_codeflower/queue/resume': {
           const { sessionId } = queuedChat();
           promptQueue.resume(sessionId);

@@ -78,6 +78,34 @@ test('takes the user’s own prompts, or one, back to a window', () => {
   assert.deepEqual(queue.snapshot('s'), { items: [] });
 });
 
+test('together sends all the waiting prompts as one, and a second prompt resets it', () => {
+  const queue = createPromptQueue();
+  queue.add('s', prompt('one'));
+  queue.setTogether('s', true);
+  // The second prompt: one per turn again.
+  queue.add('s', prompt('two'));
+  assert.equal(queue.snapshot('s').together, undefined);
+  queue.setTogether('s', true);
+  assert.equal(queue.snapshot('s').together, true);
+  // A third keeps the choice.
+  queue.add('s', { ...prompt('three'), prompt: [{ type: 'text', text: 'three' }, { type: 'image', data: 'x', mimeType: 'image/png' }] });
+  queue.add('s', { ...prompt('four'), editable: false });
+  assert.equal(queue.snapshot('s').together, true);
+  const next = queue.next('s');
+  assert.deepEqual(next.prompt, [
+    { type: 'text', text: 'one\n\ntwo\n\nthree' },
+    { type: 'image', data: 'x', mimeType: 'image/png' },
+    { type: 'text', text: 'four' }
+  ]);
+  assert.equal(next.text, 'one\n\ntwo\n\nthree\n\nfour');
+  assert.equal(next.editable, undefined);
+  assert.deepEqual(queue.snapshot('s'), { items: [] });
+  // A new queue starts one per turn.
+  queue.add('s', prompt('five'));
+  queue.add('s', prompt('six'));
+  assert.equal(queue.next('s').text, 'five');
+});
+
 test('chats have queues of their own, of a limited length', () => {
   const queue = createPromptQueue();
   queue.add('a', prompt('one'));

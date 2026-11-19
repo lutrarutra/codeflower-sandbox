@@ -3,6 +3,10 @@
 // per turn, in order, also while no window is open, and every window that
 // opens the chat sees them (`_codeflower/queue`).
 //
+// With `together` (a window's switch, once two or more wait) the next turn
+// gets all of them as one prompt. A second prompt always sets it back to one
+// per turn, so the user chooses again for what waits now.
+//
 // The next one goes once a turn ends with end_turn. Any other end (a refusal,
 // an error, a cancel the queue did not ask for) pauses the queue, which keeps
 // its prompts until a window resumes it. A cancel the queue asked for (send
@@ -15,14 +19,14 @@ export const MAX_QUEUED = 100;
 export const MAX_QUEUED_BYTES = 1_000_000;
 
 export function createPromptQueue({ onChange = () => {} } = {}) {
-  // Per session: { items, paused, resumeAfterCancel }.
+  // Per session: { items, paused, resumeAfterCancel, together }.
   const chats = new Map();
   let nextId = 1;
 
   const chat = (sessionId) => {
     let state = chats.get(sessionId);
     if (!state) {
-      state = { items: [], paused: null, resumeAfterCancel: false };
+      state = { items: [], paused: null, resumeAfterCancel: false, together: false };
       chats.set(sessionId, state);
     }
     return state;
@@ -62,8 +66,17 @@ export function createPromptQueue({ onChange = () => {} } = {}) {
         ...(action ? { action } : {})
       };
       state.items.push(item);
+      if (state.items.length === 2) state.together = false;
       changed(sessionId);
       return item;
+    },
+
+    /** All the waiting prompts in the next turn, as one (`true`), or one per turn. */
+    setTogether(sessionId, together) {
+      const state = chats.get(sessionId);
+      if (!state || state.together === together) return;
+      state.together = together;
+      changed(sessionId);
     },
 
     remove(sessionId, id) {
@@ -137,10 +150,10 @@ export function createPromptQueue({ onChange = () => {} } = {}) {
       return Boolean(state?.items.length) && !state.paused;
     },
 
-    /** The next prompt, off the queue. */
+    /** The next prompt, off the queue: with `together`, all of them as one. */
     next(sessionId) {
       const state = chats.get(sessionId);
-      const item = state?.items.shift();
+      const item = state?.together && state.items.length > 1 ? combined(state.items.splice(0)) : state?.items.shift();
       // It goes now: a cancel asked for it has nothing left to wait for.
       if (item) state.resumeAfterCancel = false;
       if (item) changed(sessionId);
@@ -174,13 +187,38 @@ export function createPromptQueue({ onChange = () => {} } = {}) {
           ...(editable ? { editable } : {}),
           ...(action ? { action } : {})
         })),
-        ...(state?.paused ? { paused: state.paused } : {})
+        ...(state?.paused ? { paused: state.paused } : {}),
+        ...(state?.together ? { together: true } : {})
       };
     },
 
     sessions() {
       return [...chats.keys()];
     }
+  };
+}
+
+// Prompts as one, in order: a text block that follows another text block
+// joins it after a blank line (a separate whitespace block is not valid
+// everywhere).
+function combined(items) {
+  const prompt = [];
+  for (const item of items) {
+    for (const [index, block] of item.prompt.entries()) {
+      const last = prompt.at(-1);
+      if (index === 0 && block?.type === 'text' && last?.type === 'text') {
+        prompt[prompt.length - 1] = { ...last, text: `${last.text}\n\n${block.text}` };
+      } else {
+        prompt.push(block);
+      }
+    }
+  }
+  return {
+    id: items[0].id,
+    prompt,
+    text: items.map((item) => item.text).join('\n\n'),
+    title: items.map((item) => item.title).join(' · '),
+    ...(items.every((item) => item.editable) ? { editable: true } : {})
   };
 }
 

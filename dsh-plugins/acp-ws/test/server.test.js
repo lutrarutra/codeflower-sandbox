@@ -1741,6 +1741,28 @@ test('queues prompts on the worker, which go on while no window is open', async 
   );
 });
 
+test('together sends all the queued prompts in the next turn, as one', async (t) => {
+  const { bridge } = await startTestBridge(t);
+  const socket = await openSocket(bridge.address);
+  t.after(() => closeSocket(socket));
+  await initialize(socket);
+  const sessionId = (await call(socket, 'session/new', { cwd: '/workspace', mcpServers: [] })).result.sessionId;
+  const key = sessionKey('claude', sessionId);
+  const queue = (text) => call(socket, '_codeflower/queue/add', { key, prompt: [{ type: 'text', text }], editable: true });
+
+  await queue('long task');
+  await receive(socket, (message) => text(message) === 'started');
+  await queue('first');
+  await queue('second');
+  assert.equal((await call(socket, '_codeflower/queue/together', { key, together: 'yes' })).error.code, -32602);
+  const together = (await call(socket, '_codeflower/queue/together', { key, together: true })).result;
+  assert.equal(together.together, true);
+  assert.deepEqual(together.items.map((item) => item.title), ['first', 'second']);
+  send(socket, { jsonrpc: '2.0', method: 'fake/finish', params: { sessionId, stopReason: 'end_turn' } });
+  const prompted = await receive(socket, (message) => message.method === '_codeflower/prompted' && message.params.prompt[0].text !== 'long task');
+  assert.deepEqual(prompted.params.prompt, [{ type: 'text', text: 'first\n\nsecond' }]);
+});
+
 test('a turn that ends otherwise pauses the queue, which any window resumes', async (t) => {
   const { bridge } = await startTestBridge(t);
   const first = await openSocket(bridge.address);
