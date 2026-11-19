@@ -33,6 +33,7 @@ import {
 } from './sessions.js';
 import { createDownloads } from './downloads.js';
 import { createThumbnails } from './thumbnails.js';
+import { createSearch, searchFolders } from './search.js';
 import { DID_NOT_START, addedMcpServers, claudeMcpConfig, describeLeftOut, failedMcpServers, mcpServersFor, withMcpServers } from './mcp.js';
 import { DEFAULT_UPLOAD_MAX_BYTES, createUploads } from './uploads.js';
 import { createUsage, dshTokens } from './usage.js';
@@ -771,6 +772,16 @@ export async function startBridge(options) {
         return terminal ? { ...session, terminal: chatTerminals.describe(terminal) } : session;
       });
   };
+
+  // The page's search: files by name and by what they say, and what chats say.
+  const search = createSearch({
+    folders: async () => searchFolders(workspace, (await describe())?.mounts ?? []),
+    sessionsDirectory,
+    sessions: allSessions,
+    log
+  });
+  // Each window's search of file contents still running, stopped by the next.
+  const contentSearches = new Map();
 
   const bearer = (request) => {
     const authorization = request.headers.authorization;
@@ -3539,6 +3550,8 @@ export async function startBridge(options) {
       for (const each of runtimes.values()) each.commands.detachClient(self);
       void uploads.release(self);
       void downloads.release(self);
+      contentSearches.get(self)?.abort();
+      contentSearches.delete(self);
       clients.delete(self);
       runtime?.clients.delete(self);
       const why = [code, reason?.toString().trim()].filter(Boolean).join(' ');
@@ -3626,7 +3639,9 @@ export async function startBridge(options) {
             capabilities: {
               ...fields.capabilities,
               // The user's shells (`_codeflower/terminal/start` kind "shell").
-              shellTerminals: Boolean(Array.isArray(ptyHelper) && ptyHelper.length)
+              shellTerminals: Boolean(Array.isArray(ptyHelper) && ptyHelper.length),
+              // The page's search (`_codeflower/search/*`).
+              search: true
             },
             agents: await describeAgents(),
             // What an agent's window hears in `initialize`, for the worker's own: sending files both ways.
@@ -3728,6 +3743,24 @@ export async function startBridge(options) {
           break;
         case '_codeflower/files/list':
           respond(await listDirectory(params.path, fileOptions));
+          break;
+        // The page's search (Ctrl+K): file names fuzzily, then file contents and chats.
+        case '_codeflower/search/paths':
+          respond(await search.paths(params));
+          break;
+        case '_codeflower/search/contents': {
+          contentSearches.get(self)?.abort();
+          const controller = new AbortController();
+          contentSearches.set(self, controller);
+          try {
+            respond({ ...(await search.contents(params, { signal: controller.signal })), ...(controller.signal.aborted ? { superseded: true } : {}) });
+          } finally {
+            if (contentSearches.get(self) === controller) contentSearches.delete(self);
+          }
+          break;
+        }
+        case '_codeflower/search/chats':
+          respond(await search.chats(params));
           break;
         case '_codeflower/files/upload':
           respond(await uploads.handle(params, self));

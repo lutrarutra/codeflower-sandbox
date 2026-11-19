@@ -858,7 +858,7 @@ test("manages the agent's plugins and starts the agent with them", async (t) => 
   const socket = await openSocket(bridge.address);
   assert.equal((await initialize(socket)).pluginSeed, '/empty');
   const { subagents, ...capabilities } = (await call(socket, '_codeflower/status')).result.capabilities;
-  assert.deepEqual(capabilities, { plugins: true, chatTerminals: true, commands: true, promptQueue: true, shellTerminals: true });
+  assert.deepEqual(capabilities, { plugins: true, chatTerminals: true, commands: true, promptQueue: true, shellTerminals: true, search: true });
   assert.deepEqual(subagents.settings, { model: { applies: 'session' } });
 
   assert.match((await call(socket, '_codeflower/plugins/add', { source: 'npm:x@1' })).error.message, /github:, not npm:/);
@@ -887,7 +887,7 @@ test('an agent without plugins says so and refuses the plugin methods', async (t
   t.after(() => closeSocket(socket));
   await initialize(socket);
   const { subagents: _, ...capabilities } = (await call(socket, '_codeflower/status')).result.capabilities;
-  assert.deepEqual(capabilities, { plugins: false, chatTerminals: true, commands: true, promptQueue: true, shellTerminals: true });
+  assert.deepEqual(capabilities, { plugins: false, chatTerminals: true, commands: true, promptQueue: true, shellTerminals: true, search: true });
   assert.deepEqual((await call(socket, '_codeflower/plugins/list')).result, { available: false });
   assert.match((await call(socket, '_codeflower/plugins/add', { source: 'github:a/b' })).error.message, /no plugins/);
 });
@@ -942,6 +942,30 @@ test('shows the files the agent asks for and lets the client read them', async (
   const denied = await call(socket, '_codeflower/files/read', { path: join(sessionsDirectory, 'secret.txt') });
   assert.match(denied.error.message, /cannot be shown/);
   assert.match((await show('missing.png')).stderr, /No such file: missing.png/);
+  await closeSocket(socket);
+});
+
+test('searches the workspace, the mounts and the chats for the page', async (t) => {
+  const workspaceDirectory = await realpath(await mkdtemp(join(tmpdir(), 'codeflower-workspace-')));
+  const input = await realpath(await mkdtemp(join(tmpdir(), 'codeflower-input-')));
+  t.after(() => Promise.all([workspaceDirectory, input].map((path) => rm(path, { recursive: true, force: true }))));
+  await writeFile(join(workspaceDirectory, 'qc_report.html'), '<p>doublet rate</p>');
+  await writeFile(join(input, 'qc_metrics.tsv'), 'doublet rate\t0.1\n');
+  const { bridge } = await startTestBridge(t, {
+    workspace: workspaceDirectory,
+    describe: async () => ({ mounts: [{ source: '/host/study', target: input, readOnly: true }] })
+  });
+  const socket = await openSocket(bridge.address);
+  await initialize(socket);
+  assert.equal((await call(socket, '_codeflower/status')).result.capabilities.search, true);
+
+  const paths = (await call(socket, '_codeflower/search/paths', { query: 'qcrep' })).result;
+  assert.deepEqual(paths.files.map((file) => file.path), [join(workspaceDirectory, 'qc_report.html')]);
+  // The mount is not under /data/input here, so its contents are read too.
+  const contents = (await call(socket, '_codeflower/search/contents', { query: 'doublet rate' })).result;
+  assert.deepEqual(contents.files.map((file) => file.path).sort(), [join(workspaceDirectory, 'qc_report.html'), join(input, 'qc_metrics.tsv')].sort());
+  assert.deepEqual((await call(socket, '_codeflower/search/chats', { query: 'doublet' })).result, { chats: [], truncated: false });
+  assert.match((await call(socket, '_codeflower/search/paths', { query: 'x'.repeat(300) })).error.message, /too long/);
   await closeSocket(socket);
 });
 
