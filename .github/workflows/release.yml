@@ -105,6 +105,8 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: dsh-plugins/acp-ws/package-lock.json
+      # The search runs ripgrep, as the image has it.
+      - run: sudo apt-get update -q && sudo apt-get install -yq ripgrep
       - run: make bridge-install
       - run: make bridge-test
 
