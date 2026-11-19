@@ -274,6 +274,10 @@ test("opens the user's shell in the workspace, without the worker's token, which
 
   await page.call('_codeflower/terminal/input', { terminalId: started.terminalId, data: 'echo "in [$PWD] token [$CODEFLOWER_TOKEN] $((6 * 7))"\r' });
   await page.printed(started.terminalId, new RegExp(`in \\[${workspace}\\] token \\[\\] 42`));
+  // The size is the terminal's, not variables that would hold curses programs at the first one.
+  await page.call('_codeflower/terminal/resize', { terminalId: started.terminalId, columns: 120, rows: 40 });
+  await page.call('_codeflower/terminal/input', { terminalId: started.terminalId, data: 'echo "size [$(stty size)] env [$(env | grep -cE \'^(COLUMNS|LINES)=\')]"\r' });
+  await page.printed(started.terminalId, /size \[40 120\] env \[0\]/);
   await page.close();
 
   // Still running: the next window gets what it printed, and can end it.

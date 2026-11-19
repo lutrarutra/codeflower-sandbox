@@ -3,8 +3,8 @@
 
 The bridge uses it for sign-in commands (e.g. `claude auth login`) and for
 the agents' own terminal UIs, which need a real terminal. The size comes from
-COLUMNS and LINES; when file descriptor 3 is open, it takes JSON lines like
-{"resize": [columns, rows]} there to change it.
+COLUMNS and LINES, which the command does not get; when file descriptor 3 is
+open, it takes JSON lines like {"resize": [columns, rows]} there to change it.
 """
 import fcntl
 import json
@@ -50,6 +50,11 @@ def main() -> int:
     if pid == 0:
         # Sized before the program starts, so it draws at the right size at once.
         fcntl.ioctl(0, termios.TIOCSWINSZ, window_size(columns, lines))
+        # Not passed on: curses programs (htop, less, vim) take COLUMNS and
+        # LINES over the terminal's size, so they would keep this first size
+        # through every resize.
+        os.environ.pop("COLUMNS", None)
+        os.environ.pop("LINES", None)
         if control is not None:
             os.close(control)
         os.environ.setdefault("TERM", "xterm-256color")
