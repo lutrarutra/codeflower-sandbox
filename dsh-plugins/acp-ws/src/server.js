@@ -38,6 +38,7 @@ import { DID_NOT_START, addedMcpServers, claudeMcpConfig, describeLeftOut, faile
 import { DEFAULT_UPLOAD_MAX_BYTES, createUploads } from './uploads.js';
 import { createUsage, dshTokens } from './usage.js';
 import { createPromptQueue, queuedPromptOf } from './prompt-queue.js';
+import { createJobs, readJobsInfo } from './jobs.js';
 import { createSubagentSettings, mergeMeta, settingsEffects } from './subagents/settings.js';
 import { createSubagentTracker } from './subagents/tracker.js';
 
@@ -262,6 +263,9 @@ export function agentEnvironment(environment, harnessEnvironment = {}) {
   delete result.CODEFLOWER_MCP_SERVERS;
   delete result.CODEFLOWER_PLUGINS;
   delete result.CODEFLOWER_PLUGINS_FETCH;
+  // With the bridge, jobs go through it (and the user's approval); a task's
+  // agent, which has no bridge, writes to the spool itself.
+  if (result.CODEFLOWER_JOBS_SOCKET) delete result.CODEFLOWER_JOBS_SPOOL;
   for (const name of CREDENTIAL_VARIABLES) {
     delete result[name];
   }
@@ -549,6 +553,14 @@ export async function startBridge(options) {
     commandsWrapper = '/opt/codeflower/bin/codeflower-cmd',
     // `codeflower-browser` reaches the bridge here, for its chat's browser.
     browserSocket = join(tmpdir(), `codeflower-browser-${instanceId}.sock`),
+    // `codeflower-job` reaches the bridge here, when the app lets the agent
+    // ask for batch jobs (CODEFLOWER_JOBS); the bridge passes them on through
+    // the spool the app reads (CODEFLOWER_JOBS_SPOOL).
+    jobsSocket = join(tmpdir(), `codeflower-jobs-${instanceId}.sock`),
+    jobsInfo = readJobsInfo(workerEnvironment),
+    jobsSpool = workerEnvironment.CODEFLOWER_JOBS_SPOOL,
+    // Tests make the jobs' timings short (createJobs).
+    jobsTiming = {},
     // Chromium from the image's browser bundle, installed on first use; a binary of its own instead in development and tests.
     browserBinary = workerEnvironment.CODEFLOWER_BROWSER_BIN || undefined,
     browserManifest = BROWSER_MANIFEST,
@@ -599,10 +611,14 @@ export async function startBridge(options) {
     ...workerEnvironment,
     CODEFLOWER_SHOW_SOCKET: showSocket,
     CODEFLOWER_BROWSER_SOCKET: browserSocket,
+    ...(jobsInfo && jobsSpool ? { CODEFLOWER_JOBS_SOCKET: jobsSocket } : {}),
     // Where the browser's Chromium is (once installed), for the agent's own Playwright too (executablePath).
     ...(browserExecutable ? { CODEFLOWER_BROWSER_BIN: browserExecutable } : {})
   };
   const fileOptions = { workspace, privateDirectory, writableFolders };
+  // Batch jobs (jobs.js), once the agents are there.
+  let jobs;
+  let jobsServer;
   const uploads = createUploads({ workspace, fileOptions, maxBytes: uploadMaxBytes, log });
   const downloads = createDownloads({ fileOptions, log });
   const thumbnails = createThumbnails({
@@ -722,6 +738,7 @@ export async function startBridge(options) {
       ended: snapshot.ended.map(titled),
       turns: snapshot.turns,
       ...(versions ? { versions } : {}),
+      ...(jobs ? { jobs: jobs.summary() } : {}),
       ...(wrapUpReason
         ? { wrapUp: { reason: wrapUpReason, state: wrappingUp.size ? 'running' : 'done', chats: wrapUpAsked } }
         : {})
@@ -1092,7 +1109,9 @@ export async function startBridge(options) {
     // With no chat to ask, the windows have nothing to show.
     if (chats.length) broadcast({ jsonrpc: '2.0', method: '_codeflower/wrapUp', params: { ...notice, chats: chats.length } });
     const done = Promise.all(
-      chats.map(({ runtime, sessionId, key }) => runtime.wrapUp(sessionId, notice, template).finally(() => wrappingUp.delete(key)))
+      chats.map(({ runtime, sessionId, key }) =>
+        runtime.wrapUp(sessionId, notice, template + (jobs?.wrapUpNote(runtime.name, sessionId) ?? '')).finally(() => wrappingUp.delete(key))
+      )
     );
     return { chats: chats.length, done };
   };
@@ -1657,11 +1676,12 @@ export async function startBridge(options) {
     const cancelChat = (host, sessionId) => {
       dropPrompts(host, sessionId);
       writeToAgent(host, { jsonrpc: '2.0', method: 'session/cancel', params: { sessionId } });
-      for (const [key, { message, sessionId: owner }] of host.waiting) {
+      for (const [key, { message, sessionId: owner, answer }] of host.waiting) {
         if (owner !== sessionId && !host.subagents.ancestors(owner).includes(sessionId)) continue;
         const result = message.method === 'session/request_permission' ? { outcome: { outcome: 'cancelled' } } : { action: 'cancel' };
         settleWaiting(host, key, result);
-        writeToAgent(host, { jsonrpc: '2.0', id: message.id, result });
+        if (answer) recorder?.fromClient({ jsonrpc: '2.0', id: message.id, result });
+        else writeToAgent(host, { jsonrpc: '2.0', id: message.id, result });
       }
     };
 
@@ -1871,7 +1891,7 @@ export async function startBridge(options) {
       if (typeof toolCallId !== 'string') return;
       for (const [key, waiting] of host.waiting) {
         const { message } = waiting;
-        if (waiting.sessionId !== sessionId || message.method !== 'session/request_permission') continue;
+        if (waiting.answer || waiting.sessionId !== sessionId || message.method !== 'session/request_permission') continue;
         if (message.params?.toolCall?.toolCallId !== toolCallId) continue;
         const options = Array.isArray(message.params.options) ? message.params.options : [];
         const allow = kind.startsWith('allow');
@@ -2274,6 +2294,8 @@ export async function startBridge(options) {
       host.waiting.delete(key);
       activity.answered(key);
       commands.answered(key);
+      // The bridge's own request (askUser) hears the answer itself.
+      waiting.answer?.(result ?? null);
       const { sessionId } = waiting;
       const params = {
         ...(sessionId !== undefined ? { key: sessionKey(agentName, sessionId), sessionId } : {}),
@@ -2859,8 +2881,10 @@ export async function startBridge(options) {
       if (message.method === undefined) {
         if (message.id === undefined) return;
         const key = requestKey(message.id);
+        const bridgeOwn = host.waiting.get(key)?.answer;
         if (settleWaiting(host, key, message.result, self)) {
-          writeToAgent(host, message, self.webSocket);
+          if (bridgeOwn) recorder?.fromClient(message);
+          else writeToAgent(host, message, self.webSocket);
         } else if (host.forwarded.get(key) === self) {
           host.forwarded.delete(key);
           writeToAgent(host, message, self.webSocket);
@@ -3478,6 +3502,41 @@ export async function startBridge(options) {
         }
         drainQueue(sessionId);
       },
+      // A question of the bridge's own for the user (e.g. a batch job to
+      // allow), asked as a permission request in the chat: every window with
+      // the chat open gets it, also those that open it later, and the first
+      // answer resolves it (undefined when the agent is not running).
+      askUser(sessionId, { toolCall, options }) {
+        const host = agentHost;
+        if (!host || closing || !childRunning(host.child)) return Promise.resolve(undefined);
+        return new Promise((answer) => {
+          const id = `codeflower-ask-${host.nextRequest++}`;
+          const key = requestKey(id);
+          const message = {
+            jsonrpc: '2.0',
+            id,
+            method: 'session/request_permission',
+            params: { sessionId, toolCall, options, _meta: { 'codeflower/requestKey': key, 'codeflower/bridge': true } }
+          };
+          recorder?.fromAgent(message);
+          host.waiting.set(key, { message, sessionId, answer });
+          activity.permission(key, sessionId, toolCall);
+          for (const target of clients) {
+            if (target.sessions.has(sessionId)) deliver(target, key, message);
+          }
+        });
+      },
+      // Tells a chat something as its next prompt, once its turn has ended.
+      tell(sessionId, text, title) {
+        try {
+          promptQueue.add(sessionId, { prompt: [{ type: 'text', text }], text, title });
+        } catch (error) {
+          log(`Could not tell ${sessionKey(agentName, sessionId)}: ${error.message}`);
+          return false;
+        }
+        drainQueue(sessionId);
+        return true;
+      },
       fromHook,
       startInitialSession,
       async close() {
@@ -3654,7 +3713,9 @@ export async function startBridge(options) {
             agents: await describeAgents(),
             // What an agent's window hears in `initialize`, for the worker's own: sending files both ways.
             files: { upload: { ...uploads.capability, folders: true }, download: downloads.capability },
-            ...(slurmJobId ? { slurmJobId } : {})
+            ...(slurmJobId ? { slurmJobId } : {}),
+            // Batch jobs the agents may ask for (`_codeflower/jobs/*`).
+            ...(jobs ? { jobs: jobs.summary() } : {})
           });
           break;
         }
@@ -3826,6 +3887,18 @@ export async function startBridge(options) {
           await browsers.browserOf(browserKey(params)).selectTab(params.targetId);
           respond({});
           break;
+        // The project's batch jobs: those active and of the last day.
+        case '_codeflower/jobs/list':
+          respond({ jobs: jobs ? jobs.snapshot() : [], ...(jobs ? { summary: jobs.summary() } : {}) });
+          break;
+        case '_codeflower/jobs/cancel': {
+          if (!jobs) throw new InvalidRequest('This worker has no batch jobs');
+          if (typeof params.id !== 'string' || !params.id) throw new InvalidRequest('Name the job to cancel (id)');
+          const answer = await jobs.cancel(params.id);
+          if (!answer.ok) throw new InvalidRequest(answer.error ?? 'Could not cancel the job');
+          respond({ job: answer.job });
+          break;
+        }
         // The user is done in the browser: the agent gets it back, and a
         // message if it handed it over.
         case '_codeflower/browser/handBack': {
@@ -4023,6 +4096,30 @@ export async function startBridge(options) {
     log(`codeflower-browser is unavailable: ${error.message}`);
   }
 
+  // codeflower-job: batch jobs, asked for in the chat its command runs in.
+  if (jobsInfo && jobsSpool && privateDirectory) {
+    jobs = createJobs({
+      info: jobsInfo,
+      spool: jobsSpool,
+      directory: join(privateDirectory, 'jobs'),
+      askUser: (chat, question) => runtimes.get(chat.agent)?.askUser(chat.sessionId, question) ?? Promise.resolve(undefined),
+      tell: (chat, text, title) => runtimes.get(chat.agent)?.tell(chat.sessionId, text, title),
+      changed: (list) => {
+        for (const target of clients) {
+          if (target.agentName === undefined) target.send({ jsonrpc: '2.0', method: '_codeflower/jobs/changed', params: { jobs: list } });
+        }
+      },
+      log,
+      keyOf: (agent, sessionId) => sessionKey(agent, sessionId),
+      ...jobsTiming
+    });
+    try {
+      jobsServer = await startShowServer(jobsSocket, (request) => jobs.handle(showingChat(request?.agent, request?.sessionId), request));
+    } catch (error) {
+      log(`codeflower-job is unavailable: ${error.message}`);
+    }
+  }
+
   // The output of commands that agents run through codeflower-cmd. A run
   // that starts before its tool call reached the bridge waits for it a little.
   if ([...runtimes.values()].some((runtime) => runtime.agent.commands?.env)) {
@@ -4110,6 +4207,8 @@ export async function startBridge(options) {
       sockets.close();
       await showServer?.close();
       await browserServer?.close();
+      await jobsServer?.close();
+      jobs?.close();
       await browsers.closeAll();
       await hookServer?.close();
       await commandsServer?.close();

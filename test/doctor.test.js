@@ -127,34 +127,44 @@ test('the allocation the app found is reported with the time left', (t) => {
   assert.match(startup({ CODEFLOWER_DOCTOR_ROOT: root }), /Allocation\n- None reported/);
 });
 
-test('batch jobs: reports scheduler commands, Slurm reachability and what submitted jobs mean', (t) => {
+test('batch jobs: off, or what the config lets the agent submit, and that jobs run in sandboxes', (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'codeflower-doctor-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const snapshot = join(dir, 'environment.md');
-  const bin = join(dir, 'bin');
-  mkdirSync(bin);
-  // PATH holds only the fakes, so the machine running the tests cannot add a real sbatch.
-  const run = () => {
-    execFileSync(process.execPath, [doctor, '--write-startup', snapshot],
-      { env: { ...process.env, PATH: bin, CODEFLOWER_ENVIRONMENT_FILE: snapshot } });
+  const run = (extra = {}) => {
+    const env = { ...process.env, CODEFLOWER_ENVIRONMENT_FILE: snapshot, ...extra };
+    if (!extra.CODEFLOWER_JOBS) delete env.CODEFLOWER_JOBS;
+    execFileSync(process.execPath, [doctor, '--write-startup', snapshot], { env });
     return readFileSync(snapshot, 'utf8');
   };
 
-  assert.match(run(), /## Batch jobs\n- No batch scheduler commands .*jobs cannot be submitted/);
+  assert.match(run(), /## Batch jobs\n- Off: the app does not submit batch jobs/);
 
-  writeFileSync(join(bin, 'sbatch'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
-  writeFileSync(join(bin, 'squeue'), '#!/bin/sh\nprintf "101\\n102\\n"\n', { mode: 0o755 });
-  const reachable = run();
-  assert.match(reachable, new RegExp(`- Slurm: \`sbatch\` at ${join(bin, 'sbatch')}`));
-  assert.match(reachable, /Slurm controller: reachable; 2 of the user's jobs/);
-  assert.match(reachable, /outside this sandbox.*codeflower-path PATH/);
-  assert.match(reachable, /Ask the user before submitting jobs/);
-
-  writeFileSync(join(bin, 'squeue'), '#!/bin/sh\necho "squeue: error: Unable to contact slurm controller" >&2\nexit 1\n', { mode: 0o755 });
-  assert.match(run(), /Slurm controller: not reachable \(squeue: error: Unable to contact slurm controller\)/);
+  const jobs = JSON.stringify({
+    scheduler: 'slurm',
+    approve: 'ask',
+    supports: ['queue', 'array'],
+    defaults: { cpus: 1, memory: '4G', time: '1h', queue: 'shortq' },
+    limits: { cpus: 32, memory: '128G' },
+    active: 20,
+    array: 100,
+    queues: [{ name: 'tinyq', time: '2h', description: 'quick jobs' }],
+    notes: 'No default partition.\nUse tinyq for tests.',
+    onStop: 'keep'
+  });
+  const on = run({ CODEFLOWER_JOBS: jobs });
+  assert.match(on, /- Scheduler: slurm; submit with `codeflower-job submit`/);
+  assert.match(on, /Each job runs in a sandbox like this one/);
+  assert.match(on, /the user is asked in the chat for each job/);
+  assert.match(on, /- Defaults: 1 CPUs, 4G memory, 1h, queue shortq/);
+  assert.match(on, /- Limits: 32 CPUs, 128G memory per job; 20 jobs queued or running at most, 100 tasks per array/);
+  assert.match(on, /- Queue tinyq \(at most 2h\): quick jobs/);
+  assert.match(on, /keep running; a later sandbox of the project follows them again/);
+  assert.match(on, /Notes from the user: No default partition. Use tinyq for tests./);
+  assert.doesNotMatch(on, /sbatch|codeflower-path/);
 
   // The live report has the section too.
   const live = execFileSync(process.execPath, [doctor],
-    { env: { ...process.env, PATH: bin, CODEFLOWER_ENVIRONMENT_FILE: snapshot }, encoding: 'utf8' });
-  assert.match(live, /## Batch jobs\n- Slurm: `sbatch`/);
+    { env: { ...process.env, CODEFLOWER_JOBS: jobs, CODEFLOWER_ENVIRONMENT_FILE: snapshot }, encoding: 'utf8' });
+  assert.match(live, /## Batch jobs\n- Scheduler: slurm/);
 });

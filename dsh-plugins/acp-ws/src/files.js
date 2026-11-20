@@ -79,7 +79,8 @@ export const inside = (path, directory) => {
 /**
  * Resolves a path the user may see: a regular file, not in the system's
  * virtual filesystems and, inside the project state, only in the workspace
- * (logins and session records stay private).
+ * and the batch jobs' folder, their output (logins and session records stay
+ * private).
  */
 export async function resolvePath(path, { workspace, privateDirectory, cwd = workspace }) {
   if (typeof path !== 'string' || !path || path.length > 4096) throw new InvalidRequest('Invalid path');
@@ -90,12 +91,15 @@ export async function resolvePath(path, { workspace, privateDirectory, cwd = wor
     throw new InvalidRequest(`No such file: ${path}`);
   }
   // Compared resolved, like the file: a folder under a symlink (macOS /var) would not match otherwise.
-  const [privateReal, workspaceReal] = await Promise.all(
-    [privateDirectory, workspace].map((folder) => folder && realpath(folder).catch(() => folder))
+  const [privateReal, workspaceReal, jobsReal] = await Promise.all(
+    [privateDirectory, workspace, privateDirectory && join(privateDirectory, 'jobs')].map(
+      (folder) => folder && realpath(folder).catch(() => folder)
+    )
   );
+  const shown = (folder) => folder && inside(real, folder);
   const denied =
     ['/proc', '/sys', '/dev'].some((directory) => inside(real, directory)) ||
-    (privateReal && inside(real, privateReal) && !(workspaceReal && inside(real, workspaceReal)));
+    (privateReal && inside(real, privateReal) && !shown(workspaceReal) && !shown(jobsReal));
   if (denied) throw new InvalidRequest(`This file cannot be shown: ${path}`);
   return { real, info: await stat(real) };
 }

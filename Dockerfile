@@ -70,6 +70,8 @@ ARG MINIFORGE_SHA256_AARCH64=1f4e2f1898c054dd35133f778b92794116c28af330e5d5936d5
 
 # The Claude Agent SDK version the app downloads and binds in for Claude Code.
 LABEL codeflower.claude-agent-sdk=$CLAUDE_AGENT_SDK_VERSION
+# The image runs batch jobs (job.sh) and has codeflower-job, which the app checks before it offers jobs.
+LABEL codeflower.jobs=1
 
 ENV LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
@@ -241,7 +243,7 @@ RUN pip install --no-cache-dir pillow==13.0.0 markdown-it-py==4.2.0 mdurl==0.1.2
         python-pptx==1.0.2 lxml==6.1.3 XlsxWriter==3.3.1 typing-extensions==4.16.0 pypdfium2==5.14.0 \
     && python -c "import sys; sys.path.insert(0, '/opt/codeflower/src/storyteller/src'); import storyteller, storyteller.deck"
 
-COPY entrypoint.sh reproduce.sh /opt/codeflower/
+COPY entrypoint.sh reproduce.sh job.sh /opt/codeflower/
 COPY lib /opt/codeflower/lib
 COPY profile.d/codeflower.sh /etc/profile.d/codeflower.sh
 COPY bin /opt/codeflower/bin

@@ -1,0 +1,468 @@
+#!/usr/local/bin/node
+// Batch jobs: asks the app (through the bridge, which asks the user) to submit
+// a job, which runs in a sandbox like this one on the cluster: the same
+// image, folders, environments and network. Reads the jobs' states and output
+// from the project's jobs folder.
+import { randomUUID } from 'node:crypto';
+import { existsSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, mkdirSync, openSync, readSync, closeSync } from 'node:fs';
+import { createConnection } from 'node:net';
+import { join, resolve } from 'node:path';
+
+const usage = `Usage: codeflower-job COMMAND [ARGS...]
+
+Batch jobs run in a sandbox like this one, on the cluster's nodes: the same
+image, folders (/data/...), software environments and network. Use them for
+work bigger or longer than this sandbox's own allocation. The app submits
+them for you, within the limits the user set; the user may be asked first.
+
+  submit [OPTIONS] -- COMMAND [ARGS...]
+                      submit a job that runs COMMAND (a program on PATH, or a
+                      script in /data/... or the workspace)
+      --name NAME       its name (default: the command's)
+      --cpus N          CPUs (default: the config's)
+      --memory SIZE     memory, e.g. 16G
+      --time TIME       time limit, e.g. 2h, 90m, 1-12:00:00
+      --gpus N[:TYPE]   GPUs, e.g. 1 or 1:l4
+      --queue QUEUE     queue (Slurm partition)
+      --array SPEC      a job array, e.g. 1-100 or 1-100%10 (at most 10 at
+                        once); each task gets its index in
+                        $CODEFLOWER_JOB_INDEX
+      --after ID[,ID]   start once these jobs ended well
+      --workdir DIR     the folder it runs in (default: this one)
+      --env NAME=VALUE  a variable for it (repeatable)
+      --no-notify       no message when it ends
+  list [--all]        this project's jobs (--all: also those that ended
+                      more than a day ago)
+  status ID           a job's state; ID is its id (j-...) or the scheduler's
+  log ID [--index I] [--scheduler] [--tail N] [--follow]
+                      a job's output (--index: an array task's;
+                      --scheduler: the scheduler's log, for jobs that did
+                      not start)
+  wait ID [--timeout TIME]
+                      wait for a short job to end (default 10m); for long
+                      ones end your turn instead: you get a message
+  cancel ID           cancel a job
+  info                the scheduler, queues, defaults and limits
+
+Add --json to any command for JSON.`;
+
+const EXIT = { ok: 0, failed: 1, invalid: 2, limit: 2, unknown: 2, denied: 3, pending: 4, scheduler: 5 };
+const FINAL = new Set(['done', 'failed', 'cancelled', 'lost']);
+const JOBS_DIR = process.env.CODEFLOWER_JOBS_DIR || '/codeflower-state/jobs';
+
+const fail = (message, code = 1) => {
+  console.error(message);
+  process.exit(code);
+};
+
+function info() {
+  const text = process.env.CODEFLOWER_JOBS;
+  if (!text) {
+    fail(
+      'Batch jobs are off in this sandbox: the app\'s config has no jobs.scheduler (or the sandbox was started without --jobs). ' +
+        'Work within this sandbox, or ask the user to enable jobs.',
+      2
+    );
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    return fail('CODEFLOWER_JOBS is not valid.', 1);
+  }
+}
+
+// Options: --name value or --name=value; flags; the rest after --.
+function parse(args, spec) {
+  const options = { env: [] };
+  const rest = [];
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === '--') {
+      rest.push(...args.slice(index + 1));
+      break;
+    }
+    if (!arg.startsWith('--')) {
+      rest.push(arg);
+      if (spec.stopAtCommand) {
+        rest.push(...args.slice(index + 1));
+        break;
+      }
+      continue;
+    }
+    let [name, value] = arg.slice(2).split(/=(.*)/s);
+    if (spec.flags.includes(name)) {
+      options[name] = true;
+      continue;
+    }
+    if (!spec.values.includes(name)) fail(`Unknown option --${name}. See codeflower-job --help.`, 2);
+    if (value === undefined) {
+      value = args[++index];
+      if (value === undefined) fail(`--${name} needs a value.`, 2);
+    }
+    if (name === 'env') options.env.push(value);
+    else options[name] = value;
+  }
+  return { options, rest };
+}
+
+// One request to the bridge, which may ask the user first.
+function askBridge(socketPath, request) {
+  return new Promise((done) => {
+    const socket = createConnection(socketPath);
+    let reply = '';
+    socket.setEncoding('utf8');
+    socket.on('connect', () =>
+      socket.write(
+        `${JSON.stringify({
+          ...request,
+          agent: process.env.CODEFLOWER_AGENT_NAME,
+          // What the agents export to their commands: the chat's session id.
+          sessionId: process.env.CLAUDE_CODE_SESSION_ID || process.env.CODEX_THREAD_ID || undefined
+        })}\n`
+      )
+    );
+    socket.on('data', (chunk) => (reply += chunk));
+    socket.on('error', (error) => fail(`Could not reach the code flower worker: ${error.message}`));
+    socket.on('end', () => {
+      try {
+        done(JSON.parse(reply));
+      } catch {
+        fail('The code flower worker sent no answer.');
+      }
+    });
+  });
+}
+
+// Without the bridge (a task): straight to the app's spool.
+async function askApp(spool, request) {
+  const id = randomUUID();
+  const requests = join(spool, 'requests');
+  mkdirSync(requests, { recursive: true });
+  writeFileSync(join(requests, `.${id}.tmp`), JSON.stringify({ ...request, id }), { mode: 0o600 });
+  renameSync(join(requests, `.${id}.tmp`), join(requests, `${id}.json`));
+  const answer = join(spool, 'responses', `${id}.json`);
+  const deadline = Date.now() + 5 * 60_000;
+  while (Date.now() < deadline) {
+    if (existsSync(answer)) {
+      try {
+        const response = JSON.parse(readFileSync(answer, 'utf8'));
+        rmSync(answer, { force: true });
+        return response;
+      } catch {
+        // Being written.
+      }
+    }
+    await new Promise((done) => setTimeout(done, 250));
+  }
+  return { ok: false, code: 'scheduler', error: 'The app did not answer.' };
+}
+
+async function request(body) {
+  const settings = info();
+  if (process.env.CODEFLOWER_JOBS_SOCKET) return askBridge(process.env.CODEFLOWER_JOBS_SOCKET, body);
+  if (process.env.CODEFLOWER_JOBS_SPOOL) {
+    if (body.action === 'submit' && settings.approve !== 'never') {
+      return { ok: false, code: 'denied', error: 'Jobs need the user\'s approval in a chat, and this run has none: the config needs jobs.approve: never for unattended runs.' };
+    }
+    return askApp(process.env.CODEFLOWER_JOBS_SPOOL, body.action === 'submit' ? { ...body.job, action: 'submit', approved: 'policy' } : body);
+  }
+  return fail('codeflower-job only works inside a code flower worker.');
+}
+
+function readJob(name) {
+  try {
+    return JSON.parse(readFileSync(join(JOBS_DIR, name, 'job.json'), 'utf8'));
+  } catch {
+    return undefined;
+  }
+}
+
+function allJobs() {
+  let names = [];
+  try {
+    names = readdirSync(JOBS_DIR).filter((name) => /^j-[0-9a-f]{6,16}$/.test(name));
+  } catch {
+    // No jobs yet.
+  }
+  return names
+    .map(readJob)
+    .filter(Boolean)
+    .sort((a, b) => Date.parse(b.submitted) - Date.parse(a.submitted));
+}
+
+function findJob(id) {
+  if (!id) fail('Which job? Give its id (j-...) or the scheduler\'s.', 2);
+  if (/^j-[0-9a-f]{6,16}$/.test(id)) {
+    const job = readJob(id);
+    if (job) return job;
+  } else {
+    const job = allJobs().find((candidate) => candidate.schedulerId === id);
+    if (job) return job;
+  }
+  return fail(`No job ${id} in this project (codeflower-job list).`, 2);
+}
+
+const elapsed = (job) => {
+  if (!job.started) return '';
+  const seconds = Math.round(((job.ended ? Date.parse(job.ended) : Date.now()) - Date.parse(job.started)) / 1000);
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  return h ? `${h}h${String(m).padStart(2, '0')}m` : m ? `${m}m${String(seconds % 60).padStart(2, '0')}s` : `${seconds}s`;
+};
+
+function stateOf(job) {
+  let state = job.state;
+  if (job.outcome) state += ` (${job.outcome.done} done, ${job.outcome.failed + (job.outcome.lost ?? 0)} failed${job.outcome.cancelled ? `, ${job.outcome.cancelled} cancelled` : ''})`;
+  else if (job.exitCode !== undefined && job.exitCode !== null && job.state !== 'done') state += ` (exit ${job.exitCode})`;
+  return state;
+}
+
+function describe(job) {
+  const lines = [
+    `${job.id} (${job.name}): ${stateOf(job)}`,
+    `  ${job.scheduler}${job.schedulerId ? ` job ${job.schedulerId}` : ''}, submitted ${job.submitted}${job.started ? `, ran ${elapsed(job)}` : ''}`,
+    `  command: ${job.command.join(' ')}`,
+    `  folder: ${job.workdir}`,
+    `  output: ${job.logs}/${job.tasks ? 'output-INDEX.log' : 'output.log'} (scheduler's log: ${job.logs}/scheduler${job.tasks ? '-INDEX' : ''}.log)`
+  ];
+  if (job.error) lines.push(`  error: ${job.error}`);
+  return lines.join('\n');
+}
+
+function printSubmitted(job) {
+  console.log(`Submitted ${job.id} (${job.name}) to ${job.scheduler}${job.schedulerId ? ` as job ${job.schedulerId}` : ''}.`);
+  console.log(`Output: ${job.logs}/${job.tasks ? 'output-INDEX.log' : 'output.log'}`);
+  console.log(
+    job.notify
+      ? `You get a message when it ends: end your turn rather than waiting. Check it with: codeflower-job status ${job.id}`
+      : `Check it with: codeflower-job status ${job.id}`
+  );
+}
+
+function answer(response, json, onOk) {
+  if (json) console.log(JSON.stringify(response, null, 2));
+  if (response.ok) {
+    if (!json) onOk(response.job);
+    return process.exit(0);
+  }
+  if (!json) console.error(response.error ?? 'The request failed.');
+  return process.exit(EXIT[response.code] ?? 1);
+}
+
+function readTail(path, lines) {
+  const size = statSync(path).size;
+  const length = Math.min(size, 256 * 1024);
+  const buffer = Buffer.alloc(length);
+  const handle = openSync(path, 'r');
+  readSync(handle, buffer, 0, length, size - length);
+  closeSync(handle);
+  const text = buffer.toString('utf8');
+  return lines ? text.split('\n').slice(-(lines + 1)).join('\n') : text;
+}
+
+const args = process.argv.slice(2);
+const command = args[0];
+if (!command || command === '-h' || command === '--help') {
+  console.log(usage);
+  process.exit(command ? 0 : 2);
+}
+
+switch (command) {
+  case 'submit': {
+    const { options, rest } = parse(args.slice(1), {
+      values: ['name', 'cpus', 'memory', 'time', 'gpus', 'queue', 'array', 'after', 'workdir', 'env'],
+      flags: ['no-notify', 'json'],
+      stopAtCommand: true
+    });
+    if (!rest.length) fail('What should the job run? codeflower-job submit [OPTIONS] -- COMMAND [ARGS...]', 2);
+    const workdir = resolve(options.workdir ?? process.cwd());
+    const [program, ...programArgs] = rest;
+    const job = {
+      command: [program.includes('/') ? resolve(workdir, program) : program, ...programArgs],
+      workdir,
+      ...(options.name ? { name: options.name } : {}),
+      ...(options.queue ? { queue: options.queue } : {}),
+      ...(options.memory ? { memory: options.memory } : {}),
+      ...(options.time ? { time: options.time } : {}),
+      ...(options.array ? { array: options.array } : {}),
+      ...(options['no-notify'] ? { notify: false } : {})
+    };
+    if (options.cpus !== undefined) {
+      job.cpus = Number(options.cpus);
+      if (!Number.isInteger(job.cpus) || job.cpus < 1) fail('--cpus must be a whole number.', 2);
+    }
+    if (options.gpus !== undefined) {
+      const [count, type] = options.gpus.split(':');
+      job.gpus = Number(count);
+      if (!Number.isInteger(job.gpus) || job.gpus < 1) fail('--gpus must be a number, e.g. 1 or 1:l4.', 2);
+      if (type) job.gpuType = type;
+    }
+    if (options.after) job.after = options.after.split(',').map((id) => id.trim()).filter(Boolean);
+    if (options.env.length) {
+      job.env = {};
+      for (const pair of options.env) {
+        const [name, value] = pair.split(/=(.*)/s);
+        if (value === undefined) fail(`--env needs NAME=VALUE, not ${pair}.`, 2);
+        job.env[name] = value;
+      }
+    }
+    answer(await request({ action: 'submit', job }), options.json, printSubmitted);
+    break;
+  }
+  case 'cancel': {
+    const { options, rest } = parse(args.slice(1), { values: [], flags: ['json'] });
+    const job = findJob(rest[0]);
+    if (FINAL.has(job.state)) {
+      if (options.json) console.log(JSON.stringify({ ok: true, job }, null, 2));
+      else console.log(`${job.id} had already ended: ${stateOf(job)}.`);
+      break;
+    }
+    answer(await request({ action: 'cancel', job: job.id }), options.json, (cancelled) =>
+      console.log(cancelled.state === 'cancelled' ? `Cancelled ${cancelled.id} (${cancelled.name}).` : `${cancelled.id} had already ended: ${stateOf(cancelled)}.`)
+    );
+    break;
+  }
+  case 'list': {
+    info();
+    const { options } = parse(args.slice(1), { values: [], flags: ['all', 'json'] });
+    const day = 24 * 60 * 60_000;
+    const jobs = allJobs().filter((job) => options.all || !FINAL.has(job.state) || Date.now() - Date.parse(job.ended ?? job.updated) < day);
+    if (options.json) {
+      console.log(JSON.stringify(jobs, null, 2));
+      break;
+    }
+    if (!jobs.length) {
+      console.log(options.all ? 'No jobs in this project.' : 'No jobs active or ended in the last day (--all for older ones).');
+      break;
+    }
+    for (const job of jobs) {
+      console.log(
+        `${job.id}  ${job.name.padEnd(20)} ${stateOf(job).padEnd(24)} ${job.scheduler}${job.schedulerId ? ` ${job.schedulerId}` : ''}${job.tasks ? `, ${job.tasks} tasks` : ''}${job.started ? `, ${elapsed(job)}` : ''}`
+      );
+    }
+    break;
+  }
+  case 'status': {
+    info();
+    const { options, rest } = parse(args.slice(1), { values: [], flags: ['json'] });
+    const job = findJob(rest[0]);
+    console.log(options.json ? JSON.stringify(job, null, 2) : describe(job));
+    break;
+  }
+  case 'log': {
+    info();
+    const { options, rest } = parse(args.slice(1), { values: ['index', 'tail'], flags: ['scheduler', 'follow', 'json'] });
+    const job = findJob(rest[0]);
+    const folder = join(JOBS_DIR, job.id);
+    if (job.tasks && options.index === undefined && !options.scheduler) {
+      const outputs = readdirSync(folder).filter((name) => /^output-\d+\.log$/.test(name));
+      fail(`${job.id} is an array of ${job.tasks} tasks: choose one with --index (output so far: ${outputs.join(', ') || 'none'}).`, 2);
+    }
+    const suffix = options.index !== undefined ? `-${Number(options.index)}` : '';
+    const file = join(folder, `${options.scheduler ? 'scheduler' : 'output'}${suffix}.log`);
+    const tail = options.tail ? Number(options.tail) : undefined;
+    if (!existsSync(file)) {
+      if (!options.follow) {
+        fail(
+          FINAL.has(job.state)
+            ? `${job.id} wrote no ${options.scheduler ? 'scheduler log' : 'output'}${options.scheduler ? '' : '; see its scheduler log: codeflower-job log ' + job.id + ' --scheduler'}.`
+            : `${job.id} is ${job.state} and has no output yet.`,
+          FINAL.has(job.state) ? 1 : 0
+        );
+      }
+    }
+    if (!options.follow) {
+      process.stdout.write(readTail(file, tail));
+      break;
+    }
+    let printed = 0;
+    for (;;) {
+      if (existsSync(file)) {
+        const size = statSync(file).size;
+        if (size > printed) {
+          const buffer = Buffer.alloc(size - printed);
+          const handle = openSync(file, 'r');
+          readSync(handle, buffer, 0, buffer.length, printed);
+          closeSync(handle);
+          process.stdout.write(buffer);
+          printed = size;
+        }
+      }
+      const current = readJob(job.id);
+      if (!current || FINAL.has(current.state)) break;
+      await new Promise((done) => setTimeout(done, 2000));
+    }
+    break;
+  }
+  case 'wait': {
+    info();
+    const { options, rest } = parse(args.slice(1), { values: ['timeout'], flags: ['json'] });
+    let job = findJob(rest[0]);
+    const timeout = options.timeout ? parseTime(options.timeout) : 10 * 60_000;
+    const deadline = Date.now() + timeout;
+    while (!FINAL.has(job.state) && Date.now() < deadline) {
+      await new Promise((done) => setTimeout(done, 5000));
+      job = readJob(job.id) ?? job;
+    }
+    if (options.json) console.log(JSON.stringify(job, null, 2));
+    else console.log(describe(job));
+    if (!FINAL.has(job.state)) {
+      if (!options.json) console.error(`Still ${job.state} after ${options.timeout ?? '10m'}: end your turn; you get a message when it ends.`);
+      process.exit(4);
+    }
+    process.exit(job.state === 'done' ? 0 : 1);
+    break;
+  }
+  case 'info': {
+    const settings = info();
+    const { options } = parse(args.slice(1), { values: [], flags: ['json'] });
+    if (options.json) {
+      console.log(JSON.stringify(settings, null, 2));
+      break;
+    }
+    console.log(describeInfo(settings));
+    break;
+  }
+  default:
+    fail(`Unknown command ${command}. See codeflower-job --help.`, 2);
+}
+
+function parseTime(text) {
+  const match = /^(\d+)(s|m|h)?$/.exec(text.trim());
+  if (!match) fail(`--timeout takes e.g. 30s, 10m or 1h, not ${text}.`, 2);
+  return Number(match[1]) * { s: 1000, m: 60_000, h: 3_600_000 }[match[2] ?? 'm'];
+}
+
+function size(entry) {
+  return [
+    entry.cpus && `${entry.cpus} CPUs`,
+    entry.memory && `${entry.memory} memory`,
+    entry.time && `${entry.time}`,
+    entry.gpus && `${entry.gpus} GPUs`
+  ]
+    .filter(Boolean)
+    .join(', ');
+}
+
+function describeInfo(settings) {
+  const lines = [
+    `Scheduler: ${settings.scheduler}${settings.example ? ' (an example profile, not tested on a real cluster)' : ''}`,
+    settings.approve === 'ask' ? 'Each job is shown to the user, who allows it or not.' : 'Jobs within the limits are submitted without asking the user.',
+    `Defaults: ${size(settings.defaults) || 'the scheduler\'s'}${settings.defaults?.queue ? `, queue ${settings.defaults.queue}` : ''}`,
+    `Limits per job: ${size(settings.limits) || 'the scheduler\'s'}; at most ${settings.active} jobs queued or running, ${settings.array} tasks per array`,
+    `Can ask for: ${settings.supports.length ? settings.supports.join(', ') : 'CPUs, memory and time only'}`
+  ];
+  if (settings.queues?.length) {
+    lines.push('Queues:');
+    for (const queue of settings.queues) {
+      const limits = [size(queue), queue.gpuTypes?.length ? `GPU types ${queue.gpuTypes.join(', ')}` : ''].filter(Boolean).join(', ');
+      lines.push(`  ${queue.name}${limits ? ` (at most ${limits})` : ''}${queue.description ? `: ${queue.description}` : ''}`);
+    }
+  }
+  lines.push(
+    `When this sandbox stops, its jobs ${settings.onStop === 'cancel' ? 'are cancelled' : 'keep running'}.`,
+    settings.envWritable ? 'Jobs may change the software environments.' : 'Jobs see the software environments read-only: install what they need here first.'
+  );
+  if (settings.notes) lines.push('', 'Notes from the user:', settings.notes);
+  return lines.join('\n');
+}

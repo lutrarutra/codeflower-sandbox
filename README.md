@@ -48,9 +48,11 @@ Releases are published for linux/amd64 and linux/arm64, tagged `X.Y.Z`, `X.Y`, `
 - `licenses/`: the licenses of what the image includes without them (OpenCode's binaries, the
   Single-cell best practices book in `skills/`)
 - `bin/`: commands for the agent: `codeflower-show`, `codeflower-pty`, `codeflower-env-export`,
-  `codeflower-network`, `codeflower-doctor` (the worker's resources, whether batch jobs can be submitted and, when isolated, its
-  allowlist), `codeflower-inventory` (describes the mounted data: formats, shapes, columns),
+  `codeflower-network`, `codeflower-doctor` (the worker's resources, whether the app submits batch jobs for it and, when isolated, its
+  allowlist), `codeflower-job` (batch jobs the app submits, each run in a sandbox like this one), `codeflower-inventory` (describes the mounted data: formats, shapes, columns),
   `codeflower-repro` (reproducible pipeline archives) and `snakemake` (run with the project's Python)
+- `job.sh`: the entrypoint `codeflower job-run` starts instead of `entrypoint.sh` for a batch job:
+  the job's command with the project's environment, without agent or bridge
 - `reproduce.sh` and `lib/`: the entrypoint `codeflower reproduce` starts instead of `entrypoint.sh`:
   it restores a pipeline archive's environment, runs it without network and compares the results,
   with no agent or bridge; `lib/env-setup.sh` is the environment setup both share

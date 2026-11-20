@@ -1,6 +1,6 @@
 #!/usr/local/bin/node --no-warnings
 import { execFileSync } from 'node:child_process';
-import { accessSync, constants, existsSync, readFileSync, statfsSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, statfsSync, writeFileSync } from 'node:fs';
 import { availableParallelism, freemem, totalmem } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -130,54 +130,40 @@ function resources() {
   return lines;
 }
 
-// Batch schedulers' submit commands. They are not in the image: a site may
-// mount them into the container (e.g. an OCI hook for Slurm under Podman).
-const schedulers = [
-  ['sbatch', 'Slurm'],
-  ['qsub', 'PBS or Grid Engine'],
-  ['bsub', 'LSF'],
-  ['condor_submit', 'HTCondor']
-];
-
-function onPath(command) {
-  for (const dir of (process.env.PATH ?? '').split(':')) {
-    if (!dir) continue;
-    const file = join(dir, command);
-    try {
-      accessSync(file, constants.X_OK);
-      if (statSync(file).isFile()) return file;
-    } catch {
-      // not here
-    }
-  }
-  return null;
-}
-
-// Whether the agent can submit batch jobs from the sandbox, and what that means.
+// Batch jobs the app submits for the agent (codeflower-job), each in a
+// sandbox like this one; the app's config says whether, where and how much.
 function batchJobs() {
-  const found = schedulers
-    .map(([command, name]) => ({ command, name, file: onPath(command) }))
-    .filter((scheduler) => scheduler.file);
-  if (!found.length) {
-    return ['- No batch scheduler commands (sbatch, qsub, bsub, condor_submit) here: jobs cannot be submitted from this sandbox.'];
+  const text = process.env.CODEFLOWER_JOBS;
+  if (!text) {
+    return ['- Off: the app does not submit batch jobs for this sandbox (no jobs.scheduler in its config). Work within this sandbox\'s allocation; the user can enable jobs.'];
   }
-  const lines = found.map((scheduler) => `- ${scheduler.name}: \`${scheduler.command}\` at ${scheduler.file}`);
-  if (found.some((scheduler) => scheduler.command === 'sbatch')) {
-    try {
-      const jobs = execFileSync('squeue', ['--me', '--noheader', '--format=%i'],
-        { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
-      const count = jobs ? jobs.split('\n').length : 0;
-      lines.push(`- Slurm controller: reachable; ${count} of the user's jobs queued or running (\`squeue --me\`), this worker's own included if it runs as a job`);
-    } catch (error) {
-      const reason = error.code === 'ENOENT' ? 'squeue not found'
-        : error.stderr?.toString().trim().split('\n').pop() || error.message;
-      lines.push(`- Slurm controller: not reachable (${reason}); submitting will likely fail`);
-    }
+  let jobs;
+  try {
+    jobs = JSON.parse(text);
+  } catch {
+    return ['- Unavailable: CODEFLOWER_JOBS is not valid.'];
+  }
+  const size = (entry = {}) =>
+    [entry.cpus && `${entry.cpus} CPUs`, entry.memory && `${entry.memory} memory`, entry.time, entry.gpus && `${entry.gpus} GPUs`]
+      .filter(Boolean)
+      .join(', ');
+  const lines = [
+    `- Scheduler: ${jobs.scheduler}${jobs.example ? ' (an example profile, not tested on a real cluster)' : ''}; submit with \`codeflower-job submit\` (\`codeflower-job --help\`)`,
+    '- Each job runs in a sandbox like this one, on a node the scheduler picks: the same image, /data folders, workspace, software environments and network. Use the paths you use here; install software here before submitting (jobs see the environments read-only' +
+      (jobs.envWritable ? ', unless the config says otherwise: here they may change them' : '') + ').',
+    `- Approval: ${jobs.approve === 'ask' ? 'the user is asked in the chat for each job, so say what you submit and why' : 'jobs within the limits are submitted without asking'}`,
+    `- Defaults: ${size(jobs.defaults) || "the scheduler's"}${jobs.defaults?.queue ? `, queue ${jobs.defaults.queue}` : ''}`,
+    `- Limits: ${size(jobs.limits) || "the scheduler's"} per job; ${jobs.active} jobs queued or running at most, ${jobs.array} tasks per array`,
+    `- Can ask for: ${jobs.supports?.length ? jobs.supports.join(', ') : 'CPUs, memory and time only'}`
+  ];
+  for (const queue of jobs.queues ?? []) {
+    const limits = [size(queue), queue.gpuTypes?.length ? `GPU types ${queue.gpuTypes.join(', ')}` : ''].filter(Boolean).join(', ');
+    lines.push(`- Queue ${queue.name}${limits ? ` (at most ${limits})` : ''}${queue.description ? `: ${queue.description}` : ''}`);
   }
   lines.push(
-    '- Submitted jobs run on the cluster as the user, outside this sandbox: sandbox paths (/data/…, /codeflower-state) and the environments installed here do not exist there. Give job scripts host paths (`codeflower-path PATH`) and software the cluster provides (modules, or a container). Jobs can reach everything the user\'s account can, not only the mounted folders, and they keep running after this worker stops.',
-    '- Ask the user before submitting jobs, follow any skill about this cluster, and tell the user which jobs are still queued or running when you finish.'
+    `- When this sandbox stops, its jobs ${jobs.onStop === 'cancel' ? 'are cancelled' : 'keep running; a later sandbox of the project follows them again'}. You get a message when a job you submitted ends.`
   );
+  if (jobs.notes) lines.push(`- Notes from the user: ${jobs.notes.replace(/\s*\n\s*/g, ' ')}`);
   return lines;
 }
 
