@@ -389,6 +389,7 @@ test('links the files the agent shows for the browser of whoever uses its termin
   const during = await show(showSocket, { paths: ['pca plot.png'], cwd: workspace, linkOnly: true });
   assert.equal(during.links[0].url, `${url}?chat=${encodeURIComponent(key)}`);
   chat.send({ jsonrpc: '2.0', method: 'fake/finish', params: { sessionId } });
+  await chat.receive((message) => message.id === 'long' && message.method === undefined);
 
   // Only the window gets files to open: with it gone, the links remain.
   await chat.close();
