@@ -1355,8 +1355,14 @@ export async function startBridge(options) {
     let limitsReading;
     let limitsReadAt = 0;
     let limitsTimer;
+    // Asked again during a read, which may predate what was spent since.
+    let limitsAgain = false;
     const refreshLimits = () => {
-      if (!readLimits || usage.authKind === 'api_key' || limitsReading || closing) return;
+      if (!readLimits || usage.authKind === 'api_key' || closing) return;
+      if (limitsReading) {
+        limitsAgain = true;
+        return;
+      }
       const wait = limitsReadAt + LIMITS_INTERVAL_MS - Date.now();
       if (wait > 0) {
         limitsTimer ??= setTimeout(() => {
@@ -1370,6 +1376,9 @@ export async function startBridge(options) {
         .catch((error) => log(`Could not read ${agent.label ?? agentName}'s rate limits: ${error.message}`))
         .finally(() => {
           limitsReading = undefined;
+          if (!limitsAgain) return;
+          limitsAgain = false;
+          refreshLimits();
         });
     };
 
@@ -2005,6 +2014,8 @@ export async function startBridge(options) {
             recorder?.record(sessionId, { kind: 'turn_end', stopReason: 'end_turn' });
             promptEnded(host, sessionId);
             queueTurnEnded(sessionId, 'end_turn');
+            // A turn typed in Codex's terminal UI spends its quota too.
+            if (agent.limitsCommand) refreshLimits();
           }, TERMINAL_TURN_SETTLE_MS).unref();
           return;
         }
@@ -2865,11 +2876,13 @@ export async function startBridge(options) {
     // A prompt's answer: what the turn added to the session's usage, which a
     // prompt result without counts (dsh) gets from the bridge.
     const endTurn = (request, message) => {
+      // Codex's quota comes no other way, also after a failed turn, which
+      // is how one that hit the limit ends.
+      if (agent.limitsCommand) refreshLimits();
       const sessionId = request.params?.sessionId;
       if (message.error || typeof sessionId !== 'string' || !protocolObject(message.result)) return undefined;
       const turn = usage.turnEnded(sessionId, message.result);
       if (turn?.usage && !protocolObject(message.result.usage)) message.result.usage = turn.usage;
-      if (agent.limitsCommand) refreshLimits();
       return turn;
     };
 
