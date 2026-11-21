@@ -6,8 +6,12 @@ import { addCost, addTokens } from './usage.js';
 // Session directories live in the project state, so the VS Code extension can
 // list, rename, and delete them without a running worker. Each file has one
 // writer: the bridge owns meta.json, lease.json, and transcript.jsonl; the
-// extension owns title.json.
+// extension owns title.json. takeover.json is another worker's request for the
+// session: the worker that asks writes it, the one holding the lease removes it
+// when it lets go (or the asker, once it has the session).
 export const LEASE_TTL_MS = 90_000;
+// How long a request to take a session over holds, unless the asker renews it.
+export const TAKEOVER_TTL_MS = 10 * 60_000;
 const HEARTBEAT_MS = 30_000;
 const AUTO_TITLE_LENGTH = 80;
 
@@ -76,6 +80,10 @@ export function leaseIsFresh(lease, now = Date.now()) {
   return Boolean(lease) && now - Date.parse(lease.heartbeatAt) < LEASE_TTL_MS;
 }
 
+export function takeoverIsFresh(request, now = Date.now()) {
+  return Boolean(request) && now - Date.parse(request.requestedAt) < TAKEOVER_TTL_MS;
+}
+
 export function createSessionStore({
   directory,
   instanceId,
@@ -93,6 +101,7 @@ export function createSessionStore({
       root,
       meta: join(root, 'meta.json'),
       lease: join(root, 'lease.json'),
+      takeover: join(root, 'takeover.json'),
       transcript: join(root, 'transcript.jsonl')
     };
   };
@@ -180,8 +189,23 @@ export function createSessionStore({
       await enqueue(state, async () => {
         await writeJsonAtomically(sessionPaths.meta, meta);
         await writeLease(state);
+        // This worker asked for the session and has it now.
+        const request = await readJson(sessionPaths.takeover).catch(() => undefined);
+        if (request?.instanceId === instanceId) await unlink(sessionPaths.takeover).catch(() => {});
       });
       startHeartbeat();
+    },
+
+    /** Another worker's fresh request to take the session over (requestTakeover), if any. */
+    async takeoverRequest(nativeSessionId) {
+      const request = await readJson(paths(nativeSessionId).takeover).catch(() => undefined);
+      if (!request || request.instanceId === instanceId || !takeoverIsFresh(request, now().getTime())) return undefined;
+      return request;
+    },
+
+    /** The request to take the session over is answered: the lease is free. */
+    async clearTakeover(nativeSessionId) {
+      await unlink(paths(nativeSessionId).takeover).catch(() => {});
     },
 
     isOpen(nativeSessionId) {
@@ -311,6 +335,19 @@ function sessionDirectory(directory, key) {
     throw new Error('Invalid session key');
   }
   return join(directory, key);
+}
+
+/**
+ * Asks the worker that holds a session's lease to let go of it: it does once
+ * the chat is idle (server.js, releaseChat). `free` when no other worker
+ * holds it, so the session opens here at once.
+ */
+export async function requestTakeover(directory, key, instanceId, now = Date.now()) {
+  const root = sessionDirectory(directory, key);
+  const lease = await readJson(join(root, 'lease.json')).catch(() => undefined);
+  if (!lease || lease.instanceId === instanceId || !leaseIsFresh(lease, now)) return { state: 'free' };
+  await writeJsonAtomically(join(root, 'takeover.json'), { instanceId, requestedAt: new Date(now).toISOString() });
+  return { state: 'requested', holder: lease.instanceId };
 }
 
 export async function listSessions(directory, now = Date.now()) {

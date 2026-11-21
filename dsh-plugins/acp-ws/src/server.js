@@ -28,6 +28,7 @@ import {
   readTranscript,
   readTranscriptPage,
   renameSession,
+  requestTakeover,
   sessionKey,
   writeJsonAtomically
 } from './sessions.js';
@@ -74,6 +75,11 @@ const SIGN_IN_POLL_MS = 2000;
 // setTimeout waits at most about 24 days; longer waits are made of several.
 const MAX_TIMER_MS = 2 ** 31 - 1;
 const SESSION_STARTS = ['session/new', 'session/resume', 'session/load'];
+// How often a worker looks whether to let go of a chat: another worker asked
+// for it (takeover.json), or no window had it open for a while.
+const RELEASE_CHECK_MS = 5_000;
+// How long an idle chat that no window has open stays here, holding its lease.
+const IDLE_RELEASE_MS = 60_000;
 // The agent lost a chat it had loaded. Claude's adapter does when the chat's
 // Claude Code process ends, e.g. out of memory on a cluster node: the turn that
 // was running fails with the first, and later requests with the second.
@@ -492,6 +498,15 @@ export function createRecorder(store, log) {
       return run(() => store.close(sessionId));
     },
 
+    /** Another worker's request for the session, if any (sessions.js). */
+    takeoverRequest(sessionId) {
+      return store.takeoverRequest(sessionId);
+    },
+
+    clearTakeover(sessionId) {
+      return store.clearTakeover(sessionId);
+    },
+
     closeAll() {
       return run(() => store.closeAll());
     }
@@ -561,6 +576,8 @@ export async function startBridge(options) {
     jobsSpool = workerEnvironment.CODEFLOWER_JOBS_SPOOL,
     // Tests make the jobs' timings short (createJobs).
     jobsTiming = {},
+    // Tests make letting go of chats quick: { checkMs, idleMs }.
+    releaseTiming = {},
     // Chromium from the image's browser bundle, installed on first use; a binary of its own instead in development and tests.
     browserBinary = workerEnvironment.CODEFLOWER_BROWSER_BIN || undefined,
     browserManifest = BROWSER_MANIFEST,
@@ -1718,6 +1735,120 @@ export async function startBridge(options) {
       return activity.busy(sessionId) || host.prompts.has(sessionId);
     };
 
+    // ---- letting go of chats: to another worker, or when no window has them ----
+
+    // Chats a window opened here. Once none has one open (`sessions/close`, or
+    // the window went) and it is idle for IDLE_RELEASE_MS, the worker lets go of
+    // it, so another worker can open it. Chats that only a task or the initial
+    // prompt opened stay.
+    const windowed = new Set();
+    // Per chat: since when it is idle with no window open.
+    const quietSince = new Map();
+    // Chats another worker asked for (takeover.json), whose windows were told.
+    const requested = new Set();
+    const releaseCheckMs = releaseTiming.checkMs ?? RELEASE_CHECK_MS;
+    const idleReleaseMs = releaseTiming.idleMs ?? IDLE_RELEASE_MS;
+    let releaseTimer;
+    let checkingReleases = false;
+
+    // Nothing in the chat runs or waits: no turn or prompt, no background work
+    // or subagent, no request for the user, no hand-over to the terminal UI, no
+    // batch job still active.
+    const chatIdle = (host, sessionId) =>
+      !chatRunning(host, sessionId) &&
+      !activity.active().includes(sessionId) &&
+      ![...host.waiting.values()].some(
+        (waiting) => waiting.sessionId === sessionId || host.subagents.ancestors(waiting.sessionId).includes(sessionId)
+      ) &&
+      !host.handoffs.has(sessionId) &&
+      !jobs?.active(agentName, sessionId);
+
+    // The bridge forgets a chat it no longer has (deleted, or let go of): its
+    // settings, the windows' attachment, its record and lease.
+    const forgetChat = async (host, sessionId) => {
+      host.sessions.delete(sessionId);
+      host.mcpFailed.delete(sessionId);
+      host.lost.delete(sessionId);
+      host.cwds.delete(sessionId);
+      for (const target of clients) target.sessions.delete(sessionId);
+      usage.forget(sessionId);
+      await recorder?.close(sessionId);
+      for (const child of host.subagents.childrenOf(sessionId)) await recorder?.close(child.sessionId);
+      host.subagents.forget(sessionId);
+      commands.clear(sessionId);
+      windowed.delete(sessionId);
+      quietSince.delete(sessionId);
+      requested.delete(sessionId);
+    };
+
+    // Lets go of an idle chat: the agent closes it where it can (session/close),
+    // and the lease goes, so another worker can open it. Its windows here hear
+    // it (`_codeflower/sessions/released`); opening it here again takes it
+    // back, unless another worker has it by then.
+    const releaseChat = async (host, sessionId, reason) => {
+      const key = sessionKey(agentName, sessionId);
+      const capabilities = (await host.initialized)?.agentCapabilities ?? {};
+      // A window's prompt came meanwhile.
+      if (agentHost !== host || !host.sessions.has(sessionId) || !chatIdle(host, sessionId)) return;
+      const windows = [...clients].filter((target) => target.sessions.has(sessionId));
+      if (capabilities.sessionCapabilities?.close) {
+        await requestAgent(host, 'session/close', { sessionId }).catch((error) =>
+          log(`${agent.label ?? agentName} could not close ${key}: ${error.message}`)
+        );
+      }
+      await forgetChat(host, sessionId);
+      if (reason === 'takeover') await recorder?.clearTakeover(sessionId);
+      log(`Let go of ${key}: ${reason === 'takeover' ? 'another worker asked for it' : 'no window had it open'}`);
+      const notice = { jsonrpc: '2.0', method: '_codeflower/sessions/released', params: { key, sessionId, reason } };
+      for (const target of windows) if (allClients.has(target)) target.send(notice);
+    };
+
+    const checkReleases = async () => {
+      const host = agentHost;
+      if (!host || !recorder || closing || checkingReleases || !childRunning(host.child)) return;
+      checkingReleases = true;
+      try {
+        const now = Date.now();
+        for (const sessionId of [...host.sessions.keys()]) {
+          if (agentHost !== host || !host.sessions.has(sessionId)) continue;
+          const idle = chatIdle(host, sessionId);
+          const request = await recorder.takeoverRequest(sessionId).catch(() => undefined);
+          if (request && idle) {
+            await releaseChat(host, sessionId, 'takeover');
+            continue;
+          }
+          // Busy: it goes once idle, which its windows are told now.
+          if (request && !requested.has(sessionId)) {
+            requested.add(sessionId);
+            toSession(sessionId, {
+              jsonrpc: '2.0',
+              method: '_codeflower/sessions/requested',
+              params: { key: sessionKey(agentName, sessionId), sessionId }
+            });
+          } else if (!request) {
+            requested.delete(sessionId);
+          }
+          const open = [...clients].some((target) => target.sessions.has(sessionId));
+          if (!idle || open || !windowed.has(sessionId)) {
+            quietSince.delete(sessionId);
+          } else if (!quietSince.has(sessionId)) {
+            quietSince.set(sessionId, now);
+          } else if (now - quietSince.get(sessionId) >= idleReleaseMs) {
+            await releaseChat(host, sessionId, 'idle');
+          }
+        }
+      } finally {
+        checkingReleases = false;
+      }
+    };
+    if (recorder) {
+      releaseTimer = setInterval(
+        () => void checkReleases().catch((error) => log(`Could not check which chats to let go of: ${error.message}`)),
+        releaseCheckMs
+      );
+      releaseTimer.unref();
+    }
+
     // Stops the turn for the queue's first prompt, which goes once it ended:
     // Esc in the terminal UI that has the chat, else as a window's Stop.
     const interruptChat = (host, sessionId) => {
@@ -2332,6 +2463,7 @@ export async function startBridge(options) {
         return;
       }
       target.sessions.add(sessionId);
+      windowed.add(sessionId);
       const leftOut = mcpLeftOut(host, sessionId);
       target.send({
         jsonrpc: '2.0',
@@ -3164,6 +3296,19 @@ export async function startBridge(options) {
           await renameSession(requireSessions(), requireOwnSession(), params.title);
           respond({});
           break;
+        // The window closed the chat: once no window has it open and it is
+        // idle, the worker lets go of it (checkReleases).
+        case '_codeflower/sessions/close': {
+          const key = requireOwnSession();
+          for (const sessionId of [...(self.sessions ?? [])]) if (sessionKey(agentName, sessionId) === key) self.sessions.delete(sessionId);
+          respond({});
+          break;
+        }
+        // Asks the worker that has the chat to let go of it, which it does
+        // once the chat is idle; `free` when no other worker has it.
+        case '_codeflower/sessions/takeOver':
+          respond(await requestTakeover(requireSessions(), requireOwnSession(), instanceId));
+          break;
         case '_codeflower/sessions/delete': {
           const directory = requireSessions();
           const key = requireOwnSession();
@@ -3172,16 +3317,7 @@ export async function startBridge(options) {
           const loaded = [...(host?.sessions.keys() ?? [])].find((sessionId) => sessionKey(agentName, sessionId) === key);
           if (loaded !== undefined) {
             if (activity.busy(loaded)) throw new InvalidRequest('The chat is still working; stop it first');
-            host.sessions.delete(loaded);
-            host.mcpFailed.delete(loaded);
-            host.lost.delete(loaded);
-            host.cwds.delete(loaded);
-            for (const target of clients) target.sessions.delete(loaded);
-            usage.forget(loaded);
-            await recorder?.close(loaded);
-            for (const child of host.subagents.childrenOf(loaded)) await recorder?.close(child.sessionId);
-            host.subagents.forget(loaded);
-            commands.clear(loaded);
+            await forgetChat(host, loaded);
           }
           await deleteSession(directory, key);
           // Its browser, with the logins in its profile, goes with it.
@@ -3541,6 +3677,7 @@ export async function startBridge(options) {
       startInitialSession,
       async close() {
         stopPluginNotices?.();
+        clearInterval(releaseTimer);
         clearTimeout(usageTimer);
         clearTimeout(limitsTimer);
         if (saveTimer) {

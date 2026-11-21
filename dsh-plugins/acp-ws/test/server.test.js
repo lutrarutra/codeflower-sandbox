@@ -676,6 +676,64 @@ test('refuses to resume a session leased by another worker', async (t) => {
   await closeSocket(socket);
 });
 
+test('lets go of a chat another worker asks for, once its turn ended', async (t) => {
+  const quick = { checkMs: 50, idleMs: 60_000 };
+  const first = await startTestBridge(t, { releaseTiming: quick });
+  const second = await startTestBridge(t, { releaseTiming: quick, sessionsDirectory: first.sessionsDirectory, instanceId: 'instance-two' });
+  const here = await openSocket(first.bridge.address);
+  const there = await openSocket(second.bridge.address);
+  t.after(() => Promise.all([closeSocket(here), closeSocket(there)]));
+  await initialize(here);
+  await initialize(there);
+  const { sessionId } = (await call(here, 'session/new', { cwd: '/workspace', mcpServers: [] })).result;
+  const key = sessionKey('claude', sessionId);
+  const root = join(first.sessionsDirectory, key);
+
+  assert.equal((await call(there, 'session/resume', { sessionId, cwd: '/workspace', mcpServers: [] })).error.code, -32010);
+  // A turn waits for the user here: the chat stays until it ended.
+  const permitted = call(here, 'session/prompt', { sessionId, prompt: [{ type: 'text', text: 'ask permission' }] });
+  const permission = await receive(here, (message) => message.method === 'session/request_permission');
+  assert.deepEqual((await call(there, '_codeflower/sessions/takeOver', { key })).result, { state: 'requested', holder: 'instance-test' });
+  assert.equal(JSON.parse(await readFile(join(root, 'takeover.json'), 'utf8')).instanceId, 'instance-two');
+  const requested = await receive(here, (message) => message.method === '_codeflower/sessions/requested');
+  assert.equal(requested.params.key, key);
+  assert.equal(JSON.parse(await readFile(join(root, 'lease.json'), 'utf8')).instanceId, 'instance-test');
+
+  send(here, { jsonrpc: '2.0', id: permission.id, result: { outcome: { outcome: 'selected', optionId: 'allow' } } });
+  assert.equal((await permitted).result.stopReason, 'end_turn');
+  const released = await receive(here, (message) => message.method === '_codeflower/sessions/released');
+  assert.deepEqual([released.params.key, released.params.reason], [key, 'takeover']);
+  await assert.rejects(readFile(join(root, 'lease.json')));
+  await assert.rejects(readFile(join(root, 'takeover.json')));
+
+  // The other worker has it now, and this one is refused.
+  const resumed = (await call(there, 'session/resume', { sessionId, cwd: '/workspace', mcpServers: [] })).result;
+  assert.ok(resumed._meta['codeflower/transcriptEntries'] > 0);
+  assert.equal(JSON.parse(await readFile(join(root, 'lease.json'), 'utf8')).instanceId, 'instance-two');
+  assert.equal((await call(here, 'session/resume', { sessionId, cwd: '/workspace', mcpServers: [] })).error.code, -32010);
+  // A chat no other worker has needs no request.
+  assert.deepEqual((await call(there, '_codeflower/sessions/takeOver', { key })).result, { state: 'free' });
+});
+
+test('lets go of an idle chat no window has open', async (t) => {
+  const { bridge, sessionsDirectory } = await startTestBridge(t, { releaseTiming: { checkMs: 50, idleMs: 200 } });
+  const socket = await openSocket(bridge.address);
+  t.after(() => closeSocket(socket));
+  await initialize(socket);
+  const closed = (await call(socket, 'session/new', { cwd: '/workspace', mcpServers: [] })).result.sessionId;
+  const kept = (await call(socket, 'session/new', { cwd: '/workspace', mcpServers: [] })).result.sessionId;
+  const lease = (sessionId) => join(sessionsDirectory, sessionKey('claude', sessionId), 'lease.json');
+
+  assert.deepEqual((await call(socket, '_codeflower/sessions/close', { key: sessionKey('claude', closed) })).result, {});
+  await waitFor(async () => !(await readFile(lease(closed)).catch(() => undefined)));
+  // The one still open in the window stays, and so does its lease.
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  assert.ok(await readFile(lease(kept)));
+  // Opening the chat again takes it back.
+  await call(socket, 'session/resume', { sessionId: closed, cwd: '/workspace', mcpServers: [] });
+  assert.equal(JSON.parse(await readFile(lease(closed), 'utf8')).instanceId, 'instance-test');
+});
+
 test('runs only the terminal sign-ins the agent announced', async (t) => {
   const { bridge, environment } = await startTestBridge(t);
   const socket = await openSocket(bridge.address);

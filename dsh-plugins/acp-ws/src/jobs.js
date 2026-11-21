@@ -303,6 +303,8 @@ export function createJobs({
     /** The jobs windows are shown: active ones and those of the last day. */
     snapshot: () => list,
     summary: () => ({ scheduler: info.scheduler, approve: info.approve, active: list.filter((job) => !FINAL.has(job.state)).length }),
+    /** The chat has a job not done yet, whose end it hears of. */
+    active: (agent, sessionId) => list.some((job) => job.agent === agent && job.sessionId === sessionId && !FINAL.has(job.state)),
     // What a chat that wraps up should know of its jobs still active.
     wrapUpNote(agent, sessionId) {
       const active = list.filter((job) => job.agent === agent && job.sessionId === sessionId && !FINAL.has(job.state));
