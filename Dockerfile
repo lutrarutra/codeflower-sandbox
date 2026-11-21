@@ -6,7 +6,7 @@
 # Claude ACP adapter pins in package-lock.json; the build checks that.
 ARG CLAUDE_AGENT_SDK_VERSION=0.3.310
 
-FROM node:22-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS dsh-runtime
+FROM node:26-bookworm-slim@sha256:5df79989ed685e09f0a98019db4cebfb22fb9df1a53c0161664a011f7ff6b0f1 AS dsh-runtime
 ARG CLAUDE_AGENT_SDK_VERSION
 
 # Harness runtimes: DeepSeek Harness, the Claude Code and Codex ACP adapters,
@@ -53,7 +53,7 @@ ADD --keep-git-dir=false https://github.com/lutrarutra/storyteller.git#v0.6.4 /
 FROM scratch AS ui-source
 ADD --keep-git-dir=false https://github.com/lutrarutra/codeflower-ui.git#v0.41.0 /
 
-FROM node:22-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS page-build
+FROM node:26-bookworm-slim@sha256:5df79989ed685e09f0a98019db4cebfb22fb9df1a53c0161664a011f7ff6b0f1 AS page-build
 WORKDIR /ui
 COPY --from=ui-source / ./
 RUN npm ci --no-audit --no-fund && npm run build:web
