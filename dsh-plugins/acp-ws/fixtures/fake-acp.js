@@ -15,7 +15,8 @@ const CREDENTIAL_VARIABLES = [
 const fakeLogin = fileURLToPath(new URL('./fake-login.js', import.meta.url));
 
 const input = createInterface({ input: process.stdin });
-let nextSession = 1;
+// A restarted worker's agent names its chats on from here, so they are not taken for earlier ones.
+let nextSession = Number(process.env.FAKE_ACP_FIRST_SESSION) || 1;
 let nextRequest = 1;
 let pendingPrompt;
 // Turns that run until the test lets them finish, by session.
@@ -684,7 +685,8 @@ input.on('line', async (line) => {
       lostSessions.delete(message.params?.sessionId);
       sessionMeta.set(message.params?.sessionId, message.params?._meta ?? null);
       if (!tasks.has(message.params?.sessionId)) tasks.set(message.params?.sessionId, { systemPrompt: null });
-      send({ jsonrpc: '2.0', id: message.id, result: mcpEcho(message) });
+      // Like Claude's adapter: the settings this process has for it, its defaults after a restart.
+      send({ jsonrpc: '2.0', id: message.id, result: { configOptions: configOptions(message.params?.sessionId), ...mcpEcho(message) } });
       break;
     case 'session/load': {
       // Like agents without session/resume: the history comes back first.
@@ -695,7 +697,7 @@ input.on('line', async (line) => {
         method: 'session/update',
         params: { sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'replayed history' } } }
       });
-      send({ jsonrpc: '2.0', id: message.id, result: mcpEcho(message) });
+      send({ jsonrpc: '2.0', id: message.id, result: { configOptions: configOptions(sessionId), ...mcpEcho(message) } });
       break;
     }
     default:

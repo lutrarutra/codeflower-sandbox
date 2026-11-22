@@ -14,6 +14,7 @@ import { createChatTerminals, terminalSize } from './chat-terminals.js';
 import { createCommands, standardCommandEvents, startCommandOutputServer } from './commands.js';
 import { hookSettings, tailTranscript, transcriptPath } from './agents/claude/mirror.js';
 import { createSessionInfo } from './session-info.js';
+import { categoryOf, createLastChoices, newChatSettings, nextChange, settingsOf } from './chat-settings.js';
 import { CREDENTIAL_VARIABLES, InvalidRequest, terminalAuthCommand } from './agents.js';
 import { readCodexLimits } from './codex-limits.js';
 import { listDirectory, readClientFile, resolveFile, saveReportComments, startShowServer, writeClientFile } from './files.js';
@@ -473,6 +474,17 @@ export function createRecorder(store, log) {
 
     setSubagent(sessionId, summary) {
       return run(() => store.setSubagent(sessionId, summary));
+    },
+
+    /** Keeps a chat's settings for when it is opened again (sessions.js). */
+    setSettings(sessionId, settings) {
+      return run(() => store.setSettings(sessionId, settings));
+    },
+
+    /** The settings a chat had when it was last open, once the store has opened it. */
+    async storedSettings(sessionId) {
+      await queue;
+      return store.storedSettings(sessionId);
     },
 
     /** Whether recorded messages are still on their way into the store. */
@@ -1195,6 +1207,11 @@ export async function startBridge(options) {
         : { sessionMeta: {}, env: {} };
     // The settings the running agent started with, for those it reads at start.
     let startedSubagentEnv = {};
+    // The settings chosen last in the windows, which new chats start with (chat-settings.js).
+    const lastChoices = await createLastChoices({
+      file: privateDirectory ? join(privateDirectory, 'chat-settings', `${agentName}.json`) : undefined,
+      log
+    });
 
     // The agent runs from the first connection until the worker stops; windows
     // (VS Code, the app's page) attach to it side by side and may come and go.
@@ -1613,7 +1630,11 @@ export async function startBridge(options) {
       }
     };
 
-    const requestAgent = (host, method, params = {}) =>
+    // `options`: `keepSettings`, a chat opened again with the settings the
+    // agent has, e.g. back from the terminal UI, where the user may have
+    // changed them; `quiet`, a setting the bridge sets again, which others do
+    // not follow (followSetting).
+    const requestAgent = (host, method, params = {}, options = {}) =>
       new Promise((resolve, reject) => {
         if (!childRunning(host.child)) {
           reject(new Error(`${agentName} exited before ${method}`));
@@ -1621,7 +1642,7 @@ export async function startBridge(options) {
         }
         const id = `cf-${host.nextRequest++}`;
         const key = requestKey(id);
-        const request = { client: null, id, bridgeId: id, key, method, params, resolve, reject };
+        const request = { ...options, client: null, id, bridgeId: id, key, method, params, resolve, reject };
         if (method === 'initialize') {
           host.initialized = new Promise((initialize) => {
             request.initialized = initialize;
@@ -1925,10 +1946,10 @@ export async function startBridge(options) {
     const recoverSession = (host, sessionId) => {
       let recovering = host.recovering.get(sessionId);
       if (recovering) return recovering;
-      const before = host.sessions.get(sessionId);
       recovering = (async () => {
         const capabilities = (await host.initialized)?.agentCapabilities ?? {};
         const resume = Boolean(capabilities.sessionCapabilities?.resume) || !capabilities.loadSession;
+        // Back with the settings it had (settleSettings), before what waited for it goes on.
         await requestAgent(host, resume ? 'session/resume' : 'session/load', {
           sessionId,
           cwd: host.cwds.get(sessionId) ?? workspace,
@@ -1936,16 +1957,6 @@ export async function startBridge(options) {
         });
         host.lost.delete(sessionId);
         log(`Resumed ${sessionKey(agentName, sessionId)}, which ${agent.label ?? agentName} had lost`);
-        const now = host.sessions.get(sessionId)?.configOptions ?? [];
-        for (const option of before?.configOptions ?? []) {
-          if (typeof option?.id !== 'string' || option.currentValue === undefined) continue;
-          if (now.find((current) => current?.id === option.id)?.currentValue === option.currentValue) continue;
-          try {
-            await requestAgent(host, 'session/set_config_option', { sessionId, configId: option.id, value: option.currentValue });
-          } catch (error) {
-            log(`Could not set ${option.id} again in ${sessionKey(agentName, sessionId)}: ${error.message}`);
-          }
-        }
       })().finally(() => host.recovering.delete(sessionId));
       host.recovering.set(sessionId, recovering);
       return recovering;
@@ -2210,7 +2221,7 @@ export async function startBridge(options) {
       log(`${handoff.key} is back from the terminal UI`);
       // The queued prompts the terminal did not get yet go back to the queue.
       promptQueue.putFirst(sessionId, handoff.queue.filter((queued) => queued.item).map((queued) => queued.item));
-      await requestAgent(host, 'session/resume', { sessionId, cwd: handoff.cwd, mcpServers: [] });
+      await requestAgent(host, 'session/resume', { sessionId, cwd: handoff.cwd, mcpServers: [] }, { keepSettings: true });
       for (const queued of handoff.queue) {
         if (!queued.client || !allClients.has(queued.client)) continue;
         const bridgeId = `cf-${host.nextRequest++}`;
@@ -2500,6 +2511,46 @@ export async function startBridge(options) {
       const { sessionId: _, _meta, ...state } = result;
       host.sessions.set(sessionId, structuredClone(state));
       sessionInfo.settings(sessionId, state);
+      keepSettings(host, sessionId);
+    };
+
+    // The chat's settings, kept in its record for when it is opened again.
+    const keepSettings = (host, sessionId) => {
+      const state = host.sessions.get(sessionId);
+      if (state) void recorder?.setSettings(sessionId, settingsOf(state));
+    };
+
+    // Brings a chat to the settings it should have, a change at a time, each
+    // asked of the agent like a window's, so every window gets the result.
+    const applySettings = async (host, sessionId, wanted) => {
+      const tried = new Set();
+      for (let change; (change = nextChange(host.sessions.get(sessionId), wanted, tried)); ) {
+        tried.add(change.configId);
+        try {
+          await requestAgent(host, change.method, { sessionId, ...change.params }, { quiet: true });
+        } catch (error) {
+          log(`Could not set ${change.configId} in ${sessionKey(agentName, sessionId)}: ${error.message}`);
+        }
+      }
+    };
+
+    // A chat that just started, or was opened (again): a new one a window
+    // started takes the settings chosen last in the windows (not the bridge's
+    // own, e.g. the initial prompt's, which no one may be there to see in
+    // plan mode), then those that follow its mode (followSetting); one opened
+    // again those it had (`before`, while the
+    // bridge still has them, else from its record, e.g. after the worker
+    // restarted), since agents keep some only while the chat runs (Claude's
+    // effort). Done before the window gets the chat, and before its prompts go.
+    const settleSettings = async (host, request, sessionId, before) => {
+      if (request.method === 'session/new') {
+        if (request.client) await applySettings(host, sessionId, newChatSettings(host.sessions.get(sessionId), lastChoices.get(), agent.remembers ?? []));
+        await followMode(host, sessionId);
+        return;
+      }
+      if (request.keepSettings) return;
+      const wanted = before ? settingsOf(before) : await recorder?.storedSettings(sessionId);
+      if (wanted) await applySettings(host, sessionId, wanted);
     };
 
     // Keeps a loaded session's settings current, so a reattach reports them.
@@ -2510,8 +2561,11 @@ export async function startBridge(options) {
         state.configOptions = update.configOptions;
       } else if (update.sessionUpdate === 'current_mode_update' && state.modes) {
         state.modes.currentModeId = update.currentModeId;
+      } else {
+        return;
       }
       sessionInfo.settings(sessionId, state);
+      keepSettings(host, sessionId);
     };
 
     const toSettings = (sessionId, update, except) =>
@@ -2571,18 +2625,22 @@ export async function startBridge(options) {
           else host.mcpFailed.delete(sessionId);
           if (typeof params?.cwd === 'string') host.cwds.set(sessionId, params.cwd);
           rememberSession(host, sessionId, result);
+          // The agent has it again: what the bridge asks of it now goes to it.
+          host.lost.delete(sessionId);
           // The session's totals start from those its transcript recorded.
           void (recorder?.isOpen(sessionId) ?? Promise.resolve()).then(() =>
             usage.opened(sessionId, store?.storedUsage(sessionId))
           );
+          // The bridge's own request (requestAgent) resolves once the settings are set.
+          request.settled = settleSettings(host, request, sessionId, state).catch((error) =>
+            log(`Could not set the settings of ${sessionKey(agentName, sessionId)}: ${error.message}`)
+          );
           if (allClients.has(request.client)) {
-            void attachSession(host, request.client, request.id, sessionId, result).then(() => {
+            void request.settled
+              // With the settings it has now.
+              .then(() => attachSession(host, request.client, request.id, sessionId, { ...result, ...host.sessions.get(sessionId) }))
               // Prompts queued before the agent restarted go on once the chat is back.
-              drainQueue(sessionId);
-              if (method === 'session/new') return followMode(host, sessionId);
-            });
-          } else if (method === 'session/new') {
-            void followMode(host, sessionId);
+              .then(() => drainQueue(sessionId));
           }
           return true;
         // The agent let go of the chat: the next window or terminal to open it
@@ -2605,14 +2663,19 @@ export async function startBridge(options) {
         // The other windows with the chat open follow a change of settings.
         case 'session/set_config_option':
           if (state && Array.isArray(result.configOptions)) {
+            // A window's choice is where the next new chats start.
+            if (request.client) void lastChoices.remember(categoryOf(state, method, params), params?.value);
             state.configOptions = result.configOptions;
             sessionInfo.settings(sessionId, state);
+            keepSettings(host, sessionId);
             toSettings(sessionId, { sessionUpdate: 'config_option_update', configOptions: result.configOptions }, request.client);
-            void followSetting(host, sessionId, params?.configId, params?.value);
+            if (!request.quiet) void followSetting(host, sessionId, params?.configId, params?.value);
           }
           break;
         case 'session/set_mode':
+          if (request.client) void lastChoices.remember('mode', params?.modeId);
           if (state?.modes) state.modes.currentModeId = params.modeId;
+          keepSettings(host, sessionId);
           toSettings(sessionId, { sessionUpdate: 'current_mode_update', currentModeId: params.modeId }, request.client);
           break;
         case 'session/set_model':
@@ -2640,6 +2703,7 @@ export async function startBridge(options) {
         // Attaches answer once the recorder caught up.
         const attached = settleRequest(host, request, message);
         if (message.error) request.reject?.(new Error(message.error.message ?? `${request.method} failed`));
+        else if (request.settled) void request.settled.then(() => request.resolve?.(message.result));
         else request.resolve?.(message.result);
         // A message the turn took in shows in every window, as a prompt does.
         const steered = request.method === STEER_METHOD && message.result?.outcome === 'injected';

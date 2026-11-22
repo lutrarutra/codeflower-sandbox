@@ -181,6 +181,8 @@ export function createSessionStore({
         meta,
         // The totals of earlier turns, which the worker's usage starts from.
         storedUsage: meta.usage ? structuredClone(meta.usage) : undefined,
+        // The settings the chat had when it was last open, which the bridge sets again.
+        storedSettings: meta.settings ? structuredClone(meta.settings) : undefined,
         // Entries recorded so far, counted when recorded, not when written.
         count: recorded.split('\n').filter((line) => line.trim()).length,
         queue: Promise.resolve()
@@ -289,6 +291,23 @@ export function createSessionStore({
           await writeJsonAtomically(state.paths.meta, state.meta);
         }
       });
+    },
+
+    /**
+     * Keeps the chat's settings in its meta ({ options: { configId: value },
+     * mode }), so it gets them back when it is opened again, also after the
+     * worker restarted. Not a change to the chat: its time stays.
+     */
+    setSettings(nativeSessionId, settings) {
+      const state = open.get(nativeSessionId);
+      if (!state || JSON.stringify(state.meta.settings) === JSON.stringify(settings)) return Promise.resolve();
+      state.meta.settings = settings;
+      return enqueue(state, () => writeJsonAtomically(state.paths.meta, state.meta));
+    },
+
+    /** The settings the session had before it was opened here. */
+    storedSettings(nativeSessionId) {
+      return open.get(nativeSessionId)?.storedSettings;
     },
 
     /** The token counts and cost of the session's turns before it was opened here. */

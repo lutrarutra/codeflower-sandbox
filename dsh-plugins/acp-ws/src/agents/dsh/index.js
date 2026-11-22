@@ -384,7 +384,9 @@ export default function dsh({ home, launch, nodePath, modules }) {
     // Its usage plugin writes token counts to this extra pipe.
     usageFd: 3,
     // The model chosen in a chat is the one fresh chats start on (defaultModelPatch):
-    // saved for the next start, and given to new chats of this one.
+    // saved for the next start, and given to new chats of this one. So the
+    // bridge's own memory of the last choices (chat-settings.js) leaves it alone.
+    remembers: ['model'],
     async followSetting({ configId, value, configOptions, started }) {
       if (!home) return undefined;
       const option = configOptions.find((candidate) => candidate?.category === 'model');

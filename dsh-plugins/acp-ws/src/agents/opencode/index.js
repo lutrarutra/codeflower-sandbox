@@ -80,6 +80,9 @@ export default function opencode({ descriptor, home, launch, nodePath, environme
       if (!server) return () => {};
       return watchEvents({ ...server, emit, log });
     },
+    // The bridge's memory of the last choices (chat-settings.js) leaves the
+    // model to followSetting.
+    remembers: ['model'],
     // A model for each mode. OpenCode itself (its terminal UI, `opencode run`)
     // takes each agent's model from its config, `agent.<mode>.model`, but
     // `opencode acp` keeps one model through mode changes and starts each chat

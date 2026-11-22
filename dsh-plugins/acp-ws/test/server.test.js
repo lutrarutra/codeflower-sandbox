@@ -413,10 +413,10 @@ test("OpenCode's model follows its mode, in every window and in a new chat", asy
   assert.equal(model(await set('mode', 'default')), 'openrouter/openrouter/free');
   await Promise.all(seen);
 
-  // A new chat starts on its mode's model.
-  const fresh = receive(window, (message) => message.params?.update?.sessionUpdate === 'config_option_update' && model(message.params.update.configOptions) === 'openrouter/qwen/qwen3-32b');
-  const next = await newChat(window);
-  assert.equal((await fresh).params.sessionId, next);
+  // A new chat starts in the mode chosen last, on its model: the window gets it so.
+  const fresh = (await call(window, 'session/new', { cwd: '/w', mcpServers: [] })).result;
+  assert.equal(fresh.configOptions.find((option) => option.id === 'mode').currentValue, 'default');
+  assert.equal(model(fresh.configOptions), 'openrouter/qwen/qwen3-32b');
 });
 
 test('describes every built-in agent completely', async () => {
@@ -2601,6 +2601,42 @@ test("resumes a chat whose agent process ended, with its settings, instead of fa
   const again = await prompt(window, sessionId, 'say hello again');
   assert.equal(again.error, undefined);
   assert.equal(again.result.stopReason, 'end_turn');
+});
+
+test('a chat gets its settings back on a restarted worker, and new chats start with the ones chosen last', async (t) => {
+  const valueOf = (options, id) => options.find((option) => option.id === id).currentValue;
+  const first = await startTestBridge(t);
+  const window = await openSocket(first.bridge.address);
+  await initialize(window);
+  const sessionId = await newChat(window);
+  await call(window, 'session/set_config_option', { sessionId, configId: 'mode', value: 'plan' });
+  await call(window, 'session/set_config_option', { sessionId, configId: 'effort', value: 'high' });
+
+  // The next chat starts with them, and its own choice is the one after that.
+  const next = (await call(window, 'session/new', { cwd: '/workspace', mcpServers: [] })).result;
+  assert.equal(valueOf(next.configOptions, 'mode'), 'plan');
+  assert.equal(valueOf(next.configOptions, 'effort'), 'high');
+  await call(window, 'session/set_config_option', { sessionId: next.sessionId, configId: 'effort', value: 'low' });
+  const saved = join(first.directory, 'chat-settings', 'claude.json');
+  await waitFor(async () => JSON.parse(await readFile(saved, 'utf8').catch(() => '{}')).thought_level === 'low');
+  await closeSocket(window);
+  await first.bridge.close();
+
+  // A new worker on the project, whose agent has its defaults: the chat is back as it was.
+  const second = await startTestBridge(t, {
+    sessionsDirectory: first.sessionsDirectory,
+    environment: { ...first.environment, FAKE_ACP_FIRST_SESSION: '10' }
+  });
+  const again = await openSocket(second.bridge.address);
+  t.after(() => closeSocket(again));
+  await initialize(again);
+  const resumed = (await call(again, 'session/resume', { sessionId, cwd: '/workspace', mcpServers: [] })).result;
+  assert.equal(valueOf(resumed.configOptions, 'mode'), 'plan');
+  assert.equal(valueOf(resumed.configOptions, 'effort'), 'high');
+  const fresh = (await call(again, 'session/new', { cwd: '/workspace', mcpServers: [] })).result;
+  assert.equal(fresh.sessionId, 'session-10');
+  assert.equal(valueOf(fresh.configOptions, 'mode'), 'plan');
+  assert.equal(valueOf(fresh.configOptions, 'effort'), 'low');
 });
 
 test("restarts an agent whose server ended by itself, and its chats resume on the new one", async (t) => {
