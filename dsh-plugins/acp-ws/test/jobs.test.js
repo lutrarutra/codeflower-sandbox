@@ -280,6 +280,8 @@ test('asks the user, submits through the app, and tells the chat when its job en
   await app.finish('j-000001', 'failed', 3);
   const told = await receive(chat, (message) => message.method === '_codeflower/prompted');
   assert.match(told.params.prompt[0].text, /A batch job you submitted ended:\n- align \(j-000001, slurm 101\): failed \(exit 3\)/);
+  // A notice of the bridge's, which the chat shows apart from the user's messages.
+  assert.deepEqual(told.params.prompt[0]._meta['codeflower/notice'], { title: 'Batch job ended', summary: 'align failed' });
   const listed = (await call(window, '_codeflower/jobs/list')).result.jobs;
   assert.deepEqual(listed.map((each) => [each.id, each.state]), [['j-000002', 'cancelled'], ['j-000001', 'failed']]);
 });
@@ -307,6 +309,7 @@ test('a denied job is not submitted, and one the user has not answered yet is pe
   chat.send(JSON.stringify({ jsonrpc: '2.0', id: later.id, result: { outcome: { outcome: 'selected', optionId: 'allow' } } }));
   const told = await receive(chat, (message) => message.method === '_codeflower/prompted');
   assert.match(told.params.prompt[0].text, /slow is j-000001/);
+  assert.equal(told.params.prompt[0]._meta['codeflower/notice'].title, 'Batch job');
 
   // Not in a chat's turn and no session named: nobody to ask.
   assert.match((await job(undefined, ['submit', '--', 'python'])).stderr, /approval in a chat/);

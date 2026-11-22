@@ -103,11 +103,22 @@ export function endNotice(jobs) {
   return `${intro}\n${lines.join('\n')}\nRead the output (codeflower-job log ID) before going on.`;
 }
 
+/** The notice's line in the chat, folded: each job's name and how it ended. */
+export function endSummary(jobs) {
+  const each = jobs.map((job) => {
+    const failed = job.outcome ? job.outcome.failed + (job.outcome.lost ?? 0) : 0;
+    const outcome = job.outcome ? ` (${job.outcome.done} done${failed ? `, ${failed} failed` : ''})` : '';
+    return `${job.name} ${job.state}${outcome}`;
+  });
+  return each.length > 3 ? `${each.slice(0, 3).join(', ')} and ${each.length - 3} more` : each.join(', ');
+}
+
 /**
  * The bridge's side of batch jobs.
  * - info: readJobsInfo(); spool: this sandbox's spool; directory: the project's jobs folder.
  * - askUser(chat, { toolCall, options }) → the answer, or undefined when it cannot ask.
- * - tell(chat, text, title): a message for the chat's next prompt.
+ * - tell(chat, text, title, summary): a message for the chat's next prompt, which the chat shows
+ *   apart from the user's, folded under its title and summary.
  * - changed(jobs): sends the list to the windows.
  */
 export function createJobs({
@@ -197,7 +208,7 @@ export function createJobs({
       const text = late.ok
         ? `The batch job request you made was ${late.job?.approved === 'user' ? 'allowed' : 'submitted'}: ${late.job?.name} is ${late.job?.id} (${info.scheduler} ${late.job?.schedulerId ?? ''}).`
         : `The batch job request you made was not submitted: ${late.error}`;
-      tell(chat, text, 'Batch job');
+      tell(chat, text, 'Batch job', late.ok ? `${late.job?.name} submitted (${late.job?.id})` : 'Not submitted');
     });
     return {
       ok: false,
@@ -235,7 +246,9 @@ export function createJobs({
       entry = { chat: { agent: job.agent, sessionId: job.sessionId }, jobs: [] };
       entry.timer = setTimeout(() => {
         notices.delete(key);
-        if (!closed) tell(entry.chat, endNotice(entry.jobs), entry.jobs.length === 1 ? 'Batch job ended' : 'Batch jobs ended');
+        if (!closed) {
+          tell(entry.chat, endNotice(entry.jobs), entry.jobs.length === 1 ? 'Batch job ended' : 'Batch jobs ended', endSummary(entry.jobs));
+        }
       }, noticeDelayMs);
       entry.timer.unref?.();
       notices.set(key, entry);

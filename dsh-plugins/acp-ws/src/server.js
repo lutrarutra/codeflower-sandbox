@@ -1165,6 +1165,14 @@ export async function startBridge(options) {
     }
   });
 
+  // A prompt of the bridge's own (a batch job ended, the wrap-up, the browser handed back), which the
+  // user did not write: its text block says so, with a title and a line for the chat, which shows it
+  // apart from the user's messages, folded (ui's `codeflower/notice`). It stays in the transcript.
+  const NOTICE_META = 'codeflower/notice';
+  const noticePrompt = (text, title, summary) => [
+    { type: 'text', text, _meta: { [NOTICE_META]: { title: title || 'Notice', ...(summary ? { summary } : {}) } } }
+  ];
+
   // The bridge told the windows of the message itself (`_codeflower/prompted`).
   const withPrompted = (result) => ({
     ...result,
@@ -2412,7 +2420,8 @@ export async function startBridge(options) {
         method: '_codeflower/wrapUp',
         params: { ...notice, key: sessionKey(agentName, sessionId), prompt: text }
       });
-      await requestAgent(host, 'session/prompt', { sessionId, prompt: [{ type: 'text', text }] }).catch((error) =>
+      const summary = notice.reason === 'quit' ? 'The app is quitting: save the work' : 'The allocation ends soon: save the work';
+      await requestAgent(host, 'session/prompt', { sessionId, prompt: noticePrompt(text, 'Wrap up', summary) }).catch((error) =>
         log(`A chat could not wrap up: ${error.message}`)
       );
     };
@@ -3708,7 +3717,11 @@ export async function startBridge(options) {
         const said = typeof note === 'string' && note.trim() ? `: "${note.trim().slice(0, 1000)}"` : '.';
         const text = `The user handed the browser back${said} Take a snapshot to see where it is now, then go on.`;
         try {
-          promptQueue.add(sessionId, { prompt: [{ type: 'text', text }], text, title: 'Browser handed back' });
+          promptQueue.add(sessionId, {
+            prompt: noticePrompt(text, 'Browser handed back', said === '.' ? 'The user is done in the browser' : note.trim().slice(0, 200)),
+            text,
+            title: 'Browser handed back'
+          });
         } catch (error) {
           log(`Could not tell ${sessionKey(agentName, sessionId)} the browser is back: ${error.message}`);
           return;
@@ -3739,10 +3752,11 @@ export async function startBridge(options) {
           }
         });
       },
-      // Tells a chat something as its next prompt, once its turn has ended.
-      tell(sessionId, text, title) {
+      // Tells a chat something as its next prompt, once its turn has ended: a notice of the
+      // bridge's, which the chat shows folded under its title and summary.
+      tell(sessionId, text, title, summary) {
         try {
-          promptQueue.add(sessionId, { prompt: [{ type: 'text', text }], text, title });
+          promptQueue.add(sessionId, { prompt: noticePrompt(text, title, summary), text, title });
         } catch (error) {
           log(`Could not tell ${sessionKey(agentName, sessionId)}: ${error.message}`);
           return false;
@@ -4317,7 +4331,7 @@ export async function startBridge(options) {
       spool: jobsSpool,
       directory: join(privateDirectory, 'jobs'),
       askUser: (chat, question) => runtimes.get(chat.agent)?.askUser(chat.sessionId, question) ?? Promise.resolve(undefined),
-      tell: (chat, text, title) => runtimes.get(chat.agent)?.tell(chat.sessionId, text, title),
+      tell: (chat, text, title, summary) => runtimes.get(chat.agent)?.tell(chat.sessionId, text, title, summary),
       changed: (list) => {
         for (const target of clients) {
           if (target.agentName === undefined) target.send({ jsonrpc: '2.0', method: '_codeflower/jobs/changed', params: { jobs: list } });
