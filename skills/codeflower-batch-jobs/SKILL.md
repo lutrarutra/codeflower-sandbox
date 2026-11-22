@@ -28,6 +28,37 @@ So a job script uses the paths and software you use here. Prepare everything fir
 - **Try it here on a small piece first** (one sample, a few minutes), so a mistake does not fail a
   hundred tasks.
 
+## Here, one job, or an array
+
+Every job, and every task of an array, pays a fixed cost before its command runs: the wait in the
+scheduler's queue (seconds to hours, longer for bigger requests and on a busy cluster), then
+starting a sandbox on its node (seconds, or minutes when the node must first load the image: its
+scheduler log, `codeflower-job log ID --scheduler`, shows that). And you hear that a job ended up to
+a minute or so after it did. Each task must be worth that cost:
+
+- **Run it here** when it fits this sandbox's allocation and remaining time. Work of a few minutes
+  never belongs in a job, nor does anything you are still trying out.
+- **Group small pieces.** When each piece takes seconds to a few minutes, give each task a chunk of
+  them and run the chunk in parallel inside it (`xargs -P`, Python's multiprocessing, or the
+  workflow tool's own parallelism) on the CPUs the task asks for. Aim for tasks of at least half an
+  hour. 2,000 one-minute samples: an array of 20 tasks of 100 samples each with 8 CPUs, not
+  2,000 tasks.
+- **Use an array** when the pieces are independent and each one, or each chunk, runs for half an
+  hour or more; `$CODEFLOWER_JOB_INDEX` picks the piece or chunk.
+- **Submit one larger job** for a single computation that needs more CPUs, memory, GPUs or time than
+  this sandbox has.
+
+## Reading and writing files
+
+A job reads and writes the same folders as this sandbox at the filesystem's full speed: sandboxing
+does not slow file access. But all jobs, and this sandbox, share the cluster's filesystem:
+
+- Work bound by reading and writing files rather than computing does not get faster with more
+  tasks, and many tasks reading one filesystem at once can be slower than one. Run it here when it
+  fits, or in one job; when it must be an array, limit how many run at once (`%4`).
+- Thousands of tiny files are slow on shared filesystems: read and write fewer, larger files (an
+  archive, a table, a database) where the tools allow.
+
 ## Submitting
 
 ```sh

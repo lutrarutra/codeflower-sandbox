@@ -68,7 +68,8 @@ When the doctor's batch-jobs section says jobs are on, `codeflower-job submit` a
 a command as a batch job on the cluster, in a sandbox like this one: same image, `/data` folders,
 workspace, software environments and network, so it uses the paths and software you use here.
 Use jobs for work bigger or longer than this sandbox's allocation, or for many independent pieces
-(an array); say what you submit and why, as the user may be asked to allow it; and follow the
+(an array, grouped so that each task runs for a while: every job waits in the queue and starts a
+sandbox first); say what you submit and why, as the user may be asked to allow it; and follow the
 codeflower-batch-jobs skill. There is no scheduler command (`sbatch`, `qsub`) in this sandbox.
 
 `codeflower-browser` drives this chat's browser, a Chromium in the sandbox that the user can
