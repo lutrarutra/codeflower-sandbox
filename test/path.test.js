@@ -69,3 +69,21 @@ test('without a map the helper says so', () => {
   assert.equal(result.status, 1);
   assert.match(result.stderr, /CODEFLOWER_PATHS_FILE is not set/);
 });
+
+test('a workspace mounted from outside the project translates to its own folder', (t) => {
+  const file = mapFile(t, [], {
+    CODEFLOWER_HOST_STATE: '/home/ana/codeflower/projects/p',
+    CODEFLOWER_HOST_WORKSPACE: '/groups/lab/ana/workspaces/p'
+  });
+  const result = run(file, [
+    '/codeflower-state/workspace/data/counts.csv',
+    '/codeflower-state/sessions/x.json',
+    '/groups/lab/ana/workspaces/p/report.html'
+  ]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(result.stdout.trim().split('\n'), [
+    '/groups/lab/ana/workspaces/p/data/counts.csv',
+    '/home/ana/codeflower/projects/p/sessions/x.json',
+    '/codeflower-state/workspace/report.html'
+  ]);
+});

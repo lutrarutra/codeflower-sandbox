@@ -117,6 +117,8 @@ function mounts() {
 async function describe() {
   return {
     stateDirectory: process.env.CODEFLOWER_HOST_STATE ?? null,
+    // The workspace's own folder, when the app mounts it from outside the project.
+    workspaceDirectory: process.env.CODEFLOWER_HOST_WORKSPACE || null,
     engine: process.env.CODEFLOWER_ENGINE ?? 'apptainer',
     mounts: mounts()
   };

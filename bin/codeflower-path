@@ -27,6 +27,10 @@ function startupMap() {
   if (process.env.CODEFLOWER_HOST_STATE) {
     map.push({ target: STATE, source: process.env.CODEFLOWER_HOST_STATE, readOnly: false });
   }
+  // A workspace the app mounts from its own folder (workspace_dir).
+  if (process.env.CODEFLOWER_HOST_WORKSPACE) {
+    map.push({ target: `${STATE}/workspace`, source: process.env.CODEFLOWER_HOST_WORKSPACE, readOnly: false });
+  }
   return map;
 }
 

@@ -176,6 +176,9 @@ function launchFacts() {
     `- Network: ${process.env.CODEFLOWER_NETWORK === 'isolated' ? 'isolated; run codeflower-network for the current allowlist' : 'no code flower isolation reported; other network restrictions may apply'}`,
     '- Agent tool limits and permissions: not reported here; check the active harness.',
     `- Project state: /codeflower-state (read-write)${process.env.CODEFLOWER_HOST_STATE ? `, ${JSON.stringify(process.env.CODEFLOWER_HOST_STATE)} on the user's computer` : ''}`,
+    ...(process.env.CODEFLOWER_HOST_WORKSPACE
+      ? [`- Workspace: /codeflower-state/workspace (read-write), ${JSON.stringify(process.env.CODEFLOWER_HOST_WORKSPACE)} on the user's computer, outside the project folder`]
+      : []),
     '',
     '## Configured user mounts'
   ];

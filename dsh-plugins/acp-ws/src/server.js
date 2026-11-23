@@ -261,6 +261,7 @@ export function agentEnvironment(environment, harnessEnvironment = {}) {
   delete result.CODEFLOWER_RUN_DIR;
   delete result.CODEFLOWER_AGENT;
   delete result.CODEFLOWER_HOST_STATE;
+  delete result.CODEFLOWER_HOST_WORKSPACE;
   delete result.CODEFLOWER_HOST_IMAGE;
   delete result.CODEFLOWER_ENGINE;
   delete result.CODEFLOWER_MOUNTS;
