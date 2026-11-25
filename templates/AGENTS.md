@@ -237,8 +237,11 @@ track. Use `codeflower-roots` (the codeflower-roots skill) from the start:
    unreadable colors, a wrong scale. Fix it and look again.
 4. **Iterate.** Let what you see decide the next step (thresholds, parameters, another method), and
    note the decisions and why you made them.
-5. **Long steps** (more than a few minutes): run them in the background with output to `logs/`, and
-   check on them, rather than blocking.
+5. **Long steps** (more than a few minutes: analyses, pipelines, builds, installs): run them in the
+   background with output to `logs/` (your shell tool's background option, where it has one), and
+   check on them, rather than blocking. A message the user sends meanwhile then does not stop them.
+   To wait for one to finish, watch for its result or a line in its log with `codeflower-watch` and
+   end your turn, rather than polling in a loop.
 
 Figures: before the first figure of an analysis or a report, ask the user which plotting library
 they want their figures in: matplotlib or seaborn (Python), Plotly (interactive in the report),

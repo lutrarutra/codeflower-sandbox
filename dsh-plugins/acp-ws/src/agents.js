@@ -4,7 +4,10 @@
 // hosts, files to write once), and an optional `index.js` adds what only code
 // can say (whether the project holds a login, where a configured key goes, a
 // launch command with arguments, its plugins adapter, parts of its subagents
-// adapter). An agent that needs nothing but ACP needs no index.js. Adding an
+// adapter). `wrapper` names a script in the folder that starts the launch
+// script itself (its path comes as the first argument), to change the agent's
+// package where it has no setting for it. An agent that needs nothing but ACP
+// needs no index.js. Adding an
 // agent is adding a folder, its package to the image's package.json, and the
 // descriptor to the app (`make agents` there).
 import { readdirSync, readFileSync, existsSync } from 'node:fs';
@@ -30,8 +33,10 @@ export async function loadRegistry(directory = AGENTS_DIRECTORY) {
         const descriptor = JSON.parse(readFileSync(join(folder, 'agent.json'), 'utf8'));
         if (descriptor.id !== entry.name) throw new Error(`${folder}/agent.json names the agent ${descriptor.id}`);
         if (typeof descriptor.launch !== 'string') throw new Error(`${folder}/agent.json has no launch script`);
+        const wrapper = descriptor.wrapper === undefined ? undefined : join(folder, descriptor.wrapper);
+        if (wrapper !== undefined && !existsSync(wrapper)) throw new Error(`${folder}/agent.json names a wrapper that is not there`);
         const hooks = existsSync(join(folder, 'index.js')) ? (await import(join(folder, 'index.js'))).default : undefined;
-        return { descriptor, hooks, icon: readIcon(folder, descriptor) };
+        return { descriptor, hooks, icon: readIcon(folder, descriptor), wrapper };
       })
   );
 }
@@ -79,13 +84,15 @@ export async function terminalAuthCommand(agent, method) {
  * environment, and whether its project already holds a login or key.
  *
  * `modules` is the image's node_modules, where each agent's `launch` script
- * is; `launch` gives other scripts by agent id (tests start a fake agent).
+ * is; `launch` gives other scripts by agent id (tests start a fake agent),
+ * which run without the agent's wrapper.
  * `agents` replaces the built-in agents (tests, from loadRegistry).
  */
 export function createAgents({ nodePath, modules, launch = {}, environment = process.env, agents = registry }) {
   return Object.fromEntries(
-    agents.map(({ descriptor, hooks, icon }) => {
+    agents.map(({ descriptor, hooks, icon, wrapper }) => {
       const script = launch[descriptor.id] ?? (modules ? join(modules, descriptor.launch) : descriptor.launch);
+      const wrapped = wrapper !== undefined && launch[descriptor.id] === undefined;
       const home = descriptor.home ? environment[descriptor.home.variable] : undefined;
       const agent = {
         label: descriptor.name,
@@ -97,7 +104,7 @@ export function createAgents({ nodePath, modules, launch = {}, environment = pro
           ...(icon ? { icon: icon.url, ...(icon.mono ? { iconMono: true } : {}) } : {})
         },
         async command() {
-          return [nodePath, script];
+          return wrapped ? [nodePath, wrapper, script] : [nodePath, script];
         },
         env: descriptor.env ?? {},
         goal: descriptor.goal,
