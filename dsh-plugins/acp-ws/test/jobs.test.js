@@ -102,11 +102,14 @@ function fakeApp(spool, jobsDirectory) {
   let next = 0;
   const seen = [];
   const jobs = new Map();
+  let saves = 0;
+  // Each save through a file of its own: the timer's rounds may overlap and save one job twice at once.
   const save = async (job) => {
     await mkdir(join(jobsDirectory, job.id), { recursive: true });
     const file = join(jobsDirectory, job.id, 'job.json');
-    await writeFile(`${file}.tmp`, JSON.stringify(job));
-    await rename(`${file}.tmp`, file);
+    const temporary = `${file}.${++saves}.tmp`;
+    await writeFile(temporary, JSON.stringify(job));
+    await rename(temporary, file);
   };
   const timer = setInterval(async () => {
     let names = [];
