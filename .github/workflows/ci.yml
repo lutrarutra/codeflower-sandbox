@@ -39,7 +39,7 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
           cache-dependency-path: dsh-plugins/acp-ws/package-lock.json
 
@@ -145,3 +145,45 @@ jobs:
             mkdir -p /tmp/audit && printf "doi: 10.1234/x\navailability: {data: 1, code: 0, environment: 0, methods: 1}\n" > /tmp/audit/paper.yaml
             printf "[]\n" > /tmp/audit/targets.yaml && codeflower-audit check --dir /tmp/audit | grep -q "OK: 0 targets"
           '
+
+      # dsh from the pruned runtime, with the profile and usage patch the bridge gives it:
+      # a package it needs that the Dockerfile removed fails here, not in a chat.
+      - name: Start dsh over ACP as the bridge does
+        if: steps.filter.outputs.image == 'true' || github.event_name == 'workflow_dispatch'
+        run: |
+          docker run --rm -i --entrypoint sh codeflower-sandbox:ci -s <<'EOF'
+          set -e
+          export DSH_HOME=/tmp/dsh-home
+          node - <<'JS'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const { spawn } = require('node:child_process');
+          const { files } = require('/opt/codeflower/acp-ws/src/agents/dsh/agent.json');
+          for (const [name, value] of Object.entries(files)) {
+            const file = path.join(process.env.DSH_HOME, name);
+            fs.mkdirSync(path.dirname(file), { recursive: true });
+            fs.writeFileSync(file, typeof value === 'string' ? value : JSON.stringify(value));
+          }
+          const dsh = spawn('dsh', ['--profile', 'codeflower', '--patch', '/opt/codeflower/dsh-usage/cordis.patch.yml'], { cwd: '/tmp', stdio: ['pipe', 'pipe', 'inherit'] });
+          const send = (id, method, params) => dsh.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+          const timer = setTimeout(() => { console.error('dsh did not answer session/new within 90 s'); process.exit(1); }, 90000);
+          let buffer = '';
+          let started = false;
+          dsh.stdout.on('data', (data) => {
+            buffer += data;
+            for (let end; (end = buffer.indexOf('\n')) >= 0; buffer = buffer.slice(end + 1)) {
+              const message = JSON.parse(buffer.slice(0, end));
+              if (message.error) { console.error(JSON.stringify(message.error)); process.exit(1); }
+              if (message.id === 1) send(2, 'session/new', { cwd: '/tmp', mcpServers: [] });
+              if (message.id === 2) {
+                console.log(`dsh started session ${message.result.sessionId}, settings: ${message.result.configOptions.map((option) => option.id)}`);
+                started = true;
+                clearTimeout(timer);
+                dsh.kill();
+              }
+            }
+          });
+          dsh.on('exit', (code, signal) => { if (!started) { console.error(`dsh exited: ${code ?? signal}`); process.exit(1); } });
+          send(1, 'initialize', { protocolVersion: 1, clientCapabilities: {} });
+          JS
+          EOF

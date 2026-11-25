@@ -11,6 +11,11 @@ const DEEPSEEK_PROVIDER = 'deepseek-official';
 // Reports dsh's token counts to the bridge, in the image.
 const USAGE_PATCH = '/opt/codeflower/dsh-usage/cordis.patch.yml';
 const DEFAULT_REASONING_EFFORTS = ['low', 'medium', 'high'];
+// What the route assumes of a model whose endpoint does not say: dsh 0.1's
+// defaults. dsh 0.2 would assume 1,000,000 tokens of context and ask for
+// 128,000 of output, which endpoints with smaller models refuse, and which
+// puts off compaction.
+const ROUTE_LIMITS = { defaultContextWindow: 262144, defaultMaxTokens: 32768 };
 
 function effortMap(efforts) {
   return Object.fromEntries(efforts.map((effort) => [effort, effort]));
@@ -29,6 +34,7 @@ export function dshEndpointPatch(route) {
             api: 'openai-completions',
             baseURL: route.baseURL,
             apiKeyEnv: 'CODEFLOWER_OPENAI_COMPAT_API_KEY',
+            ...ROUTE_LIMITS,
             models: route.models.map(({ reasoning, ...model }) => ({
               ...model,
               reasoningEfforts: reasoning !== false && route.reasoningEfforts.length ? effortMap(route.reasoningEfforts) : false
@@ -117,7 +123,12 @@ async function readLastModel(file) {
   }
 }
 
-async function addDefaultEffortsToExistingRoute(path) {
+/**
+ * Brings a route saved by an earlier bridge up to what dshEndpointPatch writes
+ * now: the default efforts for models saved without any, and the route's
+ * limits (ROUTE_LIMITS) when it has none.
+ */
+export async function updateSavedRoute(path) {
   let patches;
   try {
     patches = JSON.parse(await readText(path));
@@ -129,6 +140,12 @@ async function addDefaultEffortsToExistingRoute(path) {
   if (!Array.isArray(provider?.models)) return;
 
   let changed = false;
+  for (const [key, value] of Object.entries(ROUTE_LIMITS)) {
+    if (provider[key] === undefined) {
+      provider[key] = value;
+      changed = true;
+    }
+  }
   for (const model of provider.models) {
     if (model && typeof model === 'object' && typeof model.id === 'string' && model.reasoningEfforts === undefined) {
       model.reasoningEfforts = effortMap(DEFAULT_REASONING_EFFORTS);
@@ -362,7 +379,7 @@ export default function dsh({ home, launch, nodePath, modules }) {
       const endpointPatch = home ? join(home, ENDPOINT_PATCH) : undefined;
       const hasRoute = Boolean(endpointPatch) && (await exists(endpointPatch));
       if (hasRoute) {
-        await addDefaultEffortsToExistingRoute(endpointPatch);
+        await updateSavedRoute(endpointPatch);
         command.push('--patch', endpointPatch);
       }
       if (home) {

@@ -102,7 +102,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
           cache-dependency-path: dsh-plugins/acp-ws/package-lock.json
       # The search runs ripgrep, as the image has it.

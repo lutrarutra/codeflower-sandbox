@@ -8,7 +8,7 @@ ARG CLAUDE_AGENT_SDK_VERSION=0.3.330
 # codeflower-audit, for paper audits (the audit stage below).
 ARG CODEFLOWER_AUDIT_VERSION=v0.1.0
 
-FROM node:22-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS dsh-runtime
+FROM node:24-bookworm-slim@sha256:873f586f3794f52281bd039bf02c048a0be08fde619338f9941bad1eb6b34530 AS dsh-runtime
 ARG CLAUDE_AGENT_SDK_VERSION
 
 # Harness runtimes: DeepSeek Harness, the Claude Code and Codex ACP adapters,
@@ -20,9 +20,11 @@ RUN locked=$(node -p 'require("./package-lock.json").packages["node_modules/@ant
          echo "package-lock.json has @anthropic-ai/claude-agent-sdk $locked: set CLAUDE_AGENT_SDK_VERSION to it" >&2; exit 1; \
        fi
 # Then only what the agents load on this platform stays: not Claude Code (the
-# empty folder is where the app binds the SDK), nor dsh's web app and its
-# LibreOffice (dsh runs as an ACP agent only), node-pty's and sharp's builds for
-# other systems, Codex's voice mode, source maps and type declarations.
+# empty folder is where the app binds the SDK), nor dsh's web app, its
+# LibreOffice and its optional experimental bundles with their speech model
+# (dsh runs as an ACP agent only, and the codeflower profile switches none of
+# them on), node-pty's and sharp's builds for other systems, Codex's voice
+# mode, source maps and type declarations.
 # OpenCode comes as one native binary per CPU (the x86_64 build without AVX2, as
 # cluster nodes vary); npm installs this machine's, linked as .bin/opencode.
 RUN npm ci --omit=dev --no-audit --no-fund \
@@ -31,7 +33,7 @@ RUN npm ci --omit=dev --no-audit --no-fund \
     && .bin/opencode --version \
     && rm -rf @anthropic-ai/claude-agent-sdk @anthropic-ai/claude-agent-sdk-* \
     && mkdir @anthropic-ai/claude-agent-sdk \
-    && rm -rf @deepseek-ai/libreoffice-kit @deepseek-ai/libreoffice-kit-wasm @deepseek-ai/dsh-office-to-pdf \
+    && rm -rf @deepseek-ai/libreoffice-kit* @deepseek-ai/dsh-experimental-* sherpa-onnx-* \
               @deepseek-ai/dsh-web-app @deepseek-ai/dsh-web-frontend @deepseek-ai/dsh-client-ui-* \
     && find node-pty/prebuilds -mindepth 1 -maxdepth 1 ! -name "linux-$(node -p process.arch)" -exec rm -rf {} + \
     && rm -rf @img/*musl* @img/sharp-wasm32 \
@@ -69,7 +71,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=${CODEFLOWER_AUDI
 FROM scratch AS ui-source
 ADD --keep-git-dir=false https://github.com/lutrarutra/codeflower-ui.git#v0.45.0 /
 
-FROM node:22-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS page-build
+FROM node:24-bookworm-slim@sha256:873f586f3794f52281bd039bf02c048a0be08fde619338f9941bad1eb6b34530 AS page-build
 WORKDIR /ui
 COPY --from=ui-source / ./
 RUN npm ci --no-audit --no-fund && npm run build:web

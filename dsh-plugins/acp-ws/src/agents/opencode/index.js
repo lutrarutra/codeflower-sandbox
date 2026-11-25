@@ -177,7 +177,8 @@ async function latestSession(file, cwd, since) {
 }
 
 // Loaded only here, without the warning Node 22 prints the first time that
-// node:sqlite is experimental, which would read as a problem in the worker's log.
+// node:sqlite is experimental, which would read as a problem in the worker's log
+// (the image's Node 24 prints none; the bridge's tests may still run on 22).
 async function importSqlite() {
   const emitWarning = process.emitWarning;
   process.emitWarning = (warning, ...rest) => {

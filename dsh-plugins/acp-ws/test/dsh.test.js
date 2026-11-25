@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -90,11 +90,43 @@ test("writes the listed models' context window and input, and no effort picker f
     reasoningEfforts: ['low', 'high'],
     models: [{ id: 'deepseek/deepseek-r1', name: 'DeepSeek: R1', contextWindow: 163840, input: ['text', 'image'] }, { id: 'qwen/qwen3-coder', reasoning: false }, { id: 'typed' }]
   };
-  assert.deepEqual(dshEndpointPatch(route)[0].config.providers['codeflower-openai-compat'].models, [
+  const provider = dshEndpointPatch(route)[0].config.providers['codeflower-openai-compat'];
+  assert.deepEqual(provider.models, [
     { id: 'deepseek/deepseek-r1', name: 'DeepSeek: R1', contextWindow: 163840, input: ['text', 'image'], reasoningEfforts: { low: 'low', high: 'high' } },
     { id: 'qwen/qwen3-coder', reasoningEfforts: false },
     { id: 'typed', reasoningEfforts: { low: 'low', high: 'high' } }
   ]);
+  // Models the endpoint says nothing of get dsh 0.1's limits, not 0.2's 1M context and 128K output.
+  assert.equal(provider.defaultContextWindow, 262144);
+  assert.equal(provider.defaultMaxTokens, 32768);
+});
+
+test('a route saved by an earlier bridge gets the default efforts and limits at the next start', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'codeflower-dsh-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const agents = (await loadRegistry()).filter(({ descriptor }) => descriptor.id === 'dsh');
+  const agent = createAgents({ nodePath: 'node', launch: { dsh: 'x' }, environment: { DSH_HOME: home }, agents }).dsh;
+  const path = join(home, 'codeflower-endpoint.patch.yml');
+  const saved = (models, extra = {}) => [
+    { id: 'llm-pi-ai', config: { providers: { 'codeflower-openai-compat': { baseURL: 'https://openrouter.ai/api/v1', apiKeyEnv: 'CODEFLOWER_OPENAI_COMPAT_API_KEY', ...extra, models } } } }
+  ];
+  const provider = async () => JSON.parse(await readFile(path, 'utf8'))[0].config.providers['codeflower-openai-compat'];
+
+  await writeFile(path, JSON.stringify(saved([{ id: 'old' }, { id: 'plain', reasoningEfforts: false }])));
+  assert.ok((await agent.command()).includes(path));
+  assert.deepEqual(await provider(), {
+    baseURL: 'https://openrouter.ai/api/v1',
+    apiKeyEnv: 'CODEFLOWER_OPENAI_COMPAT_API_KEY',
+    defaultContextWindow: 262144,
+    defaultMaxTokens: 32768,
+    models: [{ id: 'old', reasoningEfforts: { low: 'low', medium: 'medium', high: 'high' } }, { id: 'plain', reasoningEfforts: false }]
+  });
+
+  // Limits already there stay.
+  await writeFile(path, JSON.stringify(saved([{ id: 'm', reasoningEfforts: false }], { defaultContextWindow: 8192, defaultMaxTokens: 1024 })));
+  await agent.command();
+  assert.equal((await provider()).defaultContextWindow, 8192);
+  assert.equal((await provider()).defaultMaxTokens, 1024);
 });
 
 // The marker contract of dsh's shell tools (parseExitStatus in @deepseek-ai/dsh-shell).
@@ -110,7 +142,7 @@ test('reads the exit status from the last line of a shell result, as dsh does', 
   assert.equal(shellExitStatus(undefined), undefined);
 });
 
-// As dsh-acp 0.1.6 reports a command that exited 1 (recorded).
+// As dsh-acp 0.1.6 reports a command that exited 1 (recorded), and 0.2.2 still does.
 test('a shell command that exited badly fails; other tools and clean exits stay as reported', async () => {
   const agent = await dsh();
   const text = (value) => [{ type: 'content', content: { type: 'text', text: value } }];
@@ -208,7 +240,7 @@ test('fresh chats start on the model chosen last, while its route is signed in',
   assert.equal(await freshModel(), undefined);
 });
 
-// dsh-acp 0.1.6 titles its file tools by their names, the file only in rawInput (recorded for write).
+// dsh-acp 0.1.6 and 0.2.2 title their file tools by their names, the file only in rawInput (recorded for write).
 test('a file tool names its file, a search what it looks for; other tools stay as reported', async () => {
   const agent = await dsh();
   const started = (title, rawInput) => ({ sessionUpdate: 'tool_call', toolCallId: `${title}-1`, title, kind: 'other', status: 'in_progress', rawInput });
