@@ -6,7 +6,7 @@
 # Claude ACP adapter pins in package-lock.json; the build checks that.
 ARG CLAUDE_AGENT_SDK_VERSION=0.3.330
 # codeflower-audit, for paper audits (the audit stage below).
-ARG CODEFLOWER_AUDIT_VERSION=v0.1.0
+ARG CODEFLOWER_AUDIT_VERSION=v0.2.0
 
 FROM node:24-bookworm-slim@sha256:873f586f3794f52281bd039bf02c048a0be08fde619338f9941bad1eb6b34530 AS dsh-runtime
 ARG CLAUDE_AGENT_SDK_VERSION
