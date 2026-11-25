@@ -4,7 +4,7 @@
 # The app downloads this version of the Claude Agent SDK and its CLI for each
 # machine and binds them in (see the label below). It must be the version the
 # Claude ACP adapter pins in package-lock.json; the build checks that.
-ARG CLAUDE_AGENT_SDK_VERSION=0.3.310
+ARG CLAUDE_AGENT_SDK_VERSION=0.3.330
 
 FROM node:22-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS dsh-runtime
 ARG CLAUDE_AGENT_SDK_VERSION
