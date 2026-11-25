@@ -5,8 +5,8 @@
   "dependencies": {
     "@deepseek-ai/dsh": "0.1.6-alpha.2",
     "@agentclientprotocol/claude-agent-acp": "0.110.1",
-    "@agentclientprotocol/codex-acp": "2.3.0",
-    "@openai/codex": "0.164.0"
+    "@agentclientprotocol/codex-acp": "2.11.0",
+    "@openai/codex": "0.171.0"
   },
   "optionalDependencies": {
     "opencode-linux-arm64": "1.19.5",
