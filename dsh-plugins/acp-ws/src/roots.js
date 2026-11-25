@@ -42,7 +42,8 @@ export function createRoots({ dir, changed = () => {}, tell = () => false, keyOf
     ...idea,
     chats: idea.chats.map((chat) => {
       const key = chat.agent && chat.sessionId ? keyOf(chat.agent, chat.sessionId) : undefined;
-      return key ? { ...chat, key } : chat;
+      const parentKey = chat.agent && chat.parent ? keyOf(chat.agent, chat.parent) : undefined;
+      return { ...chat, ...(key ? { key } : {}), ...(parentKey ? { parentKey } : {}) };
     })
   });
 

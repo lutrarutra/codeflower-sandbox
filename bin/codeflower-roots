@@ -4,6 +4,7 @@
 // chats that worked on it. The user sees the map next to the chat and comments
 // on ideas; the files are in the workspace's roots/ folder.
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { createConnection } from 'node:net';
 import { dirname, isAbsolute, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -22,7 +23,15 @@ files it produced and a conclusion. Keep it current as you work.
 
   tree                      the whole map: every idea, its status and what
                             is open (start here)
+  open [ID]                 shows the map to the user, in a tab next to the
+                            chat (on idea ID): do this when the user asks to see
+                            it, rather than pasting the tree
   show ID                   one idea in full, with the user's comments
+  todos [ID] [--mine]       what is left to do, like a todo list: the open
+                            todos, unmet needs and unanswered user comments of
+                            the ideas not done or dropped (active first), each
+                            numbered for todo check / need check; --mine: only
+                            the ideas this chat worked on (also: todo list)
   new TITLE [OPTIONS]       a new idea; prints its id
       --from ID[,ID]          the ideas it builds on (none: starts from the data)
       --status STATUS         ${STATUSES.join(', ')} (default active; idea for one
@@ -121,11 +130,40 @@ function numbers(args, list, what) {
   return [...new Set(result)].sort((a, b) => b - a);
 }
 
-const chat = {
+// The chat recorded on the ideas this command changes: what the agent exports to its
+// commands (Claude Code's and Codex's session id), unless the worker knows better
+// (resolveChat): for OpenCode and DeepSeek Harness, which export none, and subagents.
+let chat = {
   agent: process.env.CODEFLOWER_AGENT_NAME || undefined,
-  // What the agents export to their commands: the chat's session id.
   sessionId: process.env.CLAUDE_CODE_SESSION_ID || process.env.CODEX_THREAD_ID || undefined
 };
+
+// Asks the worker which chat or subagent runs this command. Without a worker
+// (tests, a task's sandbox) or an answer within 2 s, the exported id stands.
+async function resolveChat(args) {
+  const socketPath = process.env.CODEFLOWER_SHOW_SOCKET;
+  if (!socketPath) return;
+  const answer = await new Promise((done) => {
+    const socket = createConnection(socketPath);
+    let reply = '';
+    const timer = setTimeout(() => (socket.destroy(), done(undefined)), 2000);
+    socket.setEncoding('utf8');
+    socket.on('connect', () => socket.write(`${JSON.stringify({ op: 'roots-chat', args, agent: chat.agent, sessionId: chat.sessionId })}\n`));
+    socket.on('data', (chunk) => (reply += chunk));
+    socket.on('error', () => (clearTimeout(timer), done(undefined)));
+    socket.on('end', () => {
+      clearTimeout(timer);
+      try {
+        done(JSON.parse(reply));
+      } catch {
+        done(undefined);
+      }
+    });
+  });
+  if (typeof answer?.sessionId === 'string' && answer.sessionId) {
+    chat = { agent: answer.agent ?? chat.agent, sessionId: answer.sessionId, ...(answer.parent ? { parent: answer.parent } : {}) };
+  }
+}
 const dir = rootsDir();
 const workspace = process.env.CODEFLOWER_WORKSPACE || dirname(dir);
 
@@ -161,6 +199,46 @@ function summary(idea, byId) {
 function userComments(idea) {
   const last = idea.comments.findLastIndex((comment) => comment.by !== 'user');
   return idea.comments.slice(last + 1).filter((comment) => comment.by === 'user');
+}
+
+// What is left to do across the map: per idea still in play, its open todos and
+// unmet needs (numbered as show numbers them) and the user's unanswered comments.
+const ORDER = { active: 0, blocked: 1, idea: 2 };
+function todos(only, { json, mine }) {
+  const { ideas } = readAll(dir);
+  const byId = new Map(ideas.map((idea) => [idea.id, idea]));
+  if (only !== undefined && !byId.has(only)) fail(`there is no idea ${only}`);
+  const ours = (idea) => idea.chats.some((entry) => entry.agent === chat.agent && entry.sessionId === chat.sessionId);
+  if (mine && !chat.sessionId) fail('--mine needs the chat\'s session id, which this agent does not export: leave it out');
+  const open = ideas
+    .filter((idea) => (only !== undefined ? idea.id === only : idea.status in ORDER) && (!mine || ours(idea)))
+    .sort((a, b) => (ORDER[a.status] ?? 3) - (ORDER[b.status] ?? 3) || a.id - b.id)
+    .map((idea) => ({
+      id: idea.id,
+      title: idea.title,
+      status: idea.status,
+      todos: idea.todos.flatMap((todo, index) => (todo.done ? [] : [{ n: index + 1, text: todo.text }])),
+      needs: idea.needs.flatMap((need, index) =>
+        needMet(need, byId) ? [] : [{ n: index + 1, ...(need.idea !== undefined ? { idea: need.idea, status: byId.get(need.idea)?.status ?? 'missing' } : { text: need.text }) }]
+      ),
+      comments: userComments(idea).map((comment) => ({ text: comment.text, at: comment.at }))
+    }));
+  if (json) return console.log(JSON.stringify({ ideas: open }, null, 2));
+  if (!open.length) {
+    console.log(only !== undefined ? `Nothing left on #${only}.` : mine ? 'None of the ideas this chat worked on are open.' : 'No open ideas: start one with codeflower-roots new.');
+    return;
+  }
+  const lines = [];
+  for (const idea of open) {
+    const empty = !idea.todos.length && !idea.needs.length && !idea.comments.length;
+    lines.push(`#${idea.id} [${idea.status}] ${idea.title}${empty ? (idea.status === 'idea' ? '  (not started)' : '  (no open todos: add the next steps, or conclude it)') : ''}`);
+    for (const todo of idea.todos) lines.push(`  [ ] ${todo.n}. ${todo.text}`);
+    for (const need of idea.needs) lines.push(`  needs ${need.n}. ${need.idea !== undefined ? `#${need.idea} ${byId.get(need.idea)?.title ?? ''} (${need.status})` : need.text}`);
+    for (const comment of idea.comments) lines.push(`  user: ${comment.text.replace(/\s*\n\s*/g, ' ')}`);
+  }
+  const count = open.reduce((sum, idea) => sum + idea.todos.length, 0);
+  lines.push('', `${plural(count, 'open todo')} in ${plural(open.length, 'idea')}. Check them off as you go: codeflower-roots todo check ID N.`);
+  console.log(lines.join('\n'));
 }
 
 function tree({ json }) {
@@ -303,8 +381,16 @@ function main(argv) {
       }, { chat });
       return done(idea, 'updated');
     }
+    case 'todos': {
+      const { options, rest } = parse(args, { flags: ['json', 'mine'] });
+      return todos(rest[0] === undefined ? undefined : id(rest[0]), options);
+    }
     case 'todo':
     case 'need': {
+      if (command === 'todo' && args[0] === 'list') {
+        const { options, rest } = parse(args.slice(1), { flags: ['json', 'mine'] });
+        return todos(rest[0] === undefined ? undefined : id(rest[0]), options);
+      }
       const [action, target, ...items] = args;
       const list = command === 'todo' ? 'todos' : 'needs';
       const what = command;
@@ -357,6 +443,11 @@ function main(argv) {
       }, { chat });
       return done(idea, options.done ? 'concluded and done' : 'concluded');
     }
+    case 'open': {
+      const target = args[0] === undefined ? undefined : id(args[0]);
+      if (target !== undefined && !readAll(dir).ideas.some((idea) => idea.id === target)) fail(`there is no idea ${target}`);
+      return openMap(target);
+    }
     case 'comment': {
       const [target, ...words] = args;
       const text = words.join(' ').trim();
@@ -371,8 +462,37 @@ function main(argv) {
   }
 }
 
+// Asks the worker to show the map in the window the chat is open in.
+function openMap(idea) {
+  const socketPath = process.env.CODEFLOWER_SHOW_SOCKET;
+  if (!socketPath) fail('the map can only be shown inside a code flower worker', 1);
+  return new Promise((done, reject) => {
+    const socket = createConnection(socketPath);
+    let reply = '';
+    socket.setEncoding('utf8');
+    socket.on('connect', () =>
+      socket.write(`${JSON.stringify({ op: 'roots-open', ...(idea !== undefined ? { idea } : {}), agent: chat.agent, sessionId: chat.sessionId })}\n`)
+    );
+    socket.on('data', (chunk) => (reply += chunk));
+    socket.on('error', (error) => reject(Object.assign(new Error(`could not reach the code flower worker: ${error.message}`), { exitCode: 1 })));
+    socket.on('end', () => {
+      let answer;
+      try {
+        answer = JSON.parse(reply);
+      } catch {
+        return reject(Object.assign(new Error('the code flower worker sent no answer'), { exitCode: 1 }));
+      }
+      if (answer.error) return reject(Object.assign(new Error(answer.error), { exitCode: 1 }));
+      console.log(idea === undefined ? 'The map is open next to the chat.' : `The map is open next to the chat, on idea ${idea}.`);
+      done();
+    });
+  });
+}
+
 try {
-  main(process.argv.slice(2));
+  const [command] = process.argv.slice(2);
+  if (command && !['help', '--help', '-h', 'tree', 'list', 'show'].includes(command)) await resolveChat(process.argv.slice(2));
+  await main(process.argv.slice(2));
 } catch (error) {
   const known = error.exitCode !== undefined || error instanceof RootsError;
   console.error(`codeflower-roots: ${known ? error.message : error.stack ?? error}`);

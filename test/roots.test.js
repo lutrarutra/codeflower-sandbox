@@ -128,3 +128,33 @@ test('keeps files outside the workspace by their full path', (t) => {
   assert.equal(run('link', '1', join(outside, 'table.csv')).status, 0);
   assert.deepEqual(idea(1).files, [join(outside, 'table.csv')]);
 });
+
+test('lists what is left to do like a todo list, numbered for check', (t) => {
+  const { run, workspace } = setup(t);
+  run('new', 'QC', '--todo', 'Violins', '--todo', 'Thresholds');
+  run('todo', 'check', '1', '1');
+  run('new', 'Annotate', '--from', '1', '--need', '1', '--need', 'Sample sheet', '--status', 'blocked');
+  run('new', 'Later', '--status', 'idea');
+  run('new', 'Old', '--todo', 'x');
+  run('update', '4', '--status', 'dropped');
+  // Another chat's idea, for --mine.
+  spawnSync(process.execPath, [roots, 'new', 'Theirs', '--todo', 'y'], {
+    cwd: workspace,
+    env: { ...process.env, CODEFLOWER_WORKSPACE: workspace, CODEFLOWER_AGENT_NAME: 'codex', CODEX_THREAD_ID: 'other', CLAUDE_CODE_SESSION_ID: '' },
+    encoding: 'utf8'
+  });
+
+  assert.equal(
+    run('todos').stdout,
+    '#1 [active] QC\n  [ ] 2. Thresholds\n#5 [active] Theirs\n  [ ] 1. y\n#2 [blocked] Annotate\n  needs 1. #1 QC (active)\n  needs 2. Sample sheet\n' +
+      '#3 [idea] Later  (not started)\n\n2 open todos in 4 ideas. Check them off as you go: codeflower-roots todo check ID N.\n'
+  );
+  assert.doesNotMatch(run('todos', '--mine').stdout, /Theirs/);
+  assert.equal(run('todo', 'list', '2').stdout.split('\n')[0], '#2 [blocked] Annotate');
+  const json = JSON.parse(run('todos', '--json').stdout);
+  assert.deepEqual(json.ideas[0], { id: 1, title: 'QC', status: 'active', todos: [{ n: 2, text: 'Thresholds' }], needs: [], comments: [] });
+  // Done ideas leave the list.
+  run('todo', 'check', '1', '2');
+  run('update', '1', '--status', 'done');
+  assert.match(run('todos').stdout, /#2 \[blocked\] Annotate\n  needs 2\. Sample sheet\n/);
+});

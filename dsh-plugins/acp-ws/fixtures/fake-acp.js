@@ -388,6 +388,21 @@ input.on('line', async (line) => {
         });
         break;
       }
+      // `run in chat: CMD` / `run in subagent: CMD`: a command running in the chat, or in a
+      // subagent it spawned, its turn kept open (codeflower-roots asks the bridge which runs it).
+      if (text?.startsWith('run in chat: ') || text?.startsWith('run in subagent: ')) {
+        const { sessionId } = message.params;
+        const command = text.slice(text.indexOf(': ') + 2);
+        let where = sessionId;
+        if (text.startsWith('run in subagent: ')) {
+          where = `child-${nextChild++}`;
+          runningChildren.set(where, { parentId: sessionId, draft: false });
+          update(sessionId, { sessionUpdate: 'subagent_update', sessionId: where, title: 'Roots helper', description: 'Keep the map', capabilities: {}, state: { state: 'running' } });
+        }
+        update(where, { sessionUpdate: 'tool_call', toolCallId: `${where}-cmd`, title: command, kind: 'execute', status: 'in_progress' });
+        pendingPrompt = message.id;
+        break;
+      }
       if (text === 'approve plan' || text?.startsWith('approve plan in ')) {
         // Like Claude Code's ExitPlanMode: the kind comes with the tool call, not the request.
         // `approve plan in <path>`: the file Claude Code wrote the plan to.

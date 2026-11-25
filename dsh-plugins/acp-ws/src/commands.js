@@ -363,6 +363,9 @@ export function createCommands({ onChange = () => {}, tail = tailFile, now = () 
 
     sessions: () => [...new Set([...commands.values()].map((command) => command.sessionId))],
 
+    /** The commands running now, by chat: e.g. to tell which chat a process runs in. */
+    running: () => [...commands.values()].filter((command) => !command.endedAt && command.command).map((command) => ({ sessionId: command.sessionId, command: command.command })),
+
     byId: (commandId) => commands.get(commandId),
 
     describe,

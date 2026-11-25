@@ -200,4 +200,90 @@ test('windows get the map the agents keep, change it, and comment to the chat', 
   assert.match(file, /"by":"user","text":"Use 15% mito"/);
   const refused = await call(window, '_codeflower/roots/update', { id: 7, patch: {} });
   assert.match(refused.error.message, /no idea 7/);
+
+  // The agent shows the map: the window that has its chat open opens it, on the idea.
+  const roots = (args) =>
+    new Promise((resolve) =>
+      execFile(process.execPath, [rootsCommand, ...args], {
+        cwd: workspace,
+        env: {
+          ...process.env,
+          CODEFLOWER_WORKSPACE: workspace,
+          CODEFLOWER_SHOW_SOCKET: join(directory, 'show.sock'),
+          CODEFLOWER_AGENT_NAME: 'claude',
+          CLAUDE_CODE_SESSION_ID: sessionId
+        }
+      }, (error, stdout, stderr) => resolve({ code: error?.code ?? 0, stdout, stderr }))
+    );
+  const opened = await roots(['open', '1']);
+  assert.equal(opened.code, 0, opened.stderr);
+  assert.match(opened.stdout, /open next to the chat, on idea 1/);
+  const shown = await receive(chat, (message) => message.method === '_codeflower/roots/open');
+  assert.deepEqual(shown.params, { idea: 1, key: idea.chats[0].key });
+  assert.match((await roots(['open', '9'])).stderr, /there is no idea 9/);
+});
+
+test('records the chat or subagent a command runs in, also when the agent exports no session id', async (t) => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), 'codeflower-roots-')));
+  const workspace = join(directory, 'state', 'workspace');
+  await mkdir(workspace, { recursive: true });
+  const environment = { ...process.env, CODEFLOWER_TOKEN: token, CLAUDE_CONFIG_DIR: join(directory, 'claude') };
+  delete environment.CODEFLOWER_ROOTS_DIR;
+  await mkdir(environment.CLAUDE_CONFIG_DIR, { recursive: true });
+  const agents = createAgents({ nodePath: process.execPath, launch: { claude: fakeAgent }, environment });
+  const showSocket = join(directory, 'show.sock');
+  const bridge = await startBridge({
+    host: '127.0.0.1',
+    advertiseHost: 'localhost',
+    token,
+    connectionFile: join(directory, 'instance.json'),
+    instanceId: 'instance-roots-chat',
+    sessionsDirectory: join(directory, 'state', 'sessions'),
+    workspace,
+    agents: { claude: agents.claude },
+    environment,
+    rootsTiming: { watchMs: 50 },
+    showSocket,
+    browserSocket: join(directory, 'browser.sock'),
+    log: (message) => process.env.BRIDGE_DEBUG && console.error(message)
+  });
+  t.after(async () => {
+    await bridge.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+  const roots = (args, env) =>
+    new Promise((resolve) =>
+      execFile(process.execPath, [rootsCommand, ...args], {
+        cwd: workspace,
+        env: { ...process.env, CODEFLOWER_WORKSPACE: workspace, CODEFLOWER_SHOW_SOCKET: showSocket, CODEFLOWER_AGENT_NAME: 'claude', CLAUDE_CODE_SESSION_ID: '', CODEX_THREAD_ID: '', ...env }
+      }, (error, stdout, stderr) => resolve({ code: error?.code ?? 0, stdout, stderr }))
+    );
+  const recorded = async (id) => JSON.parse((await roots(['show', String(id), '--json'])).stdout).chats;
+
+  const chat = await open(bridge.address, 'claude');
+  await call(chat, 'initialize', { protocolVersion: 1, clientCapabilities: { subagents: {} } });
+  const first = (await call(chat, 'session/new', { cwd: workspace, mcpServers: [] })).result.sessionId;
+  const second = (await call(chat, 'session/new', { cwd: workspace, mcpServers: [] })).result.sessionId;
+
+  // An agent that exports no session id (OpenCode, DeepSeek Harness): its running command tells.
+  chat.send(JSON.stringify({ jsonrpc: '2.0', id: 9001, method: 'session/prompt', params: { sessionId: first, prompt: [{ type: 'text', text: 'run in chat: codeflower-roots new "Paper idea"' }] } }));
+  await sleep(300);
+  const made = await roots(['new', 'Paper idea']);
+  assert.equal(made.code, 0, made.stderr);
+  assert.deepEqual((await recorded(1)).map(({ agent, sessionId, parent }) => ({ agent, sessionId, parent })), [{ agent: 'claude', sessionId: first, parent: undefined }]);
+
+  // A subagent, which exports its parent's id: recorded as itself, with its parent.
+  chat.send(JSON.stringify({ jsonrpc: '2.0', id: 9002, method: 'session/prompt', params: { sessionId: second, prompt: [{ type: 'text', text: 'run in subagent: codeflower-roots new "Helper idea" --from 1' }] } }));
+  await sleep(300);
+  const helped = await roots(['new', 'Helper idea', '--from', '1'], { CLAUDE_CODE_SESSION_ID: second });
+  assert.equal(helped.code, 0, helped.stderr);
+  const [helper] = await recorded(2);
+  assert.match(helper.sessionId, /^child-/);
+  assert.equal(helper.parent, second);
+
+  // The windows get both chats' keys, the subagent's with its parent's.
+  const window = await open(bridge.address);
+  const { ideas } = (await call(window, '_codeflower/roots/list')).result;
+  assert.match(ideas[1].chats[0].key, /child-/);
+  assert.match(ideas[1].chats[0].parentKey, new RegExp(second));
 });

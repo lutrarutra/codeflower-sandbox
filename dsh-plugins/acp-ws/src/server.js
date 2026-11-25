@@ -1075,6 +1075,29 @@ export async function startBridge(options) {
     return { agent: name, sessionId: id, key: sessionKey(name, id) };
   };
 
+  // The chat or subagent a command of ours (`command`, e.g. codeflower-roots)
+  // runs in: the one running command that names it and its arguments
+  // (`request.args`); else the session id the agent exports, or the agent's
+  // only chat with a turn running (OpenCode and DeepSeek Harness export none,
+  // and a subagent exports its parent's). `parent`: a subagent's parent, whose
+  // chat `key` is.
+  const callingChat = (request, command) => {
+    const args = Array.isArray(request?.args) ? request.args.filter((arg) => typeof arg === 'string' && arg) : [];
+    const found = new Map();
+    for (const [name, runtime] of runtimes) {
+      if (typeof request?.agent === 'string' && request.agent && name !== request.agent) continue;
+      for (const run of runtime.runningCommands?.() ?? []) {
+        if (run.command.includes(command) && args.every((arg) => run.command.includes(arg))) {
+          found.set(`${name}\u0000${run.sessionId}`, { agent: name, sessionId: run.sessionId });
+        }
+      }
+    }
+    const chat = found.size === 1 ? [...found.values()][0] : showingChat(request?.agent, request?.sessionId);
+    if (!chat) return undefined;
+    const parent = runtimes.get(chat.agent)?.host?.subagents.parentOf(chat.sessionId);
+    return { agent: chat.agent, sessionId: chat.sessionId, key: sessionKey(chat.agent, parent ?? chat.sessionId), ...(parent ? { parent } : {}) };
+  };
+
   // The window to show a chat's files in: the one that sent its latest prompt,
   // else the newest that has it open.
   const chatWindow = ({ agent, sessionId }) => {
@@ -1325,8 +1348,21 @@ export async function startBridge(options) {
         ? { ...own, CODEFLOWER_COMMANDS_SOCKET: commandsSocket, CODEFLOWER_COMMANDS_AGENT: agentName }
         : {};
     };
+    // The commands subagents run, which the registry leaves out: only to tell which
+    // subagent a process runs in (codeflower-roots).
+    const subagentCommands = new Map();
     const followCommands = (host, sessionId, update) => {
-      if (host.subagents.isChild(sessionId)) return;
+      if (host.subagents.isChild(sessionId)) {
+        for (const event of commandEvents(update)) {
+          if (!event.id) continue;
+          const running = subagentCommands.get(sessionId) ?? new Map();
+          if (event.type === 'end') running.delete(event.id);
+          else if ((event.type === 'start' || event.type === 'info') && event.command) running.set(event.id, event.command);
+          if (running.size) subagentCommands.set(sessionId, running);
+          else subagentCommands.delete(sessionId);
+        }
+        return;
+      }
       for (const event of commandEvents(update)) commands.apply(sessionId, event);
     };
     const closeClients = (host, code, reason) => {
@@ -3762,6 +3798,11 @@ export async function startBridge(options) {
       },
       // Tells a chat something as its next prompt, once its turn has ended: a notice of the
       // bridge's, which the chat shows folded under its title and summary.
+      /** The commands running now in its chats and their subagents. */
+      runningCommands: () => [
+        ...commands.running(),
+        ...[...subagentCommands].flatMap(([sessionId, running]) => [...running.values()].map((command) => ({ sessionId, command })))
+      ],
       tell(sessionId, text, title, summary) {
         try {
           promptQueue.add(sessionId, { prompt: noticePrompt(text, title, summary), text, title });
@@ -4246,6 +4287,28 @@ export async function startBridge(options) {
         await runtimes.get(chat.agent)?.flush();
         const records = auditTranscript(await readTranscript(sessionsDirectory, chat.key));
         return { chat: chat.key, agent: chat.agent, records };
+      }
+      // codeflower-roots: the chat or subagent the command runs in, to record on the idea. The one
+      // running command that names it and its arguments; else the session id the agent exports, or
+      // the agent's only chat with a turn running (OpenCode and DeepSeek Harness export none, and a
+      // subagent exports its parent's).
+      if (request?.op === 'roots-chat') {
+        const chat = callingChat(request, 'codeflower-roots');
+        if (!chat) return {};
+        return { agent: chat.agent, sessionId: chat.sessionId, ...(chat.parent ? { parent: chat.parent } : {}) };
+      }
+      // codeflower-roots open: the map in the window the chat is open in, like the files it shows.
+      if (request?.op === 'roots-open') {
+        const chat = showingChat(request.agent, request.sessionId);
+        // Else any window, a chat's or the worker's own (the map needs no chat).
+        const target = (chat && chatWindow(chat)) ?? (clients.has(lastPrompter) ? lastPrompter : newestClient()) ?? [...clients].at(-1);
+        if (!target) return { error: 'No window is connected to this worker, so nobody can see the map now' };
+        target.send({
+          jsonrpc: '2.0',
+          method: '_codeflower/roots/open',
+          params: { ...(Number.isInteger(request.idea) ? { idea: request.idea } : {}), ...(chat ? { key: chat.key } : {}) }
+        });
+        return { opened: true };
       }
       const paths = Array.isArray(request?.paths) ? request.paths : [];
       if (!paths.length) throw new InvalidRequest('No files to show');

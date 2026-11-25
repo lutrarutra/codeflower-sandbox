@@ -196,12 +196,16 @@ track. Use `codeflower-roots` (the codeflower-roots skill) from the start:
 
 - Before any analysis, run `codeflower-roots tree`, then pick the idea your work belongs to or start
   one with `codeflower-roots new "TITLE" [--from ID]`, even for a first and only analysis.
+- `codeflower-roots todos [--mine]` lists what is left: open todos, unmet needs and the user's
+  comments, numbered for `todo check`. Keep the steps there, not only in your own todo tool.
 - A follow-up or an alternative is a new idea built on the one it came from (`--from`); refining the
   same work stays in its idea.
 - Check off todos as you go, link the key figures, scripts and reports, and when a line of work ends
   write its conclusion (`codeflower-roots conclude ID … --done`).
 - When you hand work to a subagent or another chat, name the idea it works on.
 - When the user comments on an idea, act on it and answer with `codeflower-roots comment`.
+- When the user asks to see the map or the ideas, show it with `codeflower-roots open [ID]` (a tab next
+  to the chat); `tree` is for you, not for pasting into the chat.
 
 ## How to analyse
 

@@ -200,12 +200,16 @@ export function check(idea, ideas) {
   walk(idea.id, []);
 }
 
-// Adds the chat that made a change to the idea's chats (the latest last).
+// Adds the chat that made a change to the idea's chats (the latest last); a
+// subagent with its parent chat's session id (`parent`).
 export function touchChat(idea, chat, at) {
   if (!chat?.agent && !chat?.sessionId) return;
   const same = (entry) => entry.agent === chat.agent && (entry.sessionId ?? null) === (chat.sessionId ?? null);
   const kept = idea.chats.filter((entry) => !same(entry));
-  idea.chats = [...kept, { ...(chat.agent ? { agent: chat.agent } : {}), ...(chat.sessionId ? { sessionId: chat.sessionId } : {}), at }];
+  idea.chats = [
+    ...kept,
+    { ...(chat.agent ? { agent: chat.agent } : {}), ...(chat.sessionId ? { sessionId: chat.sessionId } : {}), ...(chat.parent ? { parent: chat.parent } : {}), at }
+  ];
 }
 
 export function create(dir, fields, { chat, now = new Date() } = {}) {

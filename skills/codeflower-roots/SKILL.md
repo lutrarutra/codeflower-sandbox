@@ -28,6 +28,27 @@ which checks them and records your chat on the idea; never edit the files by han
 - **Work you hand to a subagent or another chat**: make or pick its idea first, and name it in the
   task ("Work on idea 6; keep it current with codeflower-roots").
 
+## What is left to do
+
+`codeflower-roots todos` is the project's todo list: for every idea still in play (active, then
+blocked, then not started), its open todos, the needs it still waits for and the user's comments
+you have not answered, numbered for `todo check ID N` and `need check ID N`. `--mine` keeps the
+ideas this chat worked on; `todos ID` one idea.
+
+- Run `codeflower-roots todos --mine` when you start or resume work in a chat, and `todos` when
+  you look for what to do next or the user asks what is open.
+- Keep the steps there rather than only in your own todo or plan tool: those last for one chat,
+  the map's todos for the project, and the user and other chats see them. Your own tool can
+  mirror the idea's todos for the current turn; when you check one off there, check it here too.
+- An active idea with no open todos is either done (conclude it) or missing its next steps (add them).
+
+## Showing the map
+
+`codeflower-roots open [ID]` opens the map in a tab next to the chat, on idea ID if given. When the
+user asks to see the map, the ideas or where things stand, open it: don't paste the `tree` output,
+which is for you. Open it once after starting the first idea of a project too, so the user knows it
+is there. The tab updates by itself; don't open it again after each change.
+
 ## Keeping an idea current
 
 - Todos: `todo add ID TEXT...` when you plan steps, `todo check ID N...` as each is done (numbers
