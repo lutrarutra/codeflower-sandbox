@@ -47,7 +47,7 @@ COPY dsh-plugins/acp-ws/src ./src
 # installs a copy in the project, editable). Pinned by tag; a development build
 # uses the workspace checkout instead: --build-context storyteller=../storyteller.
 FROM scratch AS storyteller
-ADD --keep-git-dir=false https://github.com/lutrarutra/storyteller.git#v0.6.5 /
+ADD --keep-git-dir=false https://github.com/lutrarutra/storyteller.git#v0.7.0 /
 
 # codeflower-audit, for paper audits: the command that checks, scores, seals and
 # verifies them (the same module the app's `codeflower audit` requires), the
