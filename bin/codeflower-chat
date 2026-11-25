@@ -1,0 +1,180 @@
+#!/usr/local/bin/node
+// The project's chats, for the agent: list them, read any of them
+// (read-only), fork one, or start a new one with its first message. The
+// bridge does the work (chats.js) and asks the user before a chat starts.
+import { readFileSync } from 'node:fs';
+import { createConnection } from 'node:net';
+
+const usage = `Usage: codeflower-chat COMMAND [ARGS...]
+
+The chats of this project, with every agent: read them, fork one, or start a
+new one. The user allows each chat you fork or start, in this chat.
+
+  list [--agent NAME]       the chats, newest first: key, agent, title, and
+                            where they came from
+  read KEY [--last N | --from I]
+                            a chat's history, condensed: the user's messages
+                            (numbered for fork --before), the agent's
+                            replies, and the tools it called (titles, not
+                            their output). The last 50 records by default
+  fork [KEY] [--before N] [--title TITLE] [MESSAGE | -]
+                            a copy of the chat KEY (default: this one) to go
+                            another way from: all of it, or from before the
+                            user's message N; MESSAGE (- reads it from stdin)
+                            is sent as its first message, else it waits for
+                            the user
+  new --title TITLE [--agent NAME] MESSAGE | -
+                            a new chat (with this chat's agent unless
+                            --agent), named TITLE, that starts working on
+                            MESSAGE (- reads it from stdin) right away
+  whoami                    this chat's key
+
+Chats you start run on their own: the user sees them in the chat list. Read
+one later with codeflower-chat read KEY to see how far it got.
+
+Add --json to any command for JSON.`;
+
+const fail = (message, code = 1) => {
+  console.error(message);
+  process.exit(code);
+};
+
+const args = process.argv.slice(2);
+if (!args.length || args[0] === '--help' || args[0] === '-h' || args[0] === 'help') {
+  console.log(usage);
+  process.exit(args.length ? 0 : 2);
+}
+
+// The options a command takes (with a value, or flags), and its words.
+function parse(rest, valued, flags = []) {
+  const options = {};
+  const words = [];
+  for (let index = 0; index < rest.length; index++) {
+    const arg = rest[index];
+    if (arg === '--json') options.json = true;
+    else if (flags.includes(arg)) options[arg.slice(2)] = true;
+    else if (valued.includes(arg)) {
+      if (index + 1 >= rest.length) fail(`${arg} needs a value\n\n${usage}`, 2);
+      options[arg.slice(2)] = rest[++index];
+    } else if (arg.startsWith('--') && arg !== '--') fail(`Unknown option ${arg}\n\n${usage}`, 2);
+    else if (arg === '--') words.push(...rest.slice(index + 1)), (index = rest.length);
+    else words.push(arg);
+  }
+  return { options, words };
+}
+
+const number = (value, label) => {
+  if (value === undefined) return undefined;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) fail(`${label} is a number from 1`, 2);
+  return parsed;
+};
+
+const messageOf = (words) => {
+  if (words.length === 1 && words[0] === '-') return readFileSync(0, 'utf8');
+  return words.length ? words.join(' ') : undefined;
+};
+
+function request(body) {
+  const socketPath = process.env.CODEFLOWER_CHATS_SOCKET;
+  if (!socketPath) fail('codeflower-chat needs the code flower worker, which this sandbox is not running (e.g. a batch job or a run task).');
+  return new Promise((done) => {
+    const socket = createConnection(socketPath);
+    let reply = '';
+    socket.setEncoding('utf8');
+    socket.on('connect', () =>
+      socket.write(
+        `${JSON.stringify({
+          ...body,
+          // The words the bridge finds this command by among the running ones (callingChat).
+          args: process.argv.slice(2).filter((arg) => /^[A-Za-z0-9._-]{1,100}$/.test(arg) && !arg.startsWith('-')).slice(0, 3),
+          agent: process.env.CODEFLOWER_AGENT_NAME,
+          // What the agents export to their commands: the chat's session id.
+          sessionId: process.env.CLAUDE_CODE_SESSION_ID || process.env.CODEX_THREAD_ID || undefined
+        })}\n`
+      )
+    );
+    socket.on('data', (chunk) => (reply += chunk));
+    socket.on('error', (error) => fail(`Could not reach the code flower worker: ${error.message}`));
+    socket.on('end', () => {
+      try {
+        done(JSON.parse(reply));
+      } catch {
+        fail('The code flower worker sent no answer.');
+      }
+    });
+  });
+}
+
+const [command, ...rest] = args;
+
+const origin = (chat) => {
+  const from = chat.origin;
+  if (!from) return '';
+  if (from.kind === 'fork') return `fork of ${from.from}${from.before ? ` before message ${from.before}` : ''}`;
+  if (from.kind === 'agent') return `started by ${from.from}`;
+  return '';
+};
+
+async function main() {
+  switch (command) {
+    case 'list': {
+      const { options } = parse(rest, ['--agent']);
+      const answer = await request({ action: 'list', ...(options.agent ? { chatAgent: options.agent } : {}) });
+      if (answer.error) fail(answer.error, 2);
+      if (options.json) return console.log(JSON.stringify(answer.chats, null, 2));
+      if (!answer.chats.length) return console.log('No chats yet.');
+      for (const chat of answer.chats) {
+        const extra = [origin(chat), chat.subagents?.length ? `subagents: ${chat.subagents.join(', ')}` : ''].filter(Boolean).join('; ');
+        console.log(`${chat.key}  ${chat.agent}  ${chat.updatedAt?.slice(0, 16).replace('T', ' ') ?? ''}  ${chat.title}${extra ? `  (${extra})` : ''}`);
+      }
+      return;
+    }
+    case 'read': {
+      const { options, words } = parse(rest, ['--last', '--from']);
+      if (words.length !== 1) fail(`Which chat? codeflower-chat read KEY (codeflower-chat list)\n\n${usage}`, 2);
+      if (options.last && options.from) fail('Give --last or --from, not both', 2);
+      const answer = await request({ action: 'read', key: words[0], last: number(options.last, '--last'), from: number(options.from, '--from') });
+      if (answer.error) fail(answer.error, 2);
+      if (options.json) return console.log(JSON.stringify(answer, null, 2));
+      const to = answer.from + answer.records.length - 1;
+      console.log(`${answer.title} (${answer.key}, ${answer.agent}${answer.origin ? `, ${origin(answer)}` : ''}${answer.parent ? `, subagent of ${answer.parent}` : ''})`);
+      console.log(answer.total ? `Records ${answer.from}-${to} of ${answer.total}${answer.from > 1 ? `; earlier: --from 1` : ''}${to < answer.total ? `; later: --from ${to + 1}` : ''}\n` : 'Nothing said yet.\n');
+      if (answer.text) console.log(answer.text);
+      return;
+    }
+    case 'fork': {
+      const { options, words } = parse(rest, ['--before', '--title']);
+      // KEY is the first word when it looks like one (agent-id), else the message starts.
+      const key = words.length && /^[a-z0-9]+-[A-Za-z0-9._-]+$/.test(words[0]) && words[0] !== '-' ? words.shift() : undefined;
+      const message = messageOf(words);
+      const answer = await request({ action: 'fork', ...(key ? { key } : {}), before: number(options.before, '--before'), title: options.title, message });
+      if (answer.error) fail(answer.error, answer.ok === false ? 3 : 2);
+      if (options.json) return console.log(JSON.stringify(answer, null, 2));
+      console.log(`Forked as ${answer.key}: ${answer.title}${message ? ', working on your message' : ', waiting for the user'}.`);
+      return;
+    }
+    case 'new': {
+      const { options, words } = parse(rest, ['--title', '--agent']);
+      if (!options.title) fail(`Name the chat: --title TITLE\n\n${usage}`, 2);
+      const message = messageOf(words);
+      if (!message?.trim()) fail(`Give the chat's first message (or - to read it from stdin)\n\n${usage}`, 2);
+      const answer = await request({ action: 'new', title: options.title, message, ...(options.agent ? { chatAgent: options.agent } : {}) });
+      if (answer.error) fail(answer.error, answer.ok === false ? 3 : 2);
+      if (options.json) return console.log(JSON.stringify(answer, null, 2));
+      console.log(`Started ${answer.key} (${answer.agent}): ${answer.title}. Read it later with: codeflower-chat read ${answer.key}`);
+      return;
+    }
+    case 'whoami': {
+      const { options } = parse(rest, []);
+      const answer = await request({ action: 'whoami' });
+      if (answer.error) fail(answer.error, 2);
+      if (!answer.key) fail('Cannot tell which chat this command runs in.', 2);
+      return console.log(options.json ? JSON.stringify(answer, null, 2) : answer.key);
+    }
+    default:
+      fail(`Unknown command ${command}\n\n${usage}`, 2);
+  }
+}
+
+await main();

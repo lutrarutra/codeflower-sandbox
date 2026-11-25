@@ -45,6 +45,13 @@ const sessionMeta = new Map();
 const lostSessions = new Set();
 // A running cost per session, like Claude Code's, which starts over on resume.
 const costs = new Map();
+// With --fork: like Claude's adapter, it forks chats (session/fork) and sends
+// a session cursor before each user message; by session, where it came from.
+const forking = process.argv.includes('--fork');
+const forks = new Map();
+// The earlier chat's history a seeded fork's first prompt brought, by session.
+const seeds = new Map();
+let nextMessage = 1;
 // Whether the client takes subagents as sessions of their own (ACP subagents
 // RFD), and the children still running, by id: their parent.
 let clientSubagents = false;
@@ -254,7 +261,7 @@ input.on('line', async (line) => {
             mcpCapabilities: { http: true },
             ...(process.argv.includes('--no-system-prompt')
               ? {}
-              : { sessionCapabilities: { systemPrompt: { mode: { append: {} } } } })
+              : { sessionCapabilities: { systemPrompt: { mode: { append: {} } }, ...(forking ? { fork: {} } : {}) } })
           },
           // Like Claude Code: it takes messages into the running turn.
           _meta: { steering: { supported: true } },
@@ -300,6 +307,22 @@ input.on('line', async (line) => {
       send({ jsonrpc: '2.0', id: message.id, result: { sessionId, configOptions: configOptions(sessionId), ...mcpEcho(message) } });
       break;
     }
+    case 'session/fork': {
+      if (!forking) {
+        send({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'Method not found' } });
+        break;
+      }
+      const { sessionId: from, cursorId } = message.params ?? {};
+      if (cursorId !== undefined && !String(cursorId).startsWith('cursor-')) {
+        send({ jsonrpc: '2.0', id: message.id, error: { code: -32602, message: `No cursor ${cursorId}` } });
+        break;
+      }
+      const sessionId = `session-${nextSession++}`;
+      tasks.set(sessionId, { systemPrompt: null, mcp: (message.params?.mcpServers ?? []).map((server) => server.command ?? server.url) });
+      forks.set(sessionId, { from, cursorId: cursorId ?? null, cwd: message.params?.cwd ?? null });
+      send({ jsonrpc: '2.0', id: message.id, result: { sessionId, configOptions: configOptions(sessionId), ...mcpEcho(message) } });
+      break;
+    }
     case 'session/set_config_option': {
       const { sessionId, configId, value } = message.params;
       settings.set(sessionId, { mode: 'default', effort: 'medium', ...settings.get(sessionId), [configId]: value });
@@ -307,7 +330,25 @@ input.on('line', async (line) => {
       break;
     }
     case 'session/prompt': {
-      const text = message.params.prompt?.[0]?.text;
+      const seed = message.params.prompt?.find((block) => block?._meta?.['codeflower/forkContext']);
+      if (seed) seeds.set(message.params.sessionId, seed.text);
+      const text = message.params.prompt?.filter((block) => block !== seed)[0]?.text;
+      if (forking) {
+        const cursorId = `cursor-${nextMessage++}`;
+        send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: message.params.sessionId,
+            update: { sessionUpdate: 'cursor_update', cursorId, capabilities: { fork: {} }, anchor: { type: 'user_message', messageId: cursorId, position: 'before' } }
+          }
+        });
+      }
+      if (text === 'fork info') {
+        const { sessionId } = message.params;
+        reply(sessionId, message.id, JSON.stringify({ fork: forks.get(sessionId) ?? null, seed: seeds.get(sessionId) ?? null, settings: settings.get(sessionId) ?? null }));
+        break;
+      }
       // Like Claude's adapter once the chat's Claude Code process ended (e.g.
       // out of memory): during a turn, or between turns, which only the next
       // prompt finds out.

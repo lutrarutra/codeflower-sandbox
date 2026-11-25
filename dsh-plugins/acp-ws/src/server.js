@@ -42,6 +42,7 @@ import { DEFAULT_UPLOAD_MAX_BYTES, createUploads } from './uploads.js';
 import { createUsage, dshTokens } from './usage.js';
 import { createPromptQueue, queuedPromptOf } from './prompt-queue.js';
 import { createJobs, readJobsInfo } from './jobs.js';
+import { createChats, FORK_CONTEXT_META } from './chats.js';
 import { createRoots, RootsRequestError } from './roots.js';
 import { rootsDir } from './roots-store.js';
 import { createSubagentSettings, mergeMeta, settingsEffects } from './subagents/settings.js';
@@ -78,7 +79,9 @@ const WRAP_UP_CANCEL_MS = 30_000;
 const SIGN_IN_POLL_MS = 2000;
 // setTimeout waits at most about 24 days; longer waits are made of several.
 const MAX_TIMER_MS = 2 ** 31 - 1;
-const SESSION_STARTS = ['session/new', 'session/resume', 'session/load'];
+const SESSION_STARTS = ['session/new', 'session/resume', 'session/load', 'session/fork'];
+// The starts that make a chat of their own, whose id is in the result.
+const NEW_SESSIONS = ['session/new', 'session/fork'];
 // How often a worker looks whether to let go of a chat: another worker asked
 // for it (takeover.json), or no window had it open for a while.
 const RELEASE_CHECK_MS = 5_000;
@@ -400,7 +403,7 @@ export function createRecorder(store, log) {
         if (!request || message.error) {
           return;
         }
-        if (request.method === 'session/new' && typeof message.result?.sessionId === 'string') {
+        if (NEW_SESSIONS.includes(request.method) && typeof message.result?.sessionId === 'string') {
           const sessionId = message.result.sessionId;
           run(() => store.open(sessionId, { cwd: request.params?.cwd }));
         } else if (request.method === 'session/resume' || request.method === 'session/load') {
@@ -588,6 +591,9 @@ export async function startBridge(options) {
     // ask for batch jobs (CODEFLOWER_JOBS); the bridge passes them on through
     // the spool the app reads (CODEFLOWER_JOBS_SPOOL).
     jobsSocket = join(tmpdir(), `codeflower-jobs-${instanceId}.sock`),
+    // `codeflower-chat` reaches the bridge here: the project's chats, to read,
+    // fork and start (chats.js).
+    chatsSocket = join(tmpdir(), `codeflower-chats-${instanceId}.sock`),
     jobsInfo = readJobsInfo(workerEnvironment),
     jobsSpool = workerEnvironment.CODEFLOWER_JOBS_SPOOL,
     // Tests make the jobs' timings short (createJobs).
@@ -647,6 +653,7 @@ export async function startBridge(options) {
     CODEFLOWER_SHOW_SOCKET: showSocket,
     CODEFLOWER_BROWSER_SOCKET: browserSocket,
     ...(jobsInfo && jobsSpool ? { CODEFLOWER_JOBS_SOCKET: jobsSocket } : {}),
+    ...(sessionsDirectory ? { CODEFLOWER_CHATS_SOCKET: chatsSocket } : {}),
     // Where the browser's Chromium is (once installed), for the agent's own Playwright too (executablePath).
     ...(browserExecutable ? { CODEFLOWER_BROWSER_BIN: browserExecutable } : {})
   };
@@ -654,6 +661,9 @@ export async function startBridge(options) {
   // Batch jobs (jobs.js), once the agents are there.
   let jobs;
   let jobsServer;
+  // The project's chats for codeflower-chat and the windows' forks (chats.js).
+  let chats;
+  let chatsServer;
   // The project's map of ideas (roots.js), once the agents are there.
   let roots;
   const uploads = createUploads({ workspace, fileOptions, maxBytes: uploadMaxBytes, log });
@@ -1708,7 +1718,8 @@ export async function startBridge(options) {
     // waits for its end. Every window that opened the chat is told when a
     // prompt starts, the one that sent it too, so all show it in one order.
     const sendRequest = (host, request, webSocket) => {
-      const { key, method, params } = request;
+      const { key, method } = request;
+      let { params } = request;
       const sessionId = params?.sessionId;
       if (typeof sessionId === 'string' && host.lost.has(sessionId) && !SESSION_STARTS.includes(method)) {
         recoverSession(host, sessionId).then(
@@ -1719,6 +1730,12 @@ export async function startBridge(options) {
       }
       const prompt = method === 'session/prompt' && typeof sessionId === 'string';
       const send = () => {
+        // A seeded fork's first prompt brings the earlier chat's history, which windows hide.
+        const seed = prompt ? forkSeeds.get(sessionId) : undefined;
+        if (seed !== undefined && Array.isArray(params.prompt)) {
+          forkSeeds.delete(sessionId);
+          params = request.params = { ...params, prompt: [{ type: 'text', text: seed, _meta: { [FORK_CONTEXT_META]: true } }, ...params.prompt] };
+        }
         host.requests.set(key, request);
         if (watched(host, sessionId) && (prompt || method === STEER_METHOD)) {
           host.ownPrompts.set(sessionId, (host.ownPrompts.get(sessionId) ?? 0) + 1);
@@ -2443,6 +2460,43 @@ export async function startBridge(options) {
       });
     };
 
+    // Whether the agent forks chats itself (`session/fork`, chats.js), as its
+    // `initialize` says; where in a chat it can, its cursors there say.
+    const forkKind = async () => {
+      const host = await ensureAgent();
+      const result = await ensureInitialized(host);
+      return result?.agentCapabilities?.sessionCapabilities?.fork ? 'native' : 'seeded';
+    };
+
+    // The history a seeded fork's first prompt brings the agent (chats.js), by session.
+    const forkSeeds = new Map();
+
+    // A chat the bridge starts for a window's fork or an agent's codeflower-chat
+    // (chats.js): `fork` the agent's own fork of a chat, else a new one; its
+    // record starts with `entries`, and its first prompt, if any, goes now.
+    const startChat = async ({ fork, cwd = workspace, settings, seed, entries, origin, title, prompt }) => {
+      if (!store) throw new Error('This worker keeps no chats');
+      const host = await ensureAgent();
+      await ensureInitialized(host);
+      const options = settings ? { settings } : {};
+      const session = fork
+        ? await requestAgent(host, 'session/fork', { sessionId: fork.sessionId, cwd, mcpServers: [], ...(fork.cursorId ? { cursorId: fork.cursorId } : {}) }, options)
+        : await requestAgent(host, 'session/new', { cwd, mcpServers: [] }, options);
+      if (typeof session?.sessionId !== 'string') throw new Error('The agent did not return a session id');
+      const { sessionId } = session;
+      const key = sessionKey(agentName, sessionId);
+      await recorder?.isOpen(sessionId);
+      await store.adopt(sessionId, { entries, origin });
+      if (title) await renameSession(sessionsDirectory, key, title);
+      if (seed) forkSeeds.set(sessionId, seed);
+      if (prompt) {
+        void requestAgent(host, 'session/prompt', { sessionId, prompt: [{ type: 'text', text: prompt }] }).catch((error) =>
+          log(`The first message of ${key} did not go: ${error.message}`)
+        );
+      }
+      return { sessionId, key };
+    };
+
     const wrapUpChat = async (host, sessionId, notice, template) => {
       // The wrap-up goes instead of the prompts waiting for the turn.
       promptQueue.clear(sessionId);
@@ -2596,7 +2650,13 @@ export async function startBridge(options) {
     // restarted), since agents keep some only while the chat runs (Claude's
     // effort). Done before the window gets the chat, and before its prompts go.
     const settleSettings = async (host, request, sessionId, before) => {
-      if (request.method === 'session/new') {
+      // A fork, or a chat an agent started: the settings of the chat it came from.
+      if (request.settings) {
+        await applySettings(host, sessionId, request.settings);
+        await followMode(host, sessionId);
+        return;
+      }
+      if (NEW_SESSIONS.includes(request.method)) {
         if (request.client) await applySettings(host, sessionId, newChatSettings(host.sessions.get(sessionId), lastChoices.get(), agent.remembers ?? []));
         await followMode(host, sessionId);
         return;
@@ -2667,11 +2727,12 @@ export async function startBridge(options) {
         if (message.error) host.initialized = undefined;
       }
       if (message.error || !protocolObject(result)) return false;
-      const sessionId = method === 'session/new' ? result.sessionId : params?.sessionId;
+      const sessionId = NEW_SESSIONS.includes(method) ? result.sessionId : params?.sessionId;
       if (typeof sessionId !== 'string') return false;
       const state = host.sessions.get(sessionId);
       switch (method) {
         case 'session/new':
+        case 'session/fork':
         case 'session/resume':
         case 'session/load':
           if (request.mcpFailed?.length) host.mcpFailed.set(sessionId, request.mcpFailed);
@@ -3422,6 +3483,15 @@ export async function startBridge(options) {
           respond({ commands: sessionId === undefined ? [] : commands.list(sessionId) });
           break;
         }
+        // A fork of the chat before one of the user's messages (`beforeEntry`, its
+        // index in the transcript), or all of it: a chat of its own (chats.js).
+        case '_codeflower/sessions/fork': {
+          requireSessions();
+          if (!chats) throw new InvalidRequest('This worker does not fork chats');
+          const beforeEntry = params.beforeEntry === undefined || params.beforeEntry === null ? undefined : params.beforeEntry;
+          respond(await chats.fork({ key: requireOwnSession(), beforeEntry, title: params.title ?? undefined }));
+          break;
+        }
         case '_codeflower/sessions/rename':
           await renameSession(requireSessions(), requireOwnSession(), params.title);
           respond({});
@@ -3815,6 +3885,8 @@ export async function startBridge(options) {
       },
       fromHook,
       startInitialSession,
+      forkKind,
+      startChat,
       async close() {
         stopPluginNotices?.();
         clearInterval(releaseTimer);
@@ -3994,7 +4066,9 @@ export async function startBridge(options) {
             // Batch jobs the agents may ask for (`_codeflower/jobs/*`).
             ...(jobs ? { jobs: jobs.summary() } : {}),
             // The project's map of ideas (`_codeflower/roots/*`).
-            roots: true
+            roots: true,
+            // Chats fork (`_codeflower/sessions/fork`), and agents fork and start them (codeflower-chat).
+            forkChats: Boolean(chats)
           });
           break;
         }
@@ -4437,6 +4511,28 @@ export async function startBridge(options) {
     ...rootsTiming
   });
 
+  // codeflower-chat: the project's chats, read by agents, and forked or started
+  // by them once the user allows it in the calling chat; windows fork too.
+  if (sessionsDirectory) {
+    chats = createChats({
+      directory: sessionsDirectory,
+      runtimes,
+      askUser: (chat, question) => runtimes.get(chat.agent)?.askUser(chat.sessionId, question) ?? Promise.resolve(undefined),
+      flush: (agent) => runtimes.get(agent)?.flush(),
+      changed: () => {
+        for (const target of clients) {
+          if (target.agentName === undefined) target.send({ jsonrpc: '2.0', method: '_codeflower/sessions/changed', params: {} });
+        }
+      },
+      log
+    });
+    try {
+      chatsServer = await startShowServer(chatsSocket, (request) => chats.handle(callingChat(request, 'codeflower-chat'), request));
+    } catch (error) {
+      log(`codeflower-chat is unavailable: ${error.message}`);
+    }
+  }
+
   // codeflower-job: batch jobs, asked for in the chat its command runs in.
   if (jobsInfo && jobsSpool && privateDirectory) {
     jobs = createJobs({
@@ -4549,6 +4645,7 @@ export async function startBridge(options) {
       await showServer?.close();
       await browserServer?.close();
       await jobsServer?.close();
+      await chatsServer?.close();
       jobs?.close();
       roots?.close();
       await browsers.closeAll();

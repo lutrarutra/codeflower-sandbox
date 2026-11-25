@@ -294,6 +294,26 @@ export function createSessionStore({
     },
 
     /**
+     * A chat that came from another (a fork, or one an agent started): where
+     * it came from (`origin`, in its meta), and the entries of the other's
+     * transcript it starts with, before anything recorded so far.
+     */
+    adopt(nativeSessionId, { entries = [], origin } = {}) {
+      const state = open.get(nativeSessionId);
+      if (!state) return Promise.resolve();
+      state.count += entries.length;
+      return enqueue(state, async () => {
+        if (entries.length) {
+          const recorded = await readFile(state.paths.transcript, 'utf8').catch(() => '');
+          const copied = entries.map((entry) => `${JSON.stringify(entry)}\n`).join('');
+          await writeFile(state.paths.transcript, copied + recorded, { mode: 0o600 });
+        }
+        if (origin) state.meta.origin = origin;
+        await writeJsonAtomically(state.paths.meta, state.meta);
+      });
+    },
+
+    /**
      * Keeps the chat's settings in its meta ({ options: { configId: value },
      * mode }), so it gets them back when it is opened again, also after the
      * worker restarted. Not a change to the chat: its time stays.
@@ -397,6 +417,7 @@ export async function listSessions(directory, now = Date.now()) {
       createdAt: meta.createdAt ?? '',
       updatedAt: meta.updatedAt ?? meta.createdAt ?? '',
       usage: meta.usage ?? null,
+      ...(meta.origin ? { origin: meta.origin } : {}),
       ...(leaseIsFresh(lease, now) ? { openOn: lease.instanceId } : {})
     });
   }
@@ -430,6 +451,11 @@ export async function listSubagents(directory, parentKey) {
   return children
     .map(({ key, meta }) => ({ key, nativeSessionId: meta.nativeSessionId, parentKey, summary: meta.subagent ?? null, createdAt: meta.createdAt ?? '' }))
     .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+}
+
+/** A recorded chat's meta.json, or undefined. */
+export async function readSessionMeta(directory, key) {
+  return readJson(join(sessionDirectory(directory, key), 'meta.json')).catch(() => undefined);
 }
 
 /** The parent's key of a recorded subagent's chat, or undefined for a chat of its own. */

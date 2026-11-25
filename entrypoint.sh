@@ -94,6 +94,7 @@ link_skill /opt/codeflower/skills/single-cell-best-practices
 link_skill /opt/codeflower/skills/codeflower-reproduce
 link_skill /opt/codeflower/skills/codeflower-audit
 link_skill /opt/codeflower/skills/codeflower-roots
+link_skill /opt/codeflower/skills/codeflower-chats
 link_skill /opt/codeflower/skills/codeflower-batch-jobs
 if [ -f "$storyteller/skill/SKILL.md" ]; then
   link_skill "$storyteller/skill" storyteller

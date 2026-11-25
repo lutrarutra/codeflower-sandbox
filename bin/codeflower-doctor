@@ -211,6 +211,15 @@ function resourcesJSON() {
   };
 }
 
+// The project's other chats (codeflower-chat), which only a worker's bridge serves.
+function otherChats() {
+  if (!process.env.CODEFLOWER_CHATS_SOCKET) return ['- Unavailable: this sandbox runs no code flower worker (e.g. a batch job or a run task).'];
+  return [
+    '- `codeflower-chat list` and `read KEY` show any chat of this project (read-only); `fork` and `new` fork or start a chat, which the user allows.',
+    '- Follow the codeflower-chats skill.'
+  ];
+}
+
 // The project's map of ideas (codeflower-roots): how many, and where to start.
 // Here too since a project's AGENTS.md is copied once and may predate it.
 function roots() {
@@ -302,6 +311,7 @@ try {
     console.log('\n## Current resources\n' + resources().join('\n'));
     console.log('\n## Batch jobs\n' + batchJobs().join('\n'));
     console.log('\n## Roots (the map of ideas)\n' + roots().join('\n'));
+    console.log('\n## Other chats\n' + otherChats().join('\n'));
     if (process.env.CODEFLOWER_NETWORK === 'isolated') {
       console.log('\n## Current network allowlist');
       try {
