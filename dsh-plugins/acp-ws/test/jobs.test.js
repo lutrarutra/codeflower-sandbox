@@ -9,7 +9,7 @@ import test from 'node:test';
 import WebSocket from 'ws';
 import { createAgents } from '../src/agents.js';
 import { resolvePath } from '../src/files.js';
-import { approvalRequest, createJobs, describeRequest, endNotice, readJobsInfo } from '../src/jobs.js';
+import { approvalRequest, arrayTasks, createJobs, describeRequest, endNotice, readJobsInfo } from '../src/jobs.js';
 import { agentEnvironment, startBridge } from '../src/server.js';
 
 const fakeAgent = fileURLToPath(new URL('../fixtures/fake-acp.js', import.meta.url));
@@ -33,11 +33,24 @@ test('describes what a request asks for, and asks to allow it', () => {
   assert.equal(readJobsInfo({ CODEFLOWER_JOBS: JSON.stringify(INFO) }).scheduler, 'slurm');
   assert.equal(
     describeRequest(INFO, { cpus: 8, memory: '32G', gpus: 1, gpuType: 'l4', array: '1-10%2', after: ['j-abcdef'] }),
-    'queue shortq, 8 CPUs, 32G memory, 1h, 1 GPU (l4), array 1-10%2, after j-abcdef'
+    'queue shortq, 8 CPUs, 32G memory, 1h, 1 GPU (l4), array 10 tasks (1-10), at most 2 at once, after j-abcdef'
   );
+  // An array's tasks are counted as the app counts them (ParseArray).
+  assert.deepEqual(arrayTasks('1-100%10'), { count: 100, limit: 10 });
+  assert.deepEqual(arrayTasks('0-10:2,3,4'), { count: 7, limit: 0 });
+  assert.equal(arrayTasks('5-1'), undefined);
+  assert.equal(arrayTasks('3:2'), undefined);
+  assert.equal(arrayTasks('1-4%0'), undefined);
   const { toolCall, options } = approvalRequest(INFO, { command: ['/data/code/x/run.sh', 'a b'], workdir: '/data/output/x' }, 'abc');
   assert.equal(toolCall.title, 'Submit the batch job run.sh (slurm)');
-  assert.match(toolCall.content[0].content.text, /Command: \/data\/code\/x\/run\.sh 'a b'\nFolder: \/data\/output\/x/);
+  assert.equal(toolCall.rawInput.command, "/data/code/x/run.sh 'a b'");
+  assert.match(toolCall.content[0].content.text, /^Folder: \/data\/output\/x\nQueue: shortq\nCPUs: 1\nMemory: 4G\nTime: 1h\n/);
+  // An array: how many tasks, and the resources are each task's; unset ones the scheduler's.
+  const array = approvalRequest({ ...INFO, defaults: {} }, { command: ['run.sh'], workdir: '/w', cpus: 4, array: '1-50%5', gpus: 1 }, 'def');
+  assert.match(
+    array.toolCall.content[0].content.text,
+    /\nArray: 50 tasks \(1-50\), at most 5 at once\nQueue: the scheduler's default\nCPUs: 4 per task\nMemory: the scheduler's default\nTime: the scheduler's default\nGPUs: 1 per task\n/
+  );
   assert.deepEqual(options.map((option) => option.kind), ['allow_once', 'allow_always', 'reject_once']);
   assert.match(
     endNotice([{ id: 'j-1', name: 'align', scheduler: 'slurm', schedulerId: '7', state: 'failed', exitCode: 2, logs: '/codeflower-state/jobs/j-1' }]),
@@ -241,7 +254,8 @@ test('asks the user, submits through the app, and tells the chat when its job en
   const asked = await receive(chat, (message) => message.method === 'session/request_permission');
   assert.equal(asked.params.sessionId, sessionId);
   assert.match(asked.params.toolCall.title, /Submit the batch job align \(slurm\)/);
-  assert.match(asked.params.toolCall.content[0].content.text, new RegExp(`Command: ${workspace}/run.sh x`));
+  assert.equal(asked.params.toolCall.rawInput.command, `${workspace}/run.sh x`);
+  assert.match(asked.params.toolCall.content[0].content.text, /\nCPUs: 4\n/);
   assert.equal(asked.params._meta['codeflower/bridge'], true);
   const waiting = (await call(window, '_codeflower/activity')).result.chats;
   assert.equal(waiting[0].waitingFor, 'permission');

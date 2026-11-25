@@ -42,32 +42,88 @@ export function readJobsInfo(environment = process.env) {
 }
 
 const memory = (value) => (value ? `${value} memory` : undefined);
+const plural = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
+
+/**
+ * A job array's spec (FIRST-LAST[:STEP] and single indices, separated by
+ * commas, with an optional %LIMIT; app/internal/jobs ParseArray): how many
+ * tasks, and how many may run at once (0: no limit). undefined when it does
+ * not read, which the app then refuses.
+ */
+export function arrayTasks(spec) {
+  const [indices, limitText] = String(spec).trim().split('%');
+  const limit = limitText === undefined ? 0 : Number(limitText);
+  if (!Number.isInteger(limit) || limit < 0 || (limitText !== undefined && limit < 1)) return undefined;
+  const seen = new Set();
+  for (const part of indices.split(',')) {
+    const match = /^\s*(\d+)(?:-(\d+))?(?::(\d+))?\s*$/.exec(part);
+    if (!match) return undefined;
+    const first = Number(match[1]);
+    const last = match[2] === undefined ? first : Number(match[2]);
+    const step = match[3] === undefined ? 1 : Number(match[3]);
+    if (last < first || step < 1 || (match[3] !== undefined && match[2] === undefined)) return undefined;
+    for (let index = first; index <= last; index += step) {
+      seen.add(index);
+      // Far past any limit: the app refuses it.
+      if (seen.size > 1_000_000) return undefined;
+    }
+  }
+  return seen.size ? { count: seen.size, limit } : undefined;
+}
+
+/** An array's tasks in words: "100 tasks (1-100), at most 10 at once". */
+function describeArray(spec) {
+  const tasks = arrayTasks(spec);
+  if (!tasks) return String(spec);
+  const indices = String(spec).split('%')[0].trim();
+  return `${plural(tasks.count, 'task')} (${indices})${tasks.limit ? `, at most ${tasks.limit} at once` : ''}`;
+}
 
 /** A one-line description of what a request asks for. */
 export function describeRequest(info, request) {
   const parts = [];
   if (request.queue || info.defaults?.queue) parts.push(`queue ${request.queue || info.defaults.queue}`);
-  parts.push(`${request.cpus || info.defaults?.cpus || 1} CPU${(request.cpus || info.defaults?.cpus || 1) === 1 ? '' : 's'}`);
+  parts.push(plural(request.cpus || info.defaults?.cpus || 1, 'CPU'));
   const size = memory(request.memory || info.defaults?.memory);
   if (size) parts.push(size);
   const time = request.time || info.defaults?.time;
   if (time) parts.push(time);
-  if (request.gpus) parts.push(`${request.gpus} GPU${request.gpus === 1 ? '' : 's'}${request.gpuType ? ` (${request.gpuType})` : ''}`);
-  if (request.array) parts.push(`array ${request.array}`);
+  if (request.gpus) parts.push(`${plural(request.gpus, 'GPU')}${request.gpuType ? ` (${request.gpuType})` : ''}`);
+  if (request.array) parts.push(`array ${describeArray(request.array)}`);
   if (request.after?.length) parts.push(`after ${request.after.join(', ')}`);
   return parts.join(', ');
 }
 
+/**
+ * What a request asks for, a line each, for the approval: unset ones take the
+ * scheduler's default; an array's resources are each task's.
+ */
+export function requestLines(info, request) {
+  const each = request.array ? ' per task' : '';
+  const value = (given) => (given ? `${given}${each}` : "the scheduler's default");
+  const lines = [
+    ...(request.array ? [`Array: ${describeArray(request.array)}`] : []),
+    `Queue: ${request.queue || info.defaults?.queue || "the scheduler's default"}`,
+    `CPUs: ${value(request.cpus || info.defaults?.cpus || 1)}`,
+    `Memory: ${value(request.memory || info.defaults?.memory)}`,
+    `Time: ${value(request.time || info.defaults?.time)}`
+  ];
+  if (request.gpus) lines.push(`GPUs: ${value(request.gpus)}${request.gpuType ? ` (${request.gpuType})` : ''}`);
+  if (request.after?.length) lines.push(`After: ${request.after.join(', ')}`);
+  return lines;
+}
+
 const shellQuote = (value) => (/^[\w@%+=:,./-]+$/.test(value) ? value : `'${String(value).replace(/'/g, "'\\''")}'`);
 
-/** The permission request a submission shows in the chat. */
+/**
+ * The permission request a submission shows in the chat. The window shows the
+ * command (rawInput) and, as the bridge's own request, the content's lines.
+ */
 export function approvalRequest(info, request, id) {
   const name = request.name || String(request.command?.[0] ?? 'job').split('/').pop();
-  const command = (request.command ?? []).map(shellQuote).join(' ');
   const details = [
-    `Command: ${command}`,
     `Folder: ${request.workdir}`,
-    `Resources: ${describeRequest(info, request)}`,
+    ...requestLines(info, request),
     ...(request.env && Object.keys(request.env).length ? [`Variables: ${Object.keys(request.env).join(', ')}`] : []),
     `It runs in a sandbox like this one (same folders and network), submitted to ${info.scheduler} as you.`
   ].join('\n');
@@ -77,7 +133,7 @@ export function approvalRequest(info, request, id) {
       title: `Submit the batch job ${name} (${info.scheduler})`,
       kind: 'execute',
       status: 'pending',
-      rawInput: { command: request.command, workdir: request.workdir, ...request },
+      rawInput: { ...request, command: (request.command ?? []).map(shellQuote).join(' ') },
       content: [{ type: 'content', content: { type: 'text', text: details } }]
     },
     options: [
