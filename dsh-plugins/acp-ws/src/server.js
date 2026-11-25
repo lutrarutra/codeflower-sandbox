@@ -17,6 +17,7 @@ import { createSessionInfo } from './session-info.js';
 import { categoryOf, createLastChoices, newChatSettings, nextChange, settingsOf } from './chat-settings.js';
 import { CREDENTIAL_VARIABLES, InvalidRequest, terminalAuthCommand } from './agents.js';
 import { readCodexLimits } from './codex-limits.js';
+import { auditTranscript } from './audit.js';
 import { listDirectory, readClientFile, resolveFile, saveReportComments, startShowServer, writeClientFile } from './files.js';
 import { createPage } from './page.js';
 import {
@@ -4236,6 +4237,16 @@ export async function startBridge(options) {
   let showServer;
   try {
     showServer = await startShowServer(showSocket, async (request) => {
+      // codeflower-audit seal: the audit chat's transcript, from the bridge's record.
+      if (request?.op === 'audit-transcript') {
+        const chat = showingChat(request.agent, request.sessionId);
+        if (!chat) throw new InvalidRequest('Cannot tell which chat this command runs in');
+        if (!sessionsDirectory) throw new InvalidRequest('This worker keeps no transcripts');
+        // The recorder may still hold the turn that runs the seal.
+        await runtimes.get(chat.agent)?.flush();
+        const records = auditTranscript(await readTranscript(sessionsDirectory, chat.key));
+        return { chat: chat.key, agent: chat.agent, records };
+      }
       const paths = Array.isArray(request?.paths) ? request.paths : [];
       if (!paths.length) throw new InvalidRequest('No files to show');
       const cwd = typeof request.cwd === 'string' ? request.cwd : workspace;

@@ -19,6 +19,7 @@ test('reads the ordered chat actions from their templates', async () => {
       ['methods', 'queue'],
       ['checkpoint', 'queue'],
       ['reproducible-pipeline', 'queue'],
+      ['audit-paper', 'queue'],
       ['wrap-up', 'interrupt']
     ]
   );

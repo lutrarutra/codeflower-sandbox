@@ -5,6 +5,8 @@
 # machine and binds them in (see the label below). It must be the version the
 # Claude ACP adapter pins in package-lock.json; the build checks that.
 ARG CLAUDE_AGENT_SDK_VERSION=0.3.330
+# codeflower-audit, for paper audits (the audit stage below).
+ARG CODEFLOWER_AUDIT_VERSION=v0.1.0
 
 FROM node:22-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS dsh-runtime
 ARG CLAUDE_AGENT_SDK_VERSION
@@ -46,6 +48,20 @@ COPY dsh-plugins/acp-ws/src ./src
 # uses the workspace checkout instead: --build-context storyteller=../storyteller.
 FROM scratch AS storyteller
 ADD --keep-git-dir=false https://github.com/lutrarutra/storyteller.git#v0.6.5 /
+
+# codeflower-audit, for paper audits: the command that checks, scores, seals and
+# verifies them (the same module the app's `codeflower audit` requires), the
+# agent's gathering commands and the codeflower-audit skill. Pinned by tag; a
+# development build uses the workspace checkout instead: --build-context audit=../audit.
+FROM scratch AS audit
+ARG CODEFLOWER_AUDIT_VERSION
+ADD --keep-git-dir=false https://github.com/lutrarutra/codeflower-audit.git#${CODEFLOWER_AUDIT_VERSION} /
+
+FROM golang:1.26-bookworm@sha256:4ebd099cae89439fff17af404a9c724079d439b4d92178819318735312ee9eb3 AS audit-build
+ARG CODEFLOWER_AUDIT_VERSION
+WORKDIR /audit
+COPY --from=audit / ./
+RUN CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=${CODEFLOWER_AUDIT_VERSION}" -o /codeflower-audit ./cmd/codeflower-audit
 
 # The chat page the worker serves with `codeflower sandbox --server`:
 # codeflower-ui's web build, pinned by tag. A development build uses the
@@ -247,8 +263,11 @@ COPY entrypoint.sh reproduce.sh job.sh /opt/codeflower/
 COPY lib /opt/codeflower/lib
 COPY profile.d/codeflower.sh /etc/profile.d/codeflower.sh
 COPY bin /opt/codeflower/bin
+COPY --from=audit-build /codeflower-audit /opt/codeflower/bin/codeflower-audit
+COPY --from=audit --chmod=755 /gather/codeflower-audit-gather /opt/codeflower/bin/codeflower-audit-gather
 COPY templates /opt/codeflower/templates
 COPY skills /opt/codeflower/skills
+COPY --from=audit /skill /opt/codeflower/skills/codeflower-audit
 COPY browser/bundle.json /opt/codeflower/browser/bundle.json
 # Licenses of what the image includes without them (OpenCode's npm builds).
 COPY licenses /opt/codeflower/licenses

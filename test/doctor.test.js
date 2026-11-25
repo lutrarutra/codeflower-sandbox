@@ -169,6 +169,46 @@ test('batch jobs: off, or what the config lets the agent submit, and that jobs r
   assert.match(live, /## Batch jobs\n- Scheduler: slurm/);
 });
 
+test('names the paper a sandbox started with --audit audits, and the audit rules', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'codeflower-doctor-'));
+  try {
+    const snapshot = join(dir, 'environment.md');
+    const env = { ...process.env, CODEFLOWER_AUDIT_DOI: '10.1234/example.2021.001' };
+    execFileSync(process.execPath, [doctor, '--write-startup', snapshot], { env });
+    const facts = readFileSync(snapshot, 'utf8');
+    assert.match(facts, /## Paper audit\n- This sandbox audits the paper doi:10\.1234\/example\.2021\.001/);
+    assert.match(facts, /codeflower-audit init 10\.1234\/example\.2021\.001/);
+    delete env.CODEFLOWER_AUDIT_DOI;
+    execFileSync(process.execPath, [doctor, '--write-startup', snapshot], { env });
+    assert.doesNotMatch(readFileSync(snapshot, 'utf8'), /Paper audit/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('--json reports the stable resources, the smallest of allocation, cgroup and host', () => {
+  const env = {
+    ...process.env,
+    PATH: '/nonexistent',
+    CODEFLOWER_ALLOCATION_SOURCE: 'slurm job 42',
+    CODEFLOWER_ALLOCATION_CPUS: '2',
+    CODEFLOWER_ALLOCATION_MEMORY: String(8 * 1024 ** 3),
+    CODEFLOWER_ALLOCATION_END: '2026-11-25T12:00:00Z',
+    CODEFLOWER_JOBS: JSON.stringify({ scheduler: 'slurm' }),
+    CODEFLOWER_ENGINE: 'apptainer'
+  };
+  const report = JSON.parse(execFileSync(process.execPath, [doctor, '--json'], { env, encoding: 'utf8' }));
+  assert.deepEqual(report, {
+    cpus: 2,
+    memory_gib: 8,
+    gpus: [],
+    allocation: 'slurm job 42',
+    time_limit_end: '2026-11-25T12:00:00.000Z',
+    batch_jobs: 'slurm',
+    engine: 'apptainer'
+  });
+});
+
 test('says whether the project has ideas in roots/, and where to start', (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'codeflower-doctor-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));

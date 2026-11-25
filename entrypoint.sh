@@ -92,6 +92,7 @@ if [ -f /opt/codeflower/browser/bundle.json ] || [ -x "${CODEFLOWER_BROWSER_BIN:
 fi
 link_skill /opt/codeflower/skills/single-cell-best-practices
 link_skill /opt/codeflower/skills/codeflower-reproduce
+link_skill /opt/codeflower/skills/codeflower-audit
 link_skill /opt/codeflower/skills/codeflower-roots
 link_skill /opt/codeflower/skills/codeflower-batch-jobs
 if [ -f "$storyteller/skill/SKILL.md" ]; then

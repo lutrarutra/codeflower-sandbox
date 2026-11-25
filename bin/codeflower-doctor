@@ -167,6 +167,50 @@ function batchJobs() {
   return lines;
 }
 
+// The resources this sandbox has, as JSON for `codeflower-audit score`: only
+// what stays the same while the worker runs (no free memory or disk), so the
+// same sandbox always reports the same. The smallest of the allocation, the
+// cgroup limit and the host wins.
+function resourcesJSON() {
+  const env = process.env;
+  let limits = { cpu: null, memory: null };
+  try {
+    limits = cgroupLimits();
+  } catch {
+    // No cgroup files: the host's numbers stand.
+  }
+  const smallest = (...values) => {
+    const numbers = values.map(Number).filter((value) => Number.isFinite(value) && value > 0);
+    return numbers.length ? Math.min(...numbers) : null;
+  };
+  const cpus = smallest(availableParallelism(), limits.cpu?.limit, env.CODEFLOWER_ALLOCATION_CPUS);
+  const memory = smallest(totalmem(), limits.memory?.limit, env.CODEFLOWER_ALLOCATION_MEMORY);
+  let gpus = [];
+  try {
+    gpus = execFileSync('nvidia-smi', ['--query-gpu=name,memory.total', '--format=csv,noheader'],
+      { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] })
+      .trim().split('\n').map((line) => line.trim()).filter(Boolean);
+  } catch {
+    // No NVIDIA GPU, or no driver in the sandbox.
+  }
+  let jobs = null;
+  try {
+    jobs = env.CODEFLOWER_JOBS ? JSON.parse(env.CODEFLOWER_JOBS).scheduler ?? null : null;
+  } catch {
+    jobs = null;
+  }
+  const end = Date.parse(env.CODEFLOWER_ALLOCATION_END ?? '');
+  return {
+    cpus: cpus === null ? null : Math.round(cpus * 100) / 100,
+    memory_gib: memory === null ? null : Math.round((memory / 1024 ** 3) * 10) / 10,
+    gpus,
+    allocation: env.CODEFLOWER_ALLOCATION_SOURCE || null,
+    time_limit_end: Number.isFinite(end) ? new Date(end).toISOString() : null,
+    batch_jobs: jobs,
+    engine: env.CODEFLOWER_ENGINE || null
+  };
+}
+
 // The project's map of ideas (codeflower-roots): how many, and where to start.
 // Here too since a project's AGENTS.md is copied once and may predate it.
 function roots() {
@@ -180,6 +224,20 @@ function roots() {
       ? `- ${count} idea${count === 1 ? '' : 's'} in roots/: run \`codeflower-roots tree\` before starting work, and keep the ideas you work on current.`
       : '- No ideas yet: start one with `codeflower-roots new` for the work you are about to do, even a first and only one.',
     '- The user sees this map next to the chat and comments on ideas; follow the codeflower-roots skill.'
+  ];
+}
+
+// A sandbox started with `codeflower sandbox --audit DOI` audits that paper.
+function paperAudit() {
+  const doi = process.env.CODEFLOWER_AUDIT_DOI;
+  if (!doi) return [];
+  return [
+    '## Paper audit',
+    `- This sandbox audits the paper doi:${doi}. Unless the user asks for something else, follow the codeflower-audit skill (start with \`codeflower-audit init ${doi}\` when audit/paper.yaml does not exist yet).`,
+    '- Size the work against this sandbox (above) before building anything: estimate what each result needs from raw data, and ask the user how deep to audit (from raw data, processed data, or the authors\' results) instead of starting work this sandbox cannot finish.',
+    '- Record facts on the rubric\'s scales; never write a score yourself. Only you change an outcome, with the reason recorded and named in the chat; a user who still disagrees is recorded as a dissent. A wish for a better score is not evidence.',
+    '- Never seal while `codeflower-audit check --final` fails, and change nothing in audit/ or the sealed folder after sealing. At the end, tell the user to push the sealed folder unchanged to GitHub.',
+    ''
   ];
 }
 
@@ -217,13 +275,15 @@ function launchFacts() {
     lines.push(`- Mount metadata unavailable: ${error.message}`);
   }
   lines.push('', '## Allocation', ...allocation(), '', '## Resources at startup', ...resources(), '',
-    '## Batch jobs', ...batchJobs(), '');
+    '## Batch jobs', ...batchJobs(), '', ...paperAudit());
   return lines.join('\n');
 }
 
 const args = process.argv.slice(2);
 try {
-  if (args.length === 2 && args[0] === '--write-startup') {
+  if (args.length === 1 && args[0] === '--json') {
+    process.stdout.write(`${JSON.stringify(resourcesJSON())}\n`);
+  } else if (args.length === 2 && args[0] === '--write-startup') {
     writeFileSync(args[1], launchFacts(), { mode: 0o600 });
   } else if (args.length === 0) {
     const file = process.env.CODEFLOWER_ENVIRONMENT_FILE;
@@ -254,7 +314,7 @@ try {
       }
     }
   } else {
-    console.error('Usage: codeflower-doctor');
+    console.error('Usage: codeflower-doctor [--json]');
     process.exitCode = 2;
   }
 } catch (error) {

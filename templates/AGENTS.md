@@ -61,8 +61,13 @@ exceed what the job may use. The startup snapshot is also at
 `$CODEFLOWER_ENVIRONMENT_FILE`; the doctor reports the current allowlist when networking is isolated.
 `codeflower-show` displays results, `codeflower-inventory` describes data folders,
 `codeflower-env-export` records installed environments,
-`codeflower-network` checks the isolated network's allowlist and hosts, and `codeflower-repro`
-turns an analysis into a reproducible pipeline archive (the codeflower-reproduce skill).
+`codeflower-network` checks the isolated network's allowlist and hosts, `codeflower-repro`
+turns an analysis into a reproducible pipeline archive (the codeflower-reproduce skill), and
+`codeflower-audit` audits how much of a published paper reproduces (the codeflower-audit skill): it
+gathers the facts, and checks, scores and seals the audit with the same code the user and the
+registry verify it with. In an audit you record facts and the rubric derives the scores: never write a score
+yourself, change an outcome only for a reason you accept (recorded, and named in the chat), record the
+user's disagreement as a dissent, and never change a sealed audit.
 
 When the doctor's batch-jobs section says jobs are on, `codeflower-job submit` asks the app to run
 a command as a batch job on the cluster, in a sandbox like this one: same image, `/data` folders,

@@ -6,8 +6,11 @@ STORYTELLER_SRC ?=
 # PAGE_SRC=../ui/dist-web takes the chat page from a local codeflower-ui build
 # (npm run build:web) instead of building the tag pinned in the Dockerfile.
 PAGE_SRC ?=
+# AUDIT_SRC=../audit builds codeflower-audit and its skill from a local checkout.
+AUDIT_SRC ?=
 BUILD_CONTEXTS := $(if $(STORYTELLER_SRC),--build-context storyteller=$(STORYTELLER_SRC)) \
-	$(if $(PAGE_SRC),--build-context page=$(PAGE_SRC))
+	$(if $(PAGE_SRC),--build-context page=$(PAGE_SRC)) \
+	$(if $(AUDIT_SRC),--build-context audit=$(AUDIT_SRC))
 
 sandbox-build:
 	docker build $(BUILD_CONTEXTS) -t codeflower-sandbox .

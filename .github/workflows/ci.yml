@@ -138,4 +138,10 @@ jobs:
             codeflower-repro init /tmp/pipeline
             codeflower-repro run /tmp/pipeline --clean
             codeflower-repro check /tmp/pipeline --no-dry-run | grep -q "expected/checksums.tsv is missing"
+            test -f /opt/codeflower/skills/codeflower-audit/SKILL.md -a -f /opt/codeflower/skills/codeflower-audit/scorecard.py
+            codeflower-audit --version | grep -q "^codeflower-audit version v"
+            test -x /opt/codeflower/bin/codeflower-audit-gather
+            /opt/conda/bin/python3 -c "import pypdfium2"
+            mkdir -p /tmp/audit && printf "doi: 10.1234/x\navailability: {data: 1, code: 0, environment: 0, methods: 1}\n" > /tmp/audit/paper.yaml
+            printf "[]\n" > /tmp/audit/targets.yaml && codeflower-audit check --dir /tmp/audit | grep -q "OK: 0 targets"
           '
