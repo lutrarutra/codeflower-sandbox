@@ -49,7 +49,7 @@ Releases are published for linux/amd64 and linux/arm64, tagged `X.Y.Z`, `X.Y`, `
   Single-cell best practices book in `skills/`)
 - `bin/`: commands for the agent: `codeflower-show`, `codeflower-pty`, `codeflower-env-export`,
   `codeflower-network`, `codeflower-doctor` (the worker's resources, whether the app submits batch jobs for it and, when isolated, its
-  allowlist), `codeflower-job` (batch jobs the app submits, each run in a sandbox like this one), `codeflower-inventory` (describes the mounted data: formats, shapes, columns),
+  allowlist), `codeflower-job` (batch jobs the app submits, each run in a sandbox like this one), `codeflower-watch` (waits for a condition without holding the agent's turn: a command the worker runs every so often, which tells the chat when it holds), `codeflower-inventory` (describes the mounted data: formats, shapes, columns),
   `codeflower-repro` (reproducible pipeline archives) and `snakemake` (run with the project's Python)
 - `job.sh`: the entrypoint `codeflower job-run` starts instead of `entrypoint.sh` for a batch job:
   the job's command with the project's environment, without agent or bridge

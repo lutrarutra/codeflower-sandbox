@@ -96,6 +96,7 @@ link_skill /opt/codeflower/skills/codeflower-audit
 link_skill /opt/codeflower/skills/codeflower-roots
 link_skill /opt/codeflower/skills/codeflower-chats
 link_skill /opt/codeflower/skills/codeflower-batch-jobs
+link_skill /opt/codeflower/skills/codeflower-watch
 if [ -f "$storyteller/skill/SKILL.md" ]; then
   link_skill "$storyteller/skill" storyteller
 fi

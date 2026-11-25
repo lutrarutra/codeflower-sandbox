@@ -91,15 +91,16 @@ export async function resolvePath(path, { workspace, privateDirectory, cwd = wor
     throw new InvalidRequest(`No such file: ${path}`);
   }
   // Compared resolved, like the file: a folder under a symlink (macOS /var) would not match otherwise.
-  const [privateReal, workspaceReal, jobsReal] = await Promise.all(
-    [privateDirectory, workspace, privateDirectory && join(privateDirectory, 'jobs')].map(
+  // The project state's batch jobs and watches keep output the windows show.
+  const [privateReal, workspaceReal, jobsReal, watchesReal] = await Promise.all(
+    [privateDirectory, workspace, privateDirectory && join(privateDirectory, 'jobs'), privateDirectory && join(privateDirectory, 'watches')].map(
       (folder) => folder && realpath(folder).catch(() => folder)
     )
   );
   const shown = (folder) => folder && inside(real, folder);
   const denied =
     ['/proc', '/sys', '/dev'].some((directory) => inside(real, directory)) ||
-    (privateReal && inside(real, privateReal) && !shown(workspaceReal) && !shown(jobsReal));
+    (privateReal && inside(real, privateReal) && !shown(workspaceReal) && !shown(jobsReal) && !shown(watchesReal));
   if (denied) throw new InvalidRequest(`This file cannot be shown: ${path}`);
   return { real, info: await stat(real) };
 }
@@ -278,8 +279,11 @@ export async function startShowServer(socketPath, onShow) {
   await unlink(socketPath).catch(() => {});
   const server = createServer((socket) => {
     let buffer = '';
+    // Aborted when the caller goes away before its answer (a command that waits, killed).
+    const gone = new AbortController();
     socket.setEncoding('utf8');
     socket.on('error', () => {});
+    socket.on('close', () => gone.abort());
     socket.on('data', async (chunk) => {
       buffer += chunk;
       if (buffer.length > MAX_SHOW_REQUEST) {
@@ -290,7 +294,7 @@ export async function startShowServer(socketPath, onShow) {
       if (newline < 0) return;
       let reply;
       try {
-        reply = await onShow(JSON.parse(buffer.slice(0, newline)));
+        reply = await onShow(JSON.parse(buffer.slice(0, newline)), { signal: gone.signal });
       } catch (error) {
         reply = { error: error.message };
       }

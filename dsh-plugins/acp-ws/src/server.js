@@ -42,9 +42,10 @@ import { DEFAULT_UPLOAD_MAX_BYTES, createUploads } from './uploads.js';
 import { createUsage, dshTokens } from './usage.js';
 import { createPromptQueue, queuedPromptOf } from './prompt-queue.js';
 import { createJobs, readJobsInfo } from './jobs.js';
+import { createWatches } from './watches.js';
 import { createChats, FORK_CONTEXT_META } from './chats.js';
 import { createRoots, RootsRequestError } from './roots.js';
-import { rootsDir } from './roots-store.js';
+import { addWatchNeed, endWatchNeeds, readAll as readIdeas, rootsDir } from './roots-store.js';
 import { createSubagentSettings, mergeMeta, settingsEffects } from './subagents/settings.js';
 import { createSubagentTracker } from './subagents/tracker.js';
 
@@ -594,6 +595,11 @@ export async function startBridge(options) {
     // `codeflower-chat` reaches the bridge here: the project's chats, to read,
     // fork and start (chats.js).
     chatsSocket = join(tmpdir(), `codeflower-chats-${instanceId}.sock`),
+    // `codeflower-watch` reaches the bridge here: commands the bridge runs
+    // every so often for a chat until a condition holds (watches.js).
+    watchSocket = join(tmpdir(), `codeflower-watch-${instanceId}.sock`),
+    // Tests make the watches' timings short (createWatches).
+    watchesTiming = {},
     jobsInfo = readJobsInfo(workerEnvironment),
     jobsSpool = workerEnvironment.CODEFLOWER_JOBS_SPOOL,
     // Tests make the jobs' timings short (createJobs).
@@ -654,6 +660,7 @@ export async function startBridge(options) {
     CODEFLOWER_BROWSER_SOCKET: browserSocket,
     ...(jobsInfo && jobsSpool ? { CODEFLOWER_JOBS_SOCKET: jobsSocket } : {}),
     ...(sessionsDirectory ? { CODEFLOWER_CHATS_SOCKET: chatsSocket } : {}),
+    CODEFLOWER_WATCH_SOCKET: watchSocket,
     // Where the browser's Chromium is (once installed), for the agent's own Playwright too (executablePath).
     ...(browserExecutable ? { CODEFLOWER_BROWSER_BIN: browserExecutable } : {})
   };
@@ -661,6 +668,9 @@ export async function startBridge(options) {
   // Batch jobs (jobs.js), once the agents are there.
   let jobs;
   let jobsServer;
+  // Watches (watches.js), once the agents are there.
+  let watches;
+  let watchesServer;
   // The project's chats for codeflower-chat and the windows' forks (chats.js).
   let chats;
   let chatsServer;
@@ -1180,7 +1190,13 @@ export async function startBridge(options) {
     if (chats.length) broadcast({ jsonrpc: '2.0', method: '_codeflower/wrapUp', params: { ...notice, chats: chats.length } });
     const done = Promise.all(
       chats.map(({ runtime, sessionId, key }) =>
-        runtime.wrapUp(sessionId, notice, template + (jobs?.wrapUpNote(runtime.name, sessionId) ?? '')).finally(() => wrappingUp.delete(key))
+        runtime
+          .wrapUp(
+            sessionId,
+            notice,
+            template + (jobs?.wrapUpNote(runtime.name, sessionId) ?? '') + (watches?.wrapUpNote(runtime.name, sessionId) ?? '')
+          )
+          .finally(() => wrappingUp.delete(key))
       )
     );
     return { chats: chats.length, done };
@@ -1852,7 +1868,7 @@ export async function startBridge(options) {
 
     // Nothing in the chat runs or waits: no turn or prompt, no background work
     // or subagent, no request for the user, no hand-over to the terminal UI, no
-    // batch job still active.
+    // batch job or watch still active (the chat must be here to hear of its end).
     const chatIdle = (host, sessionId) =>
       !chatRunning(host, sessionId) &&
       !activity.active().includes(sessionId) &&
@@ -1860,7 +1876,8 @@ export async function startBridge(options) {
         (waiting) => waiting.sessionId === sessionId || host.subagents.ancestors(waiting.sessionId).includes(sessionId)
       ) &&
       !host.handoffs.has(sessionId) &&
-      !jobs?.active(agentName, sessionId);
+      !jobs?.active(agentName, sessionId) &&
+      !watches?.active(agentName, sessionId);
 
     // The bridge forgets a chat it no longer has (deleted, or let go of): its
     // settings, the windows' attachment, its record and lease.
@@ -4068,7 +4085,9 @@ export async function startBridge(options) {
             // The project's map of ideas (`_codeflower/roots/*`).
             roots: true,
             // Chats fork (`_codeflower/sessions/fork`), and agents fork and start them (codeflower-chat).
-            forkChats: Boolean(chats)
+            forkChats: Boolean(chats),
+            // Agents' watches (codeflower-watch, `_codeflower/watches/*`).
+            ...(watches ? { watches: { active: watches.count() } } : {})
           });
           break;
         }
@@ -4265,6 +4284,31 @@ export async function startBridge(options) {
           const answer = await jobs.cancel(params.id);
           if (!answer.ok) throw new InvalidRequest(answer.error ?? 'Could not cancel the job');
           respond({ job: answer.job });
+          break;
+        }
+        // The agents' watches: those running and of the last day.
+        case '_codeflower/watches/list':
+          respond({ watches: watches ? watches.snapshot() : [] });
+          break;
+        // Runs a watch's command now (the user's Check now); a met watch is told to its chat.
+        case '_codeflower/watches/check': {
+          if (!watches) throw new InvalidRequest('This worker has no watches');
+          if (typeof params.id !== 'string' || !params.id) throw new InvalidRequest('Name the watch to check (id)');
+          try {
+            respond(await watches.checkNow(params.id));
+          } catch (error) {
+            throw new InvalidRequest(error.message);
+          }
+          break;
+        }
+        case '_codeflower/watches/stop': {
+          if (!watches) throw new InvalidRequest('This worker has no watches');
+          if (typeof params.id !== 'string' || !params.id) throw new InvalidRequest('Name the watch to stop (id)');
+          try {
+            respond({ watch: watches.stop(params.id) });
+          } catch (error) {
+            throw new InvalidRequest(error.message);
+          }
           break;
         }
         // The user is done in the browser: the agent gets it back, and a
@@ -4498,8 +4542,9 @@ export async function startBridge(options) {
 
   // Roots: the windows get the map when it changes; the chat working on an
   // idea is told of the user's comments on it.
+  const ideasDir = rootsDir({ CODEFLOWER_WORKSPACE: workspace, CODEFLOWER_ROOTS_DIR: workerEnvironment.CODEFLOWER_ROOTS_DIR });
   roots = createRoots({
-    dir: rootsDir({ CODEFLOWER_WORKSPACE: workspace, CODEFLOWER_ROOTS_DIR: workerEnvironment.CODEFLOWER_ROOTS_DIR }),
+    dir: ideasDir,
     changed: (snapshot) => {
       for (const target of clients) {
         if (target.agentName === undefined) target.send({ jsonrpc: '2.0', method: '_codeflower/roots/changed', params: snapshot });
@@ -4555,6 +4600,43 @@ export async function startBridge(options) {
     } catch (error) {
       log(`codeflower-job is unavailable: ${error.message}`);
     }
+  }
+
+  // codeflower-watch: commands the bridge runs for a chat until a condition
+  // holds, and then tells the chat; a subagent's watch tells its parent.
+  watches = createWatches({
+    directory: privateDirectory ? join(privateDirectory, 'watches') : join(tmpdir(), `codeflower-watches-${instanceId}`),
+    workspace,
+    environmentFor: (agent) => agentEnvironment(environment, runtimes.get(agent)?.agent.env),
+    tell: (chat, text, title, summary) => runtimes.get(chat.agent)?.tell(chat.sessionId, text, title, summary) ?? false,
+    changed: (list) => {
+      for (const target of clients) {
+        if (target.agentName === undefined) target.send({ jsonrpc: '2.0', method: '_codeflower/watches/changed', params: { watches: list } });
+      }
+    },
+    keyOf: (agent, sessionId) => sessionKey(agent, sessionId),
+    log,
+    // A watch an idea waits for is one of its needs in Roots (roots-store.js); the map hears at once.
+    ideas: {
+      exists: (id) => readIdeas(ideasDir).ideas.some((idea) => idea.id === id),
+      link: (chat, id, watch) => {
+        addWatchNeed(ideasDir, id, watch, { chat, lockWaitMs: 2000 });
+        void roots?.refresh();
+      },
+      ended: (watch) => {
+        const changed = endWatchNeeds(ideasDir, watch.id, watch.state, { lockWaitMs: 2000 });
+        if (changed.length) void roots?.refresh();
+        return changed;
+      }
+    },
+    ...watchesTiming
+  });
+  try {
+    watchesServer = await startShowServer(watchSocket, (request, { signal }) =>
+      watches.handle(callingChat(request, 'codeflower-watch'), request, { signal })
+    );
+  } catch (error) {
+    log(`codeflower-watch is unavailable: ${error.message}`);
   }
 
   // The output of commands that agents run through codeflower-cmd. A run
@@ -4646,7 +4728,9 @@ export async function startBridge(options) {
       await browserServer?.close();
       await jobsServer?.close();
       await chatsServer?.close();
+      await watchesServer?.close();
       jobs?.close();
+      await watches?.close();
       roots?.close();
       await browsers.closeAll();
       await hookServer?.close();

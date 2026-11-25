@@ -1,0 +1,397 @@
+#!/usr/local/bin/node
+// Watches: a command the code flower worker runs every so often for this
+// chat until a condition holds, and then tells the chat, so the agent need
+// not wait in a sleep loop. The bridge does the work (watches.js); where
+// there is none (a run task), `start` runs the watch here, in the foreground.
+import { spawnSync } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
+import { createConnection } from 'node:net';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+// The bridge's rules: /opt/codeflower/acp-ws/src in the image, the plugin's
+// folder in the repository.
+const here = dirname(fileURLToPath(import.meta.url));
+const rulesPath = [resolve(here, '../acp-ws/src/watch-rules.js'), resolve(here, '../dsh-plugins/acp-ws/src/watch-rules.js')].find(existsSync);
+const rules = await import(rulesPath);
+const { FINAL, MAX_FAILURES, RUN_TIMEOUT_MS, VERDICT_TEXT, WatchError, formatDuration, readStart, verdictOf } = rules;
+
+const usage = `Usage: codeflower-watch COMMAND [ARGS...]
+
+Waits for something without holding your turn: the worker runs a command
+every so often until a condition holds, then sends you a message with its
+output. It runs while no one is connected. End your turn after starting one.
+
+  start [OPTIONS] -- COMMAND
+                     run COMMAND (with sh -c, in this folder) now and then
+                     every --every, until --until holds; prints the first
+                     run's output, so check it reads as you meant
+      --every TIME     how often (default 1m, at least 10s), e.g. 30s, 5m, 1h
+      --until COND     when it is done (default exit):
+                         exit         the command exits 0 (1: not yet;
+                                      any other exit is an error)
+                         match:REGEX  its output matches REGEX
+                         change       its output differs from the first run's
+      --timeout TIME   give up after this long (default 24h, at most 7d); you
+                       are told, and can rearm it
+      --name NAME      a short name for it (default: the command's words)
+      --idea ID        the Roots idea that waits for it: the watch becomes one
+                       of its needs (an active idea is blocked meanwhile), met
+                       when the condition holds (and the idea active again)
+      --wait [TIME]    wait here for it to end, at most TIME (default 85s);
+                       if it has not ended by then, it keeps running and you
+                       get a message
+  list [--all]       this chat's watches (--all: every chat's), running and of
+                     the last day
+  show ID            a watch: its state, its last runs and their exit codes,
+                     and the last run's output
+  logs ID [--run N] [--tail N]
+                     all its runs' output, or run N's
+  wait ID [TIME]     wait for a watch to end, at most TIME (default 85s)
+  link ID IDEA       make a running watch a need of the Roots idea IDEA
+  check ID           run its command now rather than at the next run (which
+                     then counts from this one): prints the output and verdict;
+                     if the condition holds, the watch ends here (no message)
+  rearm ID [--timeout TIME] [--every TIME] [--until COND] [--reset]
+                     start a watch that timed out, failed or was stopped
+                     again, as it was (same id, log and Roots need); on a
+                     running one, its timeout counts from now. --every and
+                     --until change how it runs; --reset (or a new --until)
+                     clears its errors, and change compares with the next run
+  stop ID | --all    stop a watch (--all: all of this chat's); you get no
+                     message for watches you stop
+
+ID is a watch's id (w-...) or name. A run that fails ${MAX_FAILURES} times in a row
+(exit status other than 0 and 1 for exit, any but 0 for the others, or
+longer than ${formatDuration(RUN_TIMEOUT_MS)}) ends the watch as failing, and you are told.
+Watches stop when the sandbox stops.
+
+Examples:
+  codeflower-watch start --every 2m --until 'match:"state": *"(MERGED|CLOSED)"' \\
+    --name 'PR 12' -- gh pr view 12 --json state
+  codeflower-watch start --every 30s -- test -f results/done.flag
+  codeflower-watch start --every 1m --until exit -- 'curl -sf localhost:8000/health'
+
+Add --json to any command for JSON.`;
+
+const EXIT = { ok: 0, met: 0, failed: 1, invalid: 2, waiting: 4 };
+
+const fail = (message, code = 1) => {
+  console.error(message);
+  process.exit(code);
+};
+
+const args = process.argv.slice(2);
+if (!args.length || ['--help', '-h', 'help'].includes(args[0])) {
+  console.log(usage);
+  process.exit(args.length ? 0 : 2);
+}
+
+// Options: --name value, --name=value, flags. commandFollows: the first word
+// (or --) starts the command, whose own options are its.
+function parse(rest, valued, flags = [], optional = [], commandFollows = false) {
+  const options = {};
+  const words = [];
+  for (let index = 0; index < rest.length; index++) {
+    const arg = rest[index];
+    if (arg === '--') {
+      words.push(...rest.slice(index + 1));
+      break;
+    }
+    if (!arg.startsWith('--')) {
+      if (commandFollows) {
+        words.push(...rest.slice(index));
+        break;
+      }
+      words.push(arg);
+      continue;
+    }
+    const [name, value] = arg.slice(2).split(/=(.*)/s);
+    if (name === 'json' || flags.includes(name)) {
+      options[name] = true;
+    } else if (optional.includes(name)) {
+      // A value only when the next word reads as one (--wait 5m, else --wait).
+      if (value !== undefined) options[name] = value;
+      else if (rest[index + 1] !== undefined && /^\d+(\.\d+)?[smhd]?([0-9smhd.]*)$/i.test(rest[index + 1])) options[name] = rest[++index];
+      else options[name] = true;
+    } else if (valued.includes(name)) {
+      if (value !== undefined) options[name] = value;
+      else if (index + 1 < rest.length) options[name] = rest[++index];
+      else fail(`--${name} needs a value. See codeflower-watch --help.`, 2);
+    } else fail(`Unknown option --${name}. See codeflower-watch --help.`, 2);
+  }
+  return { options, words };
+}
+
+function request(body) {
+  const socketPath = process.env.CODEFLOWER_WATCH_SOCKET;
+  return new Promise((done) => {
+    const socket = createConnection(socketPath);
+    let reply = '';
+    socket.setEncoding('utf8');
+    socket.on('connect', () =>
+      socket.write(
+        `${JSON.stringify({
+          ...body,
+          // The words the bridge finds this command by among the running ones (callingChat).
+          args: args.filter((arg) => /^[A-Za-z0-9._-]{1,100}$/.test(arg) && !arg.startsWith('-')).slice(0, 3),
+          agent: process.env.CODEFLOWER_AGENT_NAME,
+          // What the agents export to their commands: the chat's session id.
+          sessionId: process.env.CLAUDE_CODE_SESSION_ID || process.env.CODEX_THREAD_ID || undefined
+        })}\n`
+      )
+    );
+    socket.on('data', (chunk) => (reply += chunk));
+    socket.on('error', (error) => fail(`Could not reach the code flower worker: ${error.message}`));
+    socket.on('end', () => {
+      try {
+        done(JSON.parse(reply));
+      } catch {
+        fail('The code flower worker sent no answer.');
+      }
+    });
+  });
+}
+
+const answered = (answer) => {
+  if (answer.error || answer.ok === false) fail(answer.error ?? 'The worker refused.', EXIT[answer.code] ?? 1);
+  return answer;
+};
+
+const ago = (iso) => (iso ? `${formatDuration(Date.now() - Date.parse(iso))} ago` : '');
+const until = (iso) => (iso ? `in ${formatDuration(Math.max(0, Date.parse(iso) - Date.now()))}` : '');
+
+function line(watch) {
+  const state =
+    watch.state === 'watching'
+      ? watch.running
+        ? `running now (run ${watch.runs})`
+        : `watching, ${watch.runs} run${watch.runs === 1 ? '' : 's'}, next ${until(watch.nextRun)}`
+      : `${watch.state}${watch.reason ? ` (${watch.reason})` : ''} ${ago(watch.ended)}, after ${watch.runs} run${watch.runs === 1 ? '' : 's'}`;
+  return `${watch.id}  ${watch.name}  every ${formatDuration(watch.every)} until ${watch.until}  ${state}${watch.idea !== undefined ? `  (idea #${watch.idea})` : ''}`;
+}
+
+function printRun(run) {
+  if (!run) return;
+  const output = (run.output ?? '').trimEnd();
+  console.log(`${run.label ?? 'First run'}: exit ${run.exitCode}${run.timedOut ? ' (timed out)' : ''}, ${VERDICT_TEXT[run.verdict]}`);
+  if (output) console.log(output);
+}
+
+// What a watch's end means for the command's own exit status.
+const ended = (watch) => (watch.state === 'met' ? EXIT.met : FINAL.has(watch.state) ? EXIT.failed : EXIT.waiting);
+
+function afterWait(answer, json) {
+  const { watch } = answer;
+  if (json) {
+    console.log(JSON.stringify(answer, null, 2));
+    return process.exit(ended(watch));
+  }
+  if (FINAL.has(watch.state)) {
+    console.log(`${watch.name} (${watch.id}) ended: ${watch.state}${watch.reason ? ` (${watch.reason})` : ''} after ${watch.runs} runs.`);
+    if (answer.output?.trim()) console.log(`Last output:\n${answer.output.trimEnd()}`);
+  } else {
+    console.log(`${watch.name} (${watch.id}) is still watching (${watch.runs} runs). You get a message when it ends: end your turn rather than waiting.`);
+  }
+  process.exit(ended(watch));
+}
+
+// Without the bridge (a run task): the watch runs here, in the foreground, until it ends.
+async function runHere(spec, json) {
+  const deadline = Date.now() + spec.timeout;
+  let baseline;
+  let failures = 0;
+  for (let number = 1; ; number++) {
+    const result = spawnSync('/bin/sh', ['-c', spec.command], { encoding: 'utf8', timeout: RUN_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 });
+    const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;
+    const run = { exitCode: result.status ?? 1, output, timedOut: result.error?.code === 'ETIMEDOUT' };
+    const verdict = verdictOf(spec.until, run, baseline);
+    if (spec.until.kind === 'change' && baseline === undefined && verdict !== 'error') baseline = output;
+    failures = verdict === 'error' ? failures + 1 : 0;
+    if (!json) console.error(`run ${number}: exit ${run.exitCode}, ${VERDICT_TEXT[verdict]}`);
+    const end = verdict === 'met' ? 'met' : failures >= MAX_FAILURES || (number === 1 && verdict === 'error') ? 'failing' : Date.now() + spec.every > deadline ? 'timeout' : undefined;
+    if (end) {
+      if (json) console.log(JSON.stringify({ ok: true, watch: { name: spec.name, state: end, runs: number }, output }, null, 2));
+      else console.log(`${spec.name} ended: ${end} after ${number} runs.${output.trim() ? `\nLast output:\n${output.trimEnd()}` : ''}`);
+      process.exit(end === 'met' ? 0 : 1);
+    }
+    await new Promise((done) => setTimeout(done, spec.every));
+  }
+}
+
+function readLog(path, run, last) {
+  let text;
+  try {
+    text = readFileSync(path, 'utf8');
+  } catch (error) {
+    return fail(`Cannot read ${path}: ${error.message}`);
+  }
+  if (run !== undefined) {
+    const start = text.indexOf(`── run ${run} · `);
+    if (start < 0) return fail(`No run ${run} in the log (it keeps the latest runs).`, 2);
+    const next = text.indexOf('\n── run ', start + 1);
+    text = text.slice(start, next < 0 ? undefined : next + 1);
+  }
+  if (last !== undefined) text = text.split('\n').slice(-last - 1).join('\n');
+  process.stdout.write(text.endsWith('\n') ? text : `${text}\n`);
+}
+
+const number = (value, label) => {
+  if (value === undefined) return undefined;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) fail(`${label} is a number from 1`, 2);
+  return parsed;
+};
+
+async function main() {
+  const [command, ...rest] = args;
+  const bridge = Boolean(process.env.CODEFLOWER_WATCH_SOCKET);
+  switch (command) {
+    case 'start': {
+      const { options, words } = parse(rest, ['every', 'until', 'timeout', 'name', 'idea'], [], ['wait'], true);
+      const body = {
+        action: 'start',
+        command: words.join(' '),
+        cwd: process.cwd(),
+        ...Object.fromEntries(['every', 'until', 'timeout', 'name', 'wait', 'idea'].filter((key) => options[key] !== undefined).map((key) => [key, options[key]]))
+      };
+      // The bridge checks the request itself; without one, it is checked here.
+      if (!bridge) {
+        let spec;
+        try {
+          spec = readStart(body);
+        } catch (error) {
+          if (error instanceof WatchError) fail(error.message, 2);
+          throw error;
+        }
+        console.error('No code flower worker here (a run task): the watch runs in the foreground until it ends.');
+        return runHere(spec, options.json);
+      }
+      const answer = answered(await request(body));
+      if (options.wait !== undefined && !FINAL.has(answer.watch.state)) {
+        if (!options.json) printRun(answer.run);
+        return afterWait(answer, options.json);
+      }
+      if (options.json) return console.log(JSON.stringify(answer, null, 2));
+      printRun(answer.run);
+      const { watch } = answer;
+      if (watch.state === 'met') console.log(`The condition already holds: ${watch.name} ended at once.`);
+      else if (watch.state === 'failing') {
+        console.log(`The first run is an error, so ${watch.name} did not start: fix the command or the condition (--until) and start it again.`);
+        process.exit(EXIT.failed);
+      } else if (FINAL.has(watch.state)) {
+        afterWait(answer, false);
+      } else {
+        console.log(
+          `Started ${watch.id} (${watch.name}): runs every ${formatDuration(watch.every)} until ${watch.until}, for at most ${formatDuration(watch.timeout)}.\n` +
+            (watch.idea !== undefined ? `It is a need of idea #${watch.idea} in Roots, met when its condition holds.\n` : '') +
+            'You get a message when it ends. End your turn now rather than waiting.'
+        );
+      }
+      return;
+    }
+    case 'list': {
+      const { options } = parse(rest, [], ['all']);
+      if (!bridge) fail('codeflower-watch list needs the code flower worker, which this sandbox is not running.', 2);
+      const { watches } = answered(await request({ action: 'list', all: Boolean(options.all) }));
+      if (options.json) return console.log(JSON.stringify(watches, null, 2));
+      if (!watches.length) return console.log('No watches.');
+      for (const watch of watches) console.log(line(watch));
+      return;
+    }
+    case 'show': {
+      const { options, words } = parse(rest, []);
+      if (!bridge) fail('codeflower-watch show needs the code flower worker, which this sandbox is not running.', 2);
+      const answer = answered(await request({ action: 'show', id: words[0] }));
+      if (options.json) return console.log(JSON.stringify(answer, null, 2));
+      const { watch } = answer;
+      console.log(line(watch));
+      console.log(`Command: ${watch.command}\nIn: ${watch.cwd}\nStarted: ${watch.started.slice(0, 19).replace('T', ' ')}, gives up at ${watch.deadline.slice(0, 19).replace('T', ' ')}`);
+      if (answer.runs.length) {
+        console.log('Runs:');
+        for (const run of answer.runs) {
+          console.log(`  ${run.run}  ${run.at.slice(11, 19)}  exit ${run.exitCode}${run.timedOut ? ' (timed out)' : ''}  ${VERDICT_TEXT[run.verdict]}  ${formatDuration(run.ms)}`);
+        }
+      }
+      if (answer.output?.trim()) console.log(`Last output:\n${answer.output.trimEnd()}`);
+      console.log(`Log: ${watch.log}`);
+      return;
+    }
+    case 'logs':
+    case 'log': {
+      const { options, words } = parse(rest, ['run', 'tail']);
+      if (!bridge) fail('codeflower-watch logs needs the code flower worker, which this sandbox is not running.', 2);
+      const { watch } = answered(await request({ action: 'show', id: words[0] }));
+      return readLog(watch.log, number(options.run, '--run'), number(options.tail, '--tail'));
+    }
+    case 'wait': {
+      const { options, words } = parse(rest, []);
+      if (!bridge) fail('codeflower-watch wait needs the code flower worker, which this sandbox is not running.', 2);
+      const answer = answered(await request({ action: 'wait', id: words[0], wait: words[1] ?? true }));
+      return afterWait(answer, options.json);
+    }
+    case 'check': {
+      const { options, words } = parse(rest, []);
+      if (!bridge) fail('codeflower-watch check needs the code flower worker, which this sandbox is not running.', 2);
+      if (words.length !== 1) fail('codeflower-watch check ID', 2);
+      const answer = answered(await request({ action: 'check', id: words[0] }));
+      const { watch } = answer;
+      if (options.json) {
+        console.log(JSON.stringify(answer, null, 2));
+      } else {
+        printRun({ ...answer.run, label: `Run ${watch.lastRun?.run ?? ''}`.trim() });
+        if (watch.state === 'met') console.log(`The condition holds: ${watch.name} ended.`);
+        else if (FINAL.has(watch.state)) console.log(`${watch.name} ended: ${watch.state}${watch.reason ? ` (${watch.reason})` : ''}.`);
+        else console.log(`Still watching; the next run is ${until(watch.nextRun) || 'after this one'}.`);
+      }
+      return process.exit(ended(watch));
+    }
+    case 'rearm': {
+      const { options, words } = parse(rest, ['timeout', 'every', 'until'], ['reset']);
+      if (!bridge) fail('codeflower-watch rearm needs the code flower worker, which this sandbox is not running.', 2);
+      if (words.length !== 1) fail('codeflower-watch rearm ID [--timeout TIME] [--every TIME] [--until COND] [--reset]', 2);
+      const answer = answered(
+        await request({
+          action: 'rearm',
+          id: words[0],
+          ...Object.fromEntries(['timeout', 'every', 'until', 'reset'].filter((key) => options[key] !== undefined).map((key) => [key, options[key]]))
+        })
+      );
+      if (options.json) return console.log(JSON.stringify(answer, null, 2));
+      const { watch } = answer;
+      if (answer.run) printRun({ ...answer.run, label: 'First run after re-arming' });
+      if (watch.state === 'met') return console.log(`The condition holds now: ${watch.name} ended at once.`);
+      if (FINAL.has(watch.state)) {
+        console.log(`${watch.name} ended again: ${watch.state}${watch.reason ? ` (${watch.reason})` : ''}.`);
+        process.exit(EXIT.failed);
+      }
+      return console.log(
+        `Re-armed ${watch.id} (${watch.name}): runs every ${formatDuration(watch.every)} until ${watch.until}, for at most ${formatDuration(watch.timeout)} from now.` +
+          (watch.idea !== undefined ? ` Idea #${watch.idea} waits for it again.` : '') +
+          '\nEnd your turn now rather than waiting.'
+      );
+    }
+    case 'link': {
+      const { options, words } = parse(rest, []);
+      if (!bridge) fail('codeflower-watch link needs the code flower worker, which this sandbox is not running.', 2);
+      if (words.length !== 2) fail('codeflower-watch link ID IDEA', 2);
+      const { watch } = answered(await request({ action: 'link', id: words[0], idea: words[1] }));
+      if (options.json) return console.log(JSON.stringify(watch, null, 2));
+      return console.log(`${watch.name} (${watch.id}) is now a need of idea #${watch.idea}: met when its condition holds.`);
+    }
+    case 'stop': {
+      const { options, words } = parse(rest, [], ['all']);
+      if (!bridge) fail('codeflower-watch stop needs the code flower worker, which this sandbox is not running.', 2);
+      if (!options.all && !words[0]) fail('Which watch? codeflower-watch stop ID (or --all)', 2);
+      const { stopped } = answered(await request({ action: 'stop', ...(options.all ? { all: true } : { id: words[0] }) }));
+      if (options.json) return console.log(JSON.stringify(stopped, null, 2));
+      if (!stopped.length) return console.log('No watch was running.');
+      for (const watch of stopped) console.log(`Stopped ${watch.id} (${watch.name}) after ${watch.runs} runs.`);
+      return;
+    }
+    default:
+      fail(`Unknown command ${command}\n\n${usage}`, 2);
+  }
+}
+
+await main();

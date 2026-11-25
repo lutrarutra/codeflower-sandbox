@@ -45,6 +45,9 @@ files it produced and a conclusion. Keep it current as you work.
   todo uncheck ID N...
   todo rm ID N...
   need add ID ID|TEXT...    add needs: an idea's id (3 or #3), or a condition
+                            (for something outside you can check with a
+                            command, start a watch instead: codeflower-watch
+                            start --idea ID ..., met when its condition holds)
   need check ID N...        mark a condition met (an idea's need is met when
                             that idea is done)
   need uncheck ID N...
@@ -183,11 +186,14 @@ function filePath(text) {
 
 const plural = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
 
+// A condition, or a watch (codeflower-watch) and how it is: watching, or how it ended.
+const needText = (need) => (need.watch ? `${need.text} (watch ${need.watch}: ${need.met ? 'met' : need.ended ?? 'watching'})` : need.text);
+
 function summary(idea, byId) {
   const parts = [];
   if (idea.todos.length) parts.push(`todos ${idea.todos.filter((todo) => todo.done).length}/${idea.todos.length}`);
   const unmet = idea.needs.filter((item) => !needMet(item, byId));
-  if (unmet.length) parts.push(`needs ${unmet.map((item) => (item.idea ? `#${item.idea}` : JSON.stringify(item.text))).join(', ')}`);
+  if (unmet.length) parts.push(`needs ${unmet.map((item) => (item.idea ? `#${item.idea}` : JSON.stringify(needText(item)))).join(', ')}`);
   const comments = userComments(idea);
   if (comments.length) parts.push(`${plural(comments.length, 'comment')} from the user`);
   if (idea.files.length) parts.push(plural(idea.files.length, 'file'));
@@ -219,7 +225,9 @@ function todos(only, { json, mine }) {
       status: idea.status,
       todos: idea.todos.flatMap((todo, index) => (todo.done ? [] : [{ n: index + 1, text: todo.text }])),
       needs: idea.needs.flatMap((need, index) =>
-        needMet(need, byId) ? [] : [{ n: index + 1, ...(need.idea !== undefined ? { idea: need.idea, status: byId.get(need.idea)?.status ?? 'missing' } : { text: need.text }) }]
+        needMet(need, byId)
+          ? []
+          : [{ n: index + 1, ...(need.idea !== undefined ? { idea: need.idea, status: byId.get(need.idea)?.status ?? 'missing' } : { text: needText(need), ...(need.watch ? { watch: need.watch, ...(need.ended ? { ended: need.ended } : {}) } : {}) }) }]
       ),
       comments: userComments(idea).map((comment) => ({ text: comment.text, at: comment.at }))
     }));
@@ -311,7 +319,7 @@ function show(ideaId, { json }) {
   if (idea.todos.length) out.push('', 'Todos:', ...numbered(idea.todos, (todo) => `[${todo.done ? 'x' : ' '}] ${todo.text}`));
   if (idea.needs.length) {
     out.push('', 'Needs:', ...numbered(idea.needs, (item) =>
-      `[${needMet(item, byId) ? 'x' : ' '}] ${item.idea ? `${name(item.idea)} (${byId.get(item.idea)?.status ?? 'missing'})` : item.text}`));
+      `[${needMet(item, byId) ? 'x' : ' '}] ${item.idea ? `${name(item.idea)} (${byId.get(item.idea)?.status ?? 'missing'})` : needText(item)}`));
   }
   if (idea.files.length) out.push('', 'Files:', ...idea.files.map((file) => `  ${file}`));
   if (idea.chats.length) {

@@ -96,7 +96,10 @@ export function normalize(front) {
   if (!idea.from.every((id) => Number.isInteger(id))) throw new RootsError('from must list idea ids');
   for (const need of idea.needs) {
     const ok = need && typeof need === 'object' && (Number.isInteger(need.idea) || typeof need.text === 'string');
-    if (!ok) throw new RootsError('each need is {"idea": ID} or {"text": "…", "met": false}');
+    if (!ok) throw new RootsError('each need is {"idea": ID}, {"text": "…", "met": false} or a watch\'s {"watch": "w-…", "text": "…", "met": false}');
+    if (need.watch !== undefined && (typeof need.watch !== 'string' || !/^w-[0-9a-f]{8}$/.test(need.watch) || typeof need.text !== 'string')) {
+      throw new RootsError('a watch\'s need is {"watch": "w-…", "text": "…", "met": false}');
+    }
   }
   for (const todo of idea.todos) {
     if (!todo || typeof todo.text !== 'string') throw new RootsError('each todo is {"text": "…", "done": false}');
@@ -253,4 +256,63 @@ export function change(dir, id, mutate, { chat, now = new Date(), lockWaitMs } =
 export function needMet(need, byId) {
   if (need.idea !== undefined) return byId.get(need.idea)?.status === 'done';
   return Boolean(need.met);
+}
+
+// ---- watches (codeflower-watch) as needs ----
+//
+// A watch an idea waits for is one of its needs: {"watch": "w-…", "text": its
+// name, "met": false, "log": its output}. The bridge adds it when the agent
+// starts the watch for the idea (blocking the idea if it was active), marks it
+// met when the watch's condition holds (and the idea active again once nothing
+// else blocks it), and otherwise records how the watch ended (`ended`).
+
+/** Adds a watch to an idea's needs; an active idea becomes blocked. */
+export function addWatchNeed(dir, id, watch, { chat, now, lockWaitMs } = {}) {
+  return change(
+    dir,
+    id,
+    (idea) => {
+      // A watch re-armed waits again in the same place.
+      const need = { watch: watch.id, text: watch.name, met: false, ...(watch.log ? { log: watch.log } : {}) };
+      const index = idea.needs.findIndex((other) => other.watch === watch.id);
+      if (index >= 0) idea.needs[index] = need;
+      else idea.needs.push(need);
+      if (idea.status === 'active') idea.status = 'blocked';
+    },
+    { chat, now, lockWaitMs }
+  );
+}
+
+/**
+ * A watch ended (its `state`): the ideas that need it, each changed. Met: the need is met, and a
+ * blocked idea whose needs are all met is active again. Otherwise the need stays open, with how the
+ * watch ended. Answers [{id, title, unblocked, state}] for the chat's notice.
+ */
+export function endWatchNeeds(dir, watchId, state, { now, lockWaitMs } = {}) {
+  const { ideas } = readAll(dir);
+  const results = [];
+  for (const waiting of ideas.filter((idea) => idea.needs.some((need) => need.watch === watchId))) {
+    let unblocked = false;
+    const idea = change(
+      dir,
+      waiting.id,
+      (idea, all) => {
+        const byId = new Map(all.map((other) => [other.id, other]));
+        for (const need of idea.needs) {
+          if (need.watch !== watchId) continue;
+          if (state === 'met') {
+            need.met = true;
+            delete need.ended;
+          } else need.ended = state;
+        }
+        if (state === 'met' && idea.status === 'blocked' && idea.needs.every((need) => needMet(need, byId))) {
+          idea.status = 'active';
+          unblocked = true;
+        }
+      },
+      { now, lockWaitMs }
+    );
+    results.push({ id: idea.id, title: idea.title, status: idea.status, unblocked });
+  }
+  return results;
 }

@@ -215,9 +215,10 @@ test('says whether the project has ideas in roots/, and where to start', (t) => 
   const snapshot = join(dir, 'environment.md');
   writeFileSync(snapshot, '# Sandbox environment at worker startup\n');
   const run = () => execFileSync(process.execPath, [doctor],
-    { env: { ...process.env, CODEFLOWER_WORKSPACE: dir, CODEFLOWER_ROOTS_DIR: '', CODEFLOWER_CHATS_SOCKET: '', CODEFLOWER_ENVIRONMENT_FILE: snapshot }, encoding: 'utf8' });
+    { env: { ...process.env, CODEFLOWER_WORKSPACE: dir, CODEFLOWER_ROOTS_DIR: '', CODEFLOWER_CHATS_SOCKET: '', CODEFLOWER_WATCH_SOCKET: '', CODEFLOWER_ENVIRONMENT_FILE: snapshot }, encoding: 'utf8' });
   assert.match(run(), /## Roots \(the map of ideas\)\n- No ideas yet: start one with `codeflower-roots new`/);
   assert.match(run(), /## Other chats\n- Unavailable: this sandbox runs no code flower worker/);
+  assert.match(run(), /## Waiting \(watches\)\n- In the foreground only/);
   mkdirSync(join(dir, 'roots'));
   writeFileSync(join(dir, 'roots', '001-qc.md'), '');
   writeFileSync(join(dir, 'roots', '002-cluster.md'), '');

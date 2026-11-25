@@ -220,6 +220,17 @@ function otherChats() {
   ];
 }
 
+// Waiting for something (codeflower-watch), which the worker's bridge runs.
+function watches() {
+  if (!process.env.CODEFLOWER_WATCH_SOCKET) {
+    return ['- In the foreground only: this sandbox runs no code flower worker (e.g. a batch job or a run task), so `codeflower-watch start` waits until its condition holds.'];
+  }
+  return [
+    '- `codeflower-watch start --every TIME --until COND -- COMMAND` runs COMMAND now and every TIME until COND holds, and you get a message when it ends; end your turn meanwhile rather than waiting in a sleep loop.',
+    '- `codeflower-watch list`, `show ID`, `logs ID` and `stop ID`. Follow the codeflower-watch skill.'
+  ];
+}
+
 // The project's map of ideas (codeflower-roots): how many, and where to start.
 // Here too since a project's AGENTS.md is copied once and may predate it.
 function roots() {
@@ -312,6 +323,7 @@ try {
     console.log('\n## Batch jobs\n' + batchJobs().join('\n'));
     console.log('\n## Roots (the map of ideas)\n' + roots().join('\n'));
     console.log('\n## Other chats\n' + otherChats().join('\n'));
+    console.log('\n## Waiting (watches)\n' + watches().join('\n'));
     if (process.env.CODEFLOWER_NETWORK === 'isolated') {
       console.log('\n## Current network allowlist');
       try {

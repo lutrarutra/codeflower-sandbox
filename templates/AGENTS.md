@@ -88,6 +88,13 @@ history (read-only), `fork` copies a chat (all of it, or from before one of the 
 try another way, and `new --title T [--agent NAME] MESSAGE` starts a chat that works on its own. The
 user allows each fork and new chat. Follow the codeflower-chats skill.
 
+To wait for something (a pull request merged, a file written, a server up, a line in a log), use
+`codeflower-watch` rather than a sleep loop: `codeflower-watch start --every 2m --until
+'match:MERGED|CLOSED' -- gh pr view 12 --json state` runs the command now and every 2 minutes until
+the condition holds, and you get a message with its output when it does, also while no one is
+connected. Start it and end your turn. Batch jobs tell you when they end without one. Follow the
+codeflower-watch skill.
+
 MCP servers come only from the code flower config on the user's computer
 (`mcp_servers:` in `~/.codeflower/config.yaml`), and apply when the sandbox
 restarts. You cannot add one yourself. When the user wants to connect one, or

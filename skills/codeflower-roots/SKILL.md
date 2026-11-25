@@ -56,6 +56,11 @@ is there. The tab updates by itself; don't open it again after each change.
 - Needs: what must happen first. Another idea (`need add 7 5`, met once idea 5 is done) or a
   condition the user or the world must satisfy (`need add 8 "Sample sheet with the treatment
   column"`, checked with `need check 8 2`). Set the status to `blocked` while one stops the work.
+  When the idea waits for something outside that a command can check (a pull request merged, a
+  job's result written, a server up), make it a watch instead: `codeflower-watch start --idea 8
+  --name "PR 12 merged" --until 'match:MERGED' -- gh pr view 12 --json state` adds it as a need
+  and blocks the idea; when the condition holds, the need is met, the idea is active again, and
+  you get a message (the codeflower-watch skill).
 - Files: `link ID PATH...` for what the idea produced that matters: key figures, the scripts that
   made them, reports, result tables. Not every intermediate file.
 - Status: `active` while worked on, `blocked`, `done`, or `dropped` for a line given up (say why in
