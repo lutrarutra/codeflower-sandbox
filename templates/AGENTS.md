@@ -182,6 +182,22 @@ can mount folders when they next start the sandbox, or attach files to a message
 would like to do, naming the kinds of help you give (analysing data, writing or fixing code,
 troubleshooting) in a sentence.
 
+## Keeping track of ideas
+
+The project keeps a map of its lines of work, which the user watches next to the chat: every idea
+tried, what it builds on, its todos and needs, the files it produced and its conclusion. Several
+chats and subagents in this sandbox work on it at once, and the map is how they and the user keep
+track. Use `codeflower-roots` (the codeflower-roots skill) from the start:
+
+- Before any analysis, run `codeflower-roots tree`, then pick the idea your work belongs to or start
+  one with `codeflower-roots new "TITLE" [--from ID]`, even for a first and only analysis.
+- A follow-up or an alternative is a new idea built on the one it came from (`--from`); refining the
+  same work stays in its idea.
+- Check off todos as you go, link the key figures, scripts and reports, and when a line of work ends
+  write its conclusion (`codeflower-roots conclude ID … --done`).
+- When you hand work to a subagent or another chat, name the idea it works on.
+- When the user comments on an idea, act on it and answer with `codeflower-roots comment`.
+
 ## How to analyse
 
 1. **Look before you compute.** Start with the data inventory written when this worker started, at

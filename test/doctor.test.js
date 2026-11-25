@@ -168,3 +168,18 @@ test('batch jobs: off, or what the config lets the agent submit, and that jobs r
     { env: { ...process.env, CODEFLOWER_JOBS: jobs, CODEFLOWER_ENVIRONMENT_FILE: snapshot }, encoding: 'utf8' });
   assert.match(live, /## Batch jobs\n- Scheduler: slurm/);
 });
+
+test('says whether the project has ideas in roots/, and where to start', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'codeflower-doctor-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const snapshot = join(dir, 'environment.md');
+  writeFileSync(snapshot, '# Sandbox environment at worker startup\n');
+  const run = () => execFileSync(process.execPath, [doctor],
+    { env: { ...process.env, CODEFLOWER_WORKSPACE: dir, CODEFLOWER_ROOTS_DIR: '', CODEFLOWER_ENVIRONMENT_FILE: snapshot }, encoding: 'utf8' });
+  assert.match(run(), /## Roots \(the map of ideas\)\n- No ideas yet: start one with `codeflower-roots new`/);
+  mkdirSync(join(dir, 'roots'));
+  writeFileSync(join(dir, 'roots', '001-qc.md'), '');
+  writeFileSync(join(dir, 'roots', '002-cluster.md'), '');
+  writeFileSync(join(dir, 'roots', 'notes.md'), '');
+  assert.match(run(), /- 2 ideas in roots\/: run `codeflower-roots tree` before starting work/);
+});

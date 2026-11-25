@@ -41,6 +41,8 @@ import { DEFAULT_UPLOAD_MAX_BYTES, createUploads } from './uploads.js';
 import { createUsage, dshTokens } from './usage.js';
 import { createPromptQueue, queuedPromptOf } from './prompt-queue.js';
 import { createJobs, readJobsInfo } from './jobs.js';
+import { createRoots, RootsRequestError } from './roots.js';
+import { rootsDir } from './roots-store.js';
 import { createSubagentSettings, mergeMeta, settingsEffects } from './subagents/settings.js';
 import { createSubagentTracker } from './subagents/tracker.js';
 
@@ -589,6 +591,8 @@ export async function startBridge(options) {
     jobsSpool = workerEnvironment.CODEFLOWER_JOBS_SPOOL,
     // Tests make the jobs' timings short (createJobs).
     jobsTiming = {},
+    // Tests make Roots' timings short (createRoots).
+    rootsTiming = {},
     // Tests make letting go of chats quick: { checkMs, idleMs }.
     releaseTiming = {},
     // Chromium from the image's browser bundle, installed on first use; a binary of its own instead in development and tests.
@@ -649,6 +653,8 @@ export async function startBridge(options) {
   // Batch jobs (jobs.js), once the agents are there.
   let jobs;
   let jobsServer;
+  // The project's map of ideas (roots.js), once the agents are there.
+  let roots;
   const uploads = createUploads({ workspace, fileOptions, maxBytes: uploadMaxBytes, log });
   const downloads = createDownloads({ fileOptions, log });
   const thumbnails = createThumbnails({
@@ -3944,7 +3950,9 @@ export async function startBridge(options) {
             files: { upload: { ...uploads.capability, folders: true }, download: downloads.capability },
             ...(slurmJobId ? { slurmJobId } : {}),
             // Batch jobs the agents may ask for (`_codeflower/jobs/*`).
-            ...(jobs ? { jobs: jobs.summary() } : {})
+            ...(jobs ? { jobs: jobs.summary() } : {}),
+            // The project's map of ideas (`_codeflower/roots/*`).
+            roots: true
           });
           break;
         }
@@ -4116,6 +4124,21 @@ export async function startBridge(options) {
           await browsers.browserOf(browserKey(params)).selectTab(params.targetId);
           respond({});
           break;
+        // Roots: the project's map of ideas, which the agents keep with codeflower-roots.
+        case '_codeflower/roots/list':
+          respond({ ...(roots ? roots.snapshot() : { ideas: [], errors: [] }), workspace });
+          break;
+        case '_codeflower/roots/update':
+        case '_codeflower/roots/comment': {
+          if (!roots) throw new InvalidRequest('This worker has no map of ideas yet');
+          try {
+            respond(message.method === '_codeflower/roots/update' ? { idea: await roots.update(params) } : await roots.comment(params));
+          } catch (error) {
+            if (error instanceof RootsRequestError) throw new InvalidRequest(error.message);
+            throw error;
+          }
+          break;
+        }
         // The project's batch jobs: those active and of the last day.
         case '_codeflower/jobs/list':
           respond({ jobs: jobs ? jobs.snapshot() : [], ...(jobs ? { summary: jobs.summary() } : {}) });
@@ -4325,6 +4348,21 @@ export async function startBridge(options) {
     log(`codeflower-browser is unavailable: ${error.message}`);
   }
 
+  // Roots: the windows get the map when it changes; the chat working on an
+  // idea is told of the user's comments on it.
+  roots = createRoots({
+    dir: rootsDir({ CODEFLOWER_WORKSPACE: workspace, CODEFLOWER_ROOTS_DIR: workerEnvironment.CODEFLOWER_ROOTS_DIR }),
+    changed: (snapshot) => {
+      for (const target of clients) {
+        if (target.agentName === undefined) target.send({ jsonrpc: '2.0', method: '_codeflower/roots/changed', params: snapshot });
+      }
+    },
+    tell: (chat, text, title, summary) => runtimes.get(chat.agent)?.tell(chat.sessionId, text, title, summary) ?? false,
+    keyOf: (agent, sessionId) => sessionKey(agent, sessionId),
+    log,
+    ...rootsTiming
+  });
+
   // codeflower-job: batch jobs, asked for in the chat its command runs in.
   if (jobsInfo && jobsSpool && privateDirectory) {
     jobs = createJobs({
@@ -4438,6 +4476,7 @@ export async function startBridge(options) {
       await browserServer?.close();
       await jobsServer?.close();
       jobs?.close();
+      roots?.close();
       await browsers.closeAll();
       await hookServer?.close();
       await commandsServer?.close();

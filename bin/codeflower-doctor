@@ -1,6 +1,6 @@
 #!/usr/local/bin/node --no-warnings
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, statfsSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statfsSync, writeFileSync } from 'node:fs';
 import { availableParallelism, freemem, totalmem } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -167,6 +167,22 @@ function batchJobs() {
   return lines;
 }
 
+// The project's map of ideas (codeflower-roots): how many, and where to start.
+// Here too since a project's AGENTS.md is copied once and may predate it.
+function roots() {
+  const dir = process.env.CODEFLOWER_ROOTS_DIR || join(process.env.CODEFLOWER_WORKSPACE || `${state}/workspace`, 'roots');
+  let count = 0;
+  try {
+    count = readdirSync(dir).filter((name) => /^\d+-.*\.md$/.test(name)).length;
+  } catch {}
+  return [
+    count
+      ? `- ${count} idea${count === 1 ? '' : 's'} in roots/: run \`codeflower-roots tree\` before starting work, and keep the ideas you work on current.`
+      : '- No ideas yet: start one with `codeflower-roots new` for the work you are about to do, even a first and only one.',
+    '- The user sees this map next to the chat and comments on ideas; follow the codeflower-roots skill.'
+  ];
+}
+
 function launchFacts() {
   const lines = [
     '# Sandbox environment at worker startup',
@@ -225,6 +241,7 @@ try {
     console.log('\n## Current allocation\n' + allocation().join('\n'));
     console.log('\n## Current resources\n' + resources().join('\n'));
     console.log('\n## Batch jobs\n' + batchJobs().join('\n'));
+    console.log('\n## Roots (the map of ideas)\n' + roots().join('\n'));
     if (process.env.CODEFLOWER_NETWORK === 'isolated') {
       console.log('\n## Current network allowlist');
       try {

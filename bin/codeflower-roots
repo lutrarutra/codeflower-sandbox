@@ -1,0 +1,380 @@
+#!/usr/local/bin/node
+// Roots: the project's map of analysis ideas. Each idea builds on others (or
+// starts from the data), has todos, needs, files and a conclusion, and the
+// chats that worked on it. The user sees the map next to the chat and comments
+// on ideas; the files are in the workspace's roots/ folder.
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { dirname, isAbsolute, relative, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+// The bridge's module: /opt/codeflower/acp-ws/src in the image, the plugin's
+// folder in the repository.
+const here = dirname(fileURLToPath(import.meta.url));
+const storePath = [resolve(here, '../acp-ws/src/roots-store.js'), resolve(here, '../dsh-plugins/acp-ws/src/roots-store.js')].find(existsSync);
+const { RootsError, STATUSES, change, create, needMet, readAll, rootsDir } = await import(storePath);
+
+const usage = `Usage: codeflower-roots COMMAND [ARGS...]
+
+Roots is this project's map of analysis ideas, which the user sees next to
+the chat. Every line of work is an idea: it builds on earlier ideas (--from)
+or starts from the data, and has todos, needs (other ideas or conditions),
+files it produced and a conclusion. Keep it current as you work.
+
+  tree                      the whole map: every idea, its status and what
+                            is open (start here)
+  show ID                   one idea in full, with the user's comments
+  new TITLE [OPTIONS]       a new idea; prints its id
+      --from ID[,ID]          the ideas it builds on (none: starts from the data)
+      --status STATUS         ${STATUSES.join(', ')} (default active; idea for one
+                              to try later)
+      --todo TEXT             a todo (repeatable)
+      --need ID|TEXT          an idea that must be done first, or a condition
+                              (repeatable)
+  update ID [--title TITLE] [--status STATUS] [--from ID[,ID]|none]
+  todo add ID TEXT...       add todos
+  todo check ID N...        mark todos done (N: their numbers in show)
+  todo uncheck ID N...
+  todo rm ID N...
+  need add ID ID|TEXT...    add needs: an idea's id (3 or #3), or a condition
+  need check ID N...        mark a condition met (an idea's need is met when
+                            that idea is done)
+  need uncheck ID N...
+  need rm ID N...
+  link ID PATH...           the files it produced: figures, scripts, reports,
+                            tables (--rm to remove)
+  conclude ID TEXT|--file F|-
+                            its conclusion, in Markdown: what it found, how
+                            sure, what it means for the next ideas; replaces
+                            the earlier one (--done also sets the status)
+  comment ID TEXT           answer the user's comments on an idea
+
+Add --json to tree, show and new for JSON. The chat that runs a command is
+recorded on the idea.`;
+
+const EXIT = { invalid: 2, unknown: 2, busy: 1 };
+
+// Throws rather than exits, so a failure inside a change still releases the lock.
+function fail(message, code = 2) {
+  throw Object.assign(new Error(message), { exitCode: code });
+}
+
+// Options: --name value or --name=value; flags; positional arguments.
+function parse(args, { values = [], lists = [], flags = [] } = {}) {
+  const options = Object.fromEntries(lists.map((name) => [name, []]));
+  const rest = [];
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === '--') {
+      rest.push(...args.slice(index + 1));
+      break;
+    }
+    if (!arg.startsWith('--') || arg === '-') {
+      rest.push(arg);
+      continue;
+    }
+    const [name, inline] = arg.slice(2).split(/=(.*)/s);
+    if (flags.includes(name)) {
+      options[name] = true;
+      continue;
+    }
+    if (!values.includes(name) && !lists.includes(name)) fail(`unknown option --${name}\n\n${usage}`);
+    const value = inline ?? args[++index];
+    if (value === undefined) fail(`--${name} needs a value.`);
+    if (lists.includes(name)) options[name].push(value);
+    else options[name] = value;
+  }
+  return { options, rest };
+}
+
+function id(text) {
+  const value = Number(String(text ?? '').replace(/^#/, ''));
+  if (!Number.isInteger(value) || value < 1) fail(`${text === undefined ? 'an idea id is missing' : `"${text}" is not an idea id`}`);
+  return value;
+}
+
+function ids(text) {
+  if (text === 'none' || text === '') return [];
+  return String(text)
+    .split(',')
+    .map((part) => id(part.trim()));
+}
+
+function status(text) {
+  if (!STATUSES.includes(text)) fail(`status must be one of ${STATUSES.join(', ')}`);
+  return text;
+}
+
+// A need: an idea's id (3 or #3), or a condition.
+function need(text) {
+  return /^#?\d+$/.test(text.trim()) ? { idea: id(text.trim()) } : { text, met: false };
+}
+
+// Item numbers as show prints them (from 1), highest first so removing keeps
+// the others' numbers.
+function numbers(args, list, what) {
+  if (!args.length) fail(`which ${what}? Give their numbers, as \`codeflower-roots show\` lists them.`);
+  const result = args.map((arg) => {
+    const value = Number(arg);
+    if (!Number.isInteger(value) || value < 1 || value > list.length) fail(`there is no ${what} ${arg} (this idea has ${list.length})`);
+    return value - 1;
+  });
+  return [...new Set(result)].sort((a, b) => b - a);
+}
+
+const chat = {
+  agent: process.env.CODEFLOWER_AGENT_NAME || undefined,
+  // What the agents export to their commands: the chat's session id.
+  sessionId: process.env.CLAUDE_CODE_SESSION_ID || process.env.CODEX_THREAD_ID || undefined
+};
+const dir = rootsDir();
+const workspace = process.env.CODEFLOWER_WORKSPACE || dirname(dir);
+
+// A file as the idea keeps it: relative to the workspace when inside it.
+function filePath(text) {
+  const real = (path) => {
+    try {
+      return realpathSync(path);
+    } catch {
+      return resolve(path);
+    }
+  };
+  const absolute = real(text);
+  const inside = relative(real(workspace), absolute);
+  return inside && !inside.startsWith('..') && !isAbsolute(inside) ? inside : absolute;
+}
+
+const plural = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
+
+function summary(idea, byId) {
+  const parts = [];
+  if (idea.todos.length) parts.push(`todos ${idea.todos.filter((todo) => todo.done).length}/${idea.todos.length}`);
+  const unmet = idea.needs.filter((item) => !needMet(item, byId));
+  if (unmet.length) parts.push(`needs ${unmet.map((item) => (item.idea ? `#${item.idea}` : JSON.stringify(item.text))).join(', ')}`);
+  const comments = userComments(idea);
+  if (comments.length) parts.push(`${plural(comments.length, 'comment')} from the user`);
+  if (idea.files.length) parts.push(plural(idea.files.length, 'file'));
+  if (idea.conclusion) parts.push('concluded');
+  return parts.length ? `  (${parts.join('; ')})` : '';
+}
+
+// The user's comments after the agents' last answer on the idea.
+function userComments(idea) {
+  const last = idea.comments.findLastIndex((comment) => comment.by !== 'user');
+  return idea.comments.slice(last + 1).filter((comment) => comment.by === 'user');
+}
+
+function tree({ json }) {
+  const { ideas, errors } = readAll(dir);
+  if (json) return console.log(JSON.stringify({ ideas, errors }, null, 2));
+  if (!ideas.length && !errors.length) {
+    console.log('No ideas yet. Start one for the work you are about to do: codeflower-roots new "TITLE" --todo "…"');
+    return;
+  }
+  const byId = new Map(ideas.map((idea) => [idea.id, idea]));
+  // Each idea sits under the first idea it builds on; elsewhere it is named.
+  const children = new Map();
+  const origins = [];
+  for (const idea of ideas) {
+    const parents = idea.from.filter((parent) => byId.has(parent));
+    if (!parents.length) origins.push(idea);
+    for (const parent of parents) {
+      if (!children.has(parent)) children.set(parent, []);
+      children.get(parent).push({ idea, primary: parent === parents[0] });
+    }
+  }
+  const lines = [];
+  const shown = new Set();
+  const line = (idea, prefix, branch) => {
+    shown.add(idea.id);
+    return `${prefix}${branch}#${idea.id} [${idea.status}] ${idea.title}${summary(idea, byId)}`;
+  };
+  const walk = (idea, prefix) => {
+    const kids = children.get(idea.id) ?? [];
+    kids.forEach(({ idea: kid, primary }, index) => {
+      const last = index === kids.length - 1;
+      if (primary) {
+        lines.push(line(kid, prefix, last ? '└─ ' : '├─ '));
+        walk(kid, prefix + (last ? '   ' : '│  '));
+      } else {
+        lines.push(`${prefix}${last ? '└─ ' : '├─ '}#${kid.id} ${kid.title} (also builds on #${kid.from[0]}, shown there)`);
+      }
+    });
+  };
+  for (const origin of origins) {
+    lines.push(line(origin, '', ''));
+    walk(origin, '');
+  }
+  // Ideas edited by hand to build on each other in a circle have no origin.
+  const circle = ideas.filter((idea) => !shown.has(idea.id));
+  if (circle.length) {
+    lines.push('', `In a circle (each builds on another; fix their from:): ${circle.map((idea) => `#${idea.id} ${idea.title}`).join(', ')}`);
+  }
+  console.log(lines.join('\n'));
+  for (const error of errors) console.log(`\nroots/${error.file} cannot be read: ${error.error}`);
+  const waiting = ideas.filter((idea) => userComments(idea).length);
+  if (waiting.length) console.log(`\nThe user commented on ${waiting.map((idea) => `#${idea.id}`).join(', ')}: read them with codeflower-roots show ID.`);
+}
+
+function show(ideaId, { json }) {
+  const { ideas, errors } = readAll(dir);
+  const idea = ideas.find((other) => other.id === ideaId);
+  if (!idea) {
+    const broken = errors.find((error) => error.file.startsWith(`${String(ideaId).padStart(3, '0')}-`));
+    fail(broken ? `roots/${broken.file} cannot be read: ${broken.error}` : `there is no idea ${ideaId}`);
+  }
+  if (json) return console.log(JSON.stringify(idea, null, 2));
+  const byId = new Map(ideas.map((other) => [other.id, other]));
+  const name = (other) => `#${other} ${byId.get(other)?.title ?? '(missing)'}`;
+  const out = [`#${idea.id} ${idea.title} [${idea.status}]`, `File: roots/${idea.file}`];
+  out.push(idea.from.length ? `Builds on: ${idea.from.map(name).join('; ')}` : 'Builds on: nothing, it starts from the data');
+  const kids = ideas.filter((other) => other.from.includes(idea.id));
+  if (kids.length) out.push(`Leads to: ${kids.map((kid) => name(kid.id)).join('; ')}`);
+  const numbered = (items, render) => items.map((item, index) => `  ${index + 1}. ${render(item)}`);
+  if (idea.todos.length) out.push('', 'Todos:', ...numbered(idea.todos, (todo) => `[${todo.done ? 'x' : ' '}] ${todo.text}`));
+  if (idea.needs.length) {
+    out.push('', 'Needs:', ...numbered(idea.needs, (item) =>
+      `[${needMet(item, byId) ? 'x' : ' '}] ${item.idea ? `${name(item.idea)} (${byId.get(item.idea)?.status ?? 'missing'})` : item.text}`));
+  }
+  if (idea.files.length) out.push('', 'Files:', ...idea.files.map((file) => `  ${file}`));
+  if (idea.chats.length) {
+    out.push('', 'Chats:', ...idea.chats.map((entry) => `  ${entry.agent ?? 'agent'}${entry.sessionId ? ` ${entry.sessionId}` : ''}, last ${entry.at}`));
+  }
+  if (idea.comments.length) {
+    out.push('', 'Comments:', ...idea.comments.map((comment) => `  ${comment.by === 'user' ? 'user' : comment.agent ?? 'agent'}, ${comment.at}: ${comment.text}`));
+    if (userComments(idea).length) out.push('  (answer with codeflower-roots comment, and act on them)');
+  }
+  out.push('', 'Conclusion:', idea.conclusion ? idea.conclusion.replace(/^/gm, '  ') : '  (none yet)');
+  console.log(out.join('\n'));
+}
+
+function done(idea, what) {
+  console.log(`#${idea.id} ${idea.title}: ${what}`);
+}
+
+function readText(args, options) {
+  if (options.file) return readFileSync(options.file, 'utf8');
+  if (args.length === 1 && args[0] === '-') return readFileSync(0, 'utf8');
+  if (!args.length) fail('give the text, --file FILE, or - to read it from standard input');
+  return args.join(' ');
+}
+
+function main(argv) {
+  const [command, ...args] = argv;
+  if (!command || command === '--help' || command === '-h' || command === 'help') {
+    console.log(usage);
+    return;
+  }
+  switch (command) {
+    case 'tree':
+    case 'list': {
+      const { options } = parse(args, { flags: ['json'] });
+      return tree(options);
+    }
+    case 'show': {
+      const { options, rest } = parse(args, { flags: ['json'] });
+      return show(id(rest[0]), options);
+    }
+    case 'new': {
+      const { options, rest } = parse(args, { values: ['from', 'status'], lists: ['todo', 'need'], flags: ['json'] });
+      const title = rest.join(' ').trim();
+      if (!title) fail('give the idea a title: codeflower-roots new "TITLE"');
+      const idea = create(dir, {
+        title,
+        status: options.status ? status(options.status) : 'active',
+        from: options.from ? ids(options.from) : [],
+        todos: options.todo.map((text) => ({ text, done: false })),
+        needs: options.need.map(need)
+      }, { chat });
+      if (options.json) console.log(JSON.stringify(idea, null, 2));
+      else console.log(`#${idea.id} ${idea.title} (roots/${idea.file})`);
+      return;
+    }
+    case 'update': {
+      const { options, rest } = parse(args, { values: ['title', 'status', 'from'] });
+      const target = id(rest[0]);
+      if (options.title === undefined && options.status === undefined && options.from === undefined) fail('give --title, --status or --from');
+      const idea = change(dir, target, (idea) => {
+        if (options.title !== undefined) {
+          if (!options.title.trim()) fail('the title cannot be empty');
+          idea.title = options.title.trim();
+        }
+        if (options.status !== undefined) idea.status = status(options.status);
+        if (options.from !== undefined) idea.from = ids(options.from);
+      }, { chat });
+      return done(idea, 'updated');
+    }
+    case 'todo':
+    case 'need': {
+      const [action, target, ...items] = args;
+      const list = command === 'todo' ? 'todos' : 'needs';
+      const what = command;
+      if (!['add', 'check', 'uncheck', 'rm'].includes(action)) fail(`${command} add|check|uncheck|rm ID ...`);
+      if (!items.length) fail(action === 'add' ? `what ${what} to add?` : `which ${what}s? Give their numbers.`);
+      const idea = change(dir, id(target), (idea) => {
+        if (action === 'add') {
+          idea[list].push(...items.map((text) => (command === 'todo' ? { text, done: false } : need(text))));
+          return;
+        }
+        for (const index of numbers(items, idea[list], what)) {
+          if (action === 'rm') idea[list].splice(index, 1);
+          else if (command === 'todo') idea.todos[index].done = action === 'check';
+          else if (idea.needs[index].idea !== undefined) fail(`need ${index + 1} is idea #${idea.needs[index].idea}: it is met when that idea is done`);
+          else idea.needs[index].met = action === 'check';
+        }
+      }, { chat });
+      const label = { add: 'added', check: 'checked', uncheck: 'unchecked', rm: 'removed' }[action];
+      return done(idea, `${plural(items.length, what)} ${label}`);
+    }
+    case 'link': {
+      const { options, rest } = parse(args, { flags: ['rm'] });
+      const [target, ...paths] = rest;
+      if (!paths.length) fail('which files? codeflower-roots link ID PATH...');
+      const files = paths.map((path) => {
+        const kept = filePath(path);
+        if (!options.rm && !existsSync(resolve(path))) fail(`${path} does not exist`);
+        return kept;
+      });
+      const idea = change(dir, id(target), (idea) => {
+        if (options.rm) {
+          const missing = files.filter((file) => !idea.files.includes(file) && !idea.files.includes(paths[files.indexOf(file)]));
+          if (missing.length) fail(`not linked: ${missing.join(', ')}`);
+          idea.files = idea.files.filter((file) => !files.includes(file) && !paths.includes(file));
+        } else {
+          for (const file of files) if (!idea.files.includes(file)) idea.files.push(file);
+        }
+      }, { chat });
+      return done(idea, options.rm ? `${plural(files.length, 'file')} unlinked` : `${plural(idea.files.length, 'file')} linked`);
+    }
+    case 'conclude': {
+      const { options, rest } = parse(args, { values: ['file'], flags: ['done'] });
+      const [target, ...words] = rest;
+      const ideaId = id(target);
+      const text = readText(words, options).trim();
+      if (!text) fail('the conclusion is empty');
+      const idea = change(dir, ideaId, (idea) => {
+        idea.conclusion = text;
+        if (options.done) idea.status = 'done';
+      }, { chat });
+      return done(idea, options.done ? 'concluded and done' : 'concluded');
+    }
+    case 'comment': {
+      const [target, ...words] = args;
+      const text = words.join(' ').trim();
+      if (!text) fail('what is the comment?');
+      const idea = change(dir, id(target), (idea) => {
+        idea.comments.push({ by: 'agent', ...(chat.agent ? { agent: chat.agent } : {}), text, at: new Date().toISOString() });
+      }, { chat });
+      return done(idea, 'commented');
+    }
+    default:
+      fail(`unknown command ${command}\n\n${usage}`);
+  }
+}
+
+try {
+  main(process.argv.slice(2));
+} catch (error) {
+  const known = error.exitCode !== undefined || error instanceof RootsError;
+  console.error(`codeflower-roots: ${known ? error.message : error.stack ?? error}`);
+  process.exitCode = error.exitCode ?? (error instanceof RootsError ? EXIT[error.code] ?? 2 : 1);
+}
