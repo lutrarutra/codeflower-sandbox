@@ -6,7 +6,7 @@
 # Claude ACP adapter pins in package-lock.json; the build checks that.
 ARG CLAUDE_AGENT_SDK_VERSION=0.3.330
 # codeflower-audit, for paper audits (the audit stage below).
-ARG CODEFLOWER_AUDIT_VERSION=v0.2.0
+ARG CODEFLOWER_AUDIT_VERSION=v0.3.0
 
 FROM node:24-bookworm-slim@sha256:873f586f3794f52281bd039bf02c048a0be08fde619338f9941bad1eb6b34530 AS dsh-runtime
 ARG CLAUDE_AGENT_SDK_VERSION
@@ -49,7 +49,7 @@ COPY dsh-plugins/acp-ws/src ./src
 # installs a copy in the project, editable). Pinned by tag; a development build
 # uses the workspace checkout instead: --build-context storyteller=../storyteller.
 FROM scratch AS storyteller
-ADD --keep-git-dir=false https://github.com/lutrarutra/storyteller.git#v0.7.0 /
+ADD --keep-git-dir=false https://github.com/lutrarutra/storyteller.git#v0.7.1 /
 
 # codeflower-audit, for paper audits: the command that checks, scores, seals and
 # verifies them (the same module the app's `codeflower audit` requires), the
@@ -257,9 +257,12 @@ COPY --from=dsh-runtime /opt/codeflower/acp-ws /opt/codeflower/acp-ws
 COPY --from=storyteller / /opt/codeflower/src/storyteller
 COPY --from=page / /opt/codeflower/page
 # python-pptx (with lxml, XlsxWriter, typing-extensions) and pypdfium2 are for its decks.
+# playwright (with greenlet, pyee) is for `storyteller pdf`, which an audit runs to seal its report as a
+# PDF; it drives the browser codeflower-browser installs (CODEFLOWER_BROWSER_BIN) and downloads none.
 RUN pip install --no-cache-dir pillow==13.0.0 markdown-it-py==4.2.0 mdurl==0.1.2 hatchling==1.33.0 editables==0.6 pygments==2.21.0 \
         python-pptx==1.0.2 lxml==6.1.3 XlsxWriter==3.3.1 typing-extensions==4.16.0 pypdfium2==5.14.0 \
-    && python -c "import sys; sys.path.insert(0, '/opt/codeflower/src/storyteller/src'); import storyteller, storyteller.deck"
+        playwright==1.64.1 greenlet==3.5.6 pyee==14.0.0 \
+    && python -c "import sys; sys.path.insert(0, '/opt/codeflower/src/storyteller/src'); import storyteller, storyteller.deck, storyteller.pdf, playwright.sync_api"
 
 COPY entrypoint.sh reproduce.sh job.sh /opt/codeflower/
 COPY lib /opt/codeflower/lib
