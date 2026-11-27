@@ -227,6 +227,8 @@ function watches() {
   }
   return [
     '- `codeflower-watch start --every TIME --until COND -- COMMAND` runs COMMAND now and every TIME until COND holds, and you get a message when it ends; end your turn meanwhile rather than waiting in a sleep loop.',
+    '- Give `--fail match:REGEX` for what a failure prints, so a job that died does not read as `not yet`; check the `Runs with sh -c:` line and the first run\'s output.',
+    '- Long jobs you start: run them with your shell tool\'s background option (Claude Code: a `timeout` up to 7 days), not `nohup … &`, so you hear when they exit. To wait for a process you did not start that way, `--pid PID` ends the watch when it does.',
     '- `codeflower-watch list`, `show ID`, `logs ID` and `stop ID`. Follow the codeflower-watch skill.'
   ];
 }

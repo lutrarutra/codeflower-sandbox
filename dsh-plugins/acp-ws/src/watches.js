@@ -22,8 +22,13 @@ import {
   VERDICT_TEXT,
   WatchError,
   MAX_TIMEOUT_MS,
+  PID_CHECK_MS,
+  followedProcesses,
   formatDuration,
+  misuseOf,
+  processAlive,
   parseDuration,
+  parseFail,
   parseUntil,
   readStart,
   readWait,
@@ -48,6 +53,8 @@ const RUN_LOG_CHARS = 256 * 1024;
 const LOG_BYTES = 1024 * 1024;
 // Of the last output, the notice quotes at most this much.
 const NOTICE_OUTPUT_CHARS = 4 * 1024;
+// Of a run's stderr, kept apart (also in its output) for the first run's check.
+const STDERR_CHARS = 8 * 1024;
 // Runs remembered per watch for `show`.
 const RUNS_KEPT = 20;
 
@@ -58,6 +65,8 @@ const tail = (text, chars) => (text.length > chars ? `…${text.slice(-chars)}` 
 
 const STATE_TEXT = {
   met: 'its condition was met',
+  failed: 'what it watched failed',
+  exited: 'the processes it followed ended (their exit status is not known to the watch: read the output)',
   timeout: 'it timed out before its condition was met',
   failing: 'its command failed',
   stopped: 'the user stopped it',
@@ -75,10 +84,10 @@ export function endNotice(watches) {
     return [
       `- ${watch.name} (${watch.id}): ${watch.state}, ${how} (${ran}).`,
       `  Command: ${watch.command}`,
-      `  Until: ${untilText(watch.until)}, every ${formatDuration(watch.every)}`,
+      `  Until: ${untilText(watch.until)}${watch.fail ? `, fail: ${untilText(watch.fail)}` : ''}${watch.pids?.length ? `, while process ${watch.pids.join(', ')} runs` : ''}, every ${formatDuration(watch.every)}`,
       `  ${last}`,
       `  All its output: ${watch.log} (codeflower-watch logs ${watch.id})`,
-      ...(watch.state === 'met' ? [] : [`  Still worth waiting for? \`codeflower-watch rearm ${watch.id} [--timeout TIME]\` restarts it as it was${watch.state === 'failing' ? ', once you fixed what failed' : ''}.`]),
+      ...(watch.state === 'met' || watch.state === 'exited' ? [] : [`  Still worth waiting for? \`codeflower-watch rearm ${watch.id} [--timeout TIME]\` restarts it as it was${watch.state === 'failing' || watch.state === 'failed' ? ', once you fixed what failed' : ''}.`]),
       ...(watch.ideas ?? []).map((idea) =>
         watch.state === 'met'
           ? `  Roots: idea #${idea.id} ${idea.title} had it as a need, now met${idea.unblocked ? '; the idea is active again' : idea.status === 'blocked' ? '; the idea is still blocked by other needs' : ''}.`
@@ -105,6 +114,8 @@ function publicOf(watch) {
     cwd: watch.cwd,
     every: watch.every,
     until: untilText(watch.until),
+    ...(watch.fail ? { fail: untilText(watch.fail) } : {}),
+    ...(watch.pids?.length ? { pids: watch.pids.map(({ pid }) => pid) } : {}),
     timeout: watch.timeout,
     state: watch.state,
     running: Boolean(watch.child),
@@ -124,6 +135,16 @@ function publicOf(watch) {
     ...(watch.key ? { key: watch.key } : {})
   };
 }
+
+/** What the command gets of a run: its exit status, verdict, output and stderr (both their end). */
+const runAnswer = (result) => ({
+  exitCode: result.exitCode,
+  verdict: result.verdict,
+  output: tail(result.output, 8 * 1024),
+  ...(result.stderr?.trim() ? { stderr: tail(result.stderr, 4 * 1024) } : {}),
+  ...(result.misuse ? { misuse: result.misuse } : {}),
+  ...(result.timedOut ? { timedOut: true } : {})
+});
 
 function stopChild(child, graceMs) {
   try {
@@ -164,7 +185,8 @@ export function createWatches({
   minEveryMs = MIN_EVERY_MS,
   runTimeoutMs = RUN_TIMEOUT_MS,
   noticeDelayMs = NOTICE_DELAY_MS,
-  killGraceMs = KILL_GRACE_MS
+  killGraceMs = KILL_GRACE_MS,
+  pidCheckMs = PID_CHECK_MS
 }) {
   const watches = new Map();
   const notices = new Map();
@@ -243,7 +265,7 @@ export function createWatches({
       entry.timer.unref?.();
       notices.set(key, entry);
     }
-    entry.watches.push({ ...publicOf(watch), until: watch.until, lastOutput: watch.lastOutput, ideas: watch.ideas });
+    entry.watches.push({ ...publicOf(watch), until: watch.until, fail: watch.fail, lastOutput: watch.lastOutput, ideas: watch.ideas });
   };
 
   // Ends a watch. notify: false when whoever ended it already knows (the
@@ -256,6 +278,7 @@ export function createWatches({
     delete watch.nextRun;
     clearTimeout(watch.timer);
     clearTimeout(watch.deadlineTimer);
+    clearInterval(watch.pidTimer);
     const line = `\n── ${state}${reason ? `: ${reason}` : ''} · ${stamp(Date.now())} ──\n`;
     if (watch.child) {
       watch.endLine = line;
@@ -275,6 +298,7 @@ export function createWatches({
   const execute = (watch) =>
     new Promise((resolve) => {
       let output = '';
+      let stderr = '';
       let logged = 0;
       let timedOut = false;
       let done = false;
@@ -283,7 +307,7 @@ export function createWatches({
         done = true;
         clearTimeout(timer);
         watch.child = undefined;
-        resolve({ exitCode, output: output.slice(-LAST_OUTPUT_CHARS), timedOut });
+        resolve({ exitCode, output: output.slice(-LAST_OUTPUT_CHARS), stderr: stderr.slice(-STDERR_CHARS), timedOut });
       };
       let child;
       try {
@@ -308,10 +332,12 @@ export function createWatches({
           void write(watch, logged >= RUN_LOG_CHARS ? `${part}\n(the rest of this run's output is left out of the log)\n` : part);
         }
       };
-      for (const stream of [child.stdout, child.stderr]) {
-        stream.setEncoding('utf8');
-        stream.on('data', take);
-      }
+      for (const stream of [child.stdout, child.stderr]) stream.setEncoding('utf8');
+      child.stdout.on('data', take);
+      child.stderr.on('data', (text) => {
+        if (stderr.length < STDERR_CHARS * 2) stderr += text;
+        take(text);
+      });
       const timer = setTimeout(() => {
         timedOut = true;
         stopChild(child, killGraceMs);
@@ -325,15 +351,16 @@ export function createWatches({
     });
 
   // One run; the run going on is `watch.current`, which a check asked meanwhile waits for.
-  const runOnce = (watch) => {
-    const run = runNow(watch).finally(() => {
+  const runOnce = (watch, options) => {
+    const run = runNow(watch, options).finally(() => {
       if (watch.current === run) delete watch.current;
     });
     watch.current = run;
     return run;
   };
 
-  const runNow = async (watch) => {
+  // first: the run that starts or re-arms it, whose stderr must not say that the command is wrong.
+  const runNow = async (watch, { first = false } = {}) => {
     const number = ++watch.runs;
     const startedAt = Date.now();
     delete watch.nextRun;
@@ -341,7 +368,8 @@ export function createWatches({
     const running = execute(watch);
     emit();
     const result = await running;
-    const verdict = verdictOf(watch.until, result, watch.baseline);
+    const misuse = first ? misuseOf(result.stderr) : undefined;
+    const verdict = misuse ? 'error' : verdictOf(watch.until, result, watch.baseline, watch.fail);
     if (watch.until.kind === 'change' && watch.baseline === undefined && verdict !== 'error') watch.baseline = result.output;
     const ms = Date.now() - startedAt;
     watch.lastOutput = result.output;
@@ -350,18 +378,18 @@ export function createWatches({
     if (watch.history.length > RUNS_KEPT) watch.history.shift();
     watch.failures = verdict === 'error' ? watch.failures + 1 : 0;
     const exit = result.timedOut ? `stopped after ${formatDuration(runTimeoutMs)}` : `exit ${result.exitCode}`;
-    void write(watch, `${result.output && !result.output.endsWith('\n') ? '\n' : ''}── ${exit} · ${VERDICT_TEXT[verdict]} · ${formatDuration(ms)} ──\n`);
+    void write(watch, `${result.output && !result.output.endsWith('\n') ? '\n' : ''}── ${exit} · ${VERDICT_TEXT[verdict]}${misuse ? ` (its stderr says the command is wrong: ${misuse})` : ''} · ${formatDuration(ms)} ──\n`);
     if (watch.endLine) {
       void write(watch, watch.endLine);
       delete watch.endLine;
     }
     trim(watch);
     if (!FINAL.has(watch.state)) void save(watch);
-    return { ...result, verdict };
+    return { ...result, verdict, ...(misuse ? { misuse } : {}) };
   };
 
   const schedule = (watch) => {
-    if (closed || FINAL.has(watch.state)) return;
+    if (closed || FINAL.has(watch.state) || watch.ending) return;
     watch.nextRun = iso(Date.now() + watch.every);
     watch.timer = setTimeout(() => void tick(watch), watch.every);
     watch.timer.unref?.();
@@ -378,9 +406,55 @@ export function createWatches({
   const afterRun = (watch, result, { notify = true } = {}) => {
     if (FINAL.has(watch.state)) return;
     if (result.verdict === 'met') finish(watch, 'met', { notify });
+    else if (result.verdict === 'failed') finish(watch, 'failed', { reason: failReason(watch), notify });
     else if (watch.failures >= MAX_FAILURES) {
       finish(watch, 'failing', { reason: `${MAX_FAILURES} runs in a row failed (exit ${result.exitCode}${result.timedOut ? ', timed out' : ''})`, notify });
     } else schedule(watch);
+  };
+
+  const failReason = (watch) => `its output matched ${untilText(watch.fail)}`;
+
+  // --pid: every pidCheckMs (not only at its runs), whether its processes still run. When none
+  // does, the command runs once more, for the output at the end, and the watch ends: failed or
+  // met if that run says so, else exited.
+  const followPids = (watch) => {
+    clearInterval(watch.pidTimer);
+    if (!watch.pids?.length || FINAL.has(watch.state)) return;
+    watch.pidTimer = setInterval(() => void checkPids(watch), pidCheckMs);
+    watch.pidTimer.unref?.();
+  };
+
+  const checkPids = async (watch) => {
+    if (closed || FINAL.has(watch.state) || watch.ending || !watch.pids?.length) return;
+    if (watch.pids.some(({ pid, start }) => processAlive(pid, start))) return;
+    watch.ending = true;
+    clearInterval(watch.pidTimer);
+    clearTimeout(watch.timer);
+    delete watch.nextRun;
+    try {
+      if (watch.current) await watch.current;
+      if (FINAL.has(watch.state)) return;
+      const which = watch.pids.map(({ pid }) => pid).join(', ');
+      void write(watch, `\n── process ${which} ended: one last run ──\n`);
+      const result = await runOnce(watch);
+      if (FINAL.has(watch.state)) return;
+      if (result.verdict === 'failed') finish(watch, 'failed', { reason: failReason(watch) });
+      else if (result.verdict === 'met') finish(watch, 'met');
+      else finish(watch, 'exited', { reason: `process ${which} ended` });
+    } finally {
+      delete watch.ending;
+    }
+  };
+
+  // How the first run (of a start or a re-arm) ends the watch, if it does: met or failed at once, or an error.
+  const afterFirst = (watch, first) => {
+    if (FINAL.has(watch.state)) return true;
+    if (first.verdict === 'met') finish(watch, 'met', { notify: false });
+    else if (first.verdict === 'failed') finish(watch, 'failed', { reason: failReason(watch), notify: false });
+    else if (first.verdict === 'error') {
+      finish(watch, 'failing', { reason: first.misuse ? `the first run's stderr says the command is wrong: ${first.misuse}` : 'the first run failed', notify: false });
+    } else return false;
+    return true;
   };
 
   /**
@@ -470,6 +544,7 @@ export function createWatches({
   const start = async (chat, request, signal) => {
     if (!chat) throw new WatchError("A watch tells the chat it runs for, and this command's chat is not known: run codeflower-watch in a chat's turn");
     const spec = readStart(request, { minEveryMs });
+    const pids = followedProcesses(spec.pids);
     const idea = readIdea(request.idea);
     const sessionId = chat.parent ?? chat.sessionId;
     const active = [...watches.values()].filter((watch) => ofChat(chat, watch) && !FINAL.has(watch.state)).length;
@@ -485,6 +560,8 @@ export function createWatches({
       cwd: await usableFolder(request.cwd),
       every: spec.every,
       until: spec.until,
+      ...(spec.fail ? { fail: spec.fail } : {}),
+      ...(pids.length ? { pids } : {}),
       timeout: spec.timeout,
       state: 'watching',
       runs: 0,
@@ -501,24 +578,21 @@ export function createWatches({
       waiters: new Set(),
       writing: Promise.resolve()
     };
-    await writeFile(watch.log, `codeflower-watch ${watch.name}: ${watch.command}\nevery ${formatDuration(watch.every)} until ${untilText(watch.until)}, for at most ${formatDuration(watch.timeout)}\n\n`);
+    await writeFile(watch.log, `codeflower-watch ${watch.name}: ${watch.command}\nevery ${formatDuration(watch.every)} until ${untilText(watch.until)}${watch.fail ? `, failed on ${untilText(watch.fail)}` : ''}, for at most ${formatDuration(watch.timeout)}\n\n`);
     watches.set(id, watch);
     arm(watch, now);
     log(`${watch.key ?? sessionId} started watch ${id} (${watch.name}), every ${formatDuration(watch.every)} until ${untilText(watch.until)}`);
 
     // The first run, at once: the caller sees its output and whether it reads as meant.
-    const first = await runOnce(watch);
+    const first = await runOnce(watch, { first: true });
     // (Unless a window stopped it meanwhile.)
-    if (!FINAL.has(watch.state)) {
-      if (first.verdict === 'met') finish(watch, 'met', { notify: false });
-      else if (first.verdict === 'error') finish(watch, 'failing', { reason: 'the first run failed', notify: false });
-      else {
-        // It waits: the idea it is for needs it (only now, so a watch that ends at once leaves no need).
-        if (idea !== undefined) linkIdea(chat, watch, idea);
-        schedule(watch);
-      }
+    if (!afterFirst(watch, first)) {
+      // It waits: the idea it is for needs it (only now, so a watch that ends at once leaves no need).
+      if (idea !== undefined) linkIdea(chat, watch, idea);
+      schedule(watch);
+      followPids(watch);
     }
-    const run = { exitCode: first.exitCode, verdict: first.verdict, output: tail(first.output, 8 * 1024), ...(first.timedOut ? { timedOut: true } : {}) };
+    const run = runAnswer(first);
     if (!spec.wait || FINAL.has(watch.state)) return { ok: true, watch: publicOf(watch), run };
     const waited = await waitFor(watch, spec.wait, signal);
     return { ok: true, watch: publicOf(watch), run, waited, ...(FINAL.has(watch.state) ? { output: tail(watch.lastOutput, 8 * 1024) } : {}) };
@@ -542,6 +616,7 @@ export function createWatches({
     if (!chat) throw new WatchError("A watch tells the chat it runs for, and this command's chat is not known: run codeflower-watch in a chat's turn");
     const watch = find(chat, request.id);
     if (watch.state === 'met') throw new WatchError(`${watch.name} ended with its condition met: start a new watch to wait for something else`);
+    if (watch.state === 'exited') throw new WatchError(`${watch.name} ended with the processes it followed: start a new watch (with the new --pid) to follow others`);
     // Every option checked before anything changes.
     const timeout = request.timeout === undefined ? undefined : parseDuration(request.timeout);
     if (request.timeout !== undefined && !timeout) throw new WatchError(`--timeout does not read: ${request.timeout} (e.g. 2h, 3d)`);
@@ -551,9 +626,11 @@ export function createWatches({
     if (request.every !== undefined && !every) throw new WatchError(`--every does not read: ${request.every} (e.g. 30s, 5m, 1h)`);
     if (every !== undefined && every < minEveryMs) throw new WatchError(`--every is at least ${formatDuration(minEveryMs)}`);
     const until = request.until === undefined ? undefined : parseUntil(request.until);
+    const fail = request.fail === undefined ? undefined : parseFail(request.fail);
     if (timeout !== undefined) watch.timeout = timeout;
     if (every !== undefined) watch.every = every;
     if (until) watch.until = until;
+    if (fail) watch.fail = fail;
     // --reset (or a new condition): no errors counted, and `change` compares with the next run.
     if (request.reset || until) {
       watch.failures = 0;
@@ -566,6 +643,7 @@ export function createWatches({
     const changes = [
       every !== undefined ? `every ${formatDuration(watch.every)}` : '',
       until ? `until ${untilText(watch.until)}` : '',
+      fail ? `fail on ${untilText(watch.fail)}` : '',
       request.reset || until ? 'reset' : ''
     ].filter(Boolean);
     if (watch.state === 'watching') {
@@ -600,14 +678,20 @@ export function createWatches({
       }
     }
     log(`${watch.key ?? sessionId} re-armed watch ${watch.id} (${watch.name}) for ${formatDuration(watch.timeout)}`);
-    const first = await runOnce(watch);
+    const first = await runOnce(watch, { first: true });
     if (!FINAL.has(watch.state)) {
       if (first.verdict === 'met') finish(watch, 'met', { notify: false });
+      else if (first.verdict === 'failed') finish(watch, 'failed', { reason: failReason(watch), notify: false });
+      else if (first.misuse) finish(watch, 'failing', { reason: `the first run's stderr says the command is wrong: ${first.misuse}`, notify: false });
       else if (watch.failures >= MAX_FAILURES) finish(watch, 'failing', { reason: `${MAX_FAILURES} runs in a row failed`, notify: false });
-      else schedule(watch);
+      else {
+        schedule(watch);
+        // Its processes may have ended meanwhile: then it ends now.
+        followPids(watch);
+        void checkPids(watch);
+      }
     }
-    const run = { exitCode: first.exitCode, verdict: first.verdict, output: tail(first.output, 8 * 1024), ...(first.timedOut ? { timedOut: true } : {}) };
-    return { ok: true, watch: publicOf(watch), run };
+    return { ok: true, watch: publicOf(watch), run: runAnswer(first) };
   };
 
   const stop = (id, by = 'user') => {
@@ -642,6 +726,7 @@ export function createWatches({
       const watch = {
         ...record,
         until: { kind: 'exit' },
+        ...(Array.isArray(record.pids) ? { pids: record.pids.map((pid) => ({ pid })) } : {}),
         folder,
         history: [],
         waiters: new Set(),
@@ -650,6 +735,7 @@ export function createWatches({
       };
       try {
         watch.until = parseUntil(record.until);
+        watch.fail = parseFail(record.fail);
       } catch {
         // An old condition that no longer reads: it is only shown.
       }
@@ -685,8 +771,7 @@ export function createWatches({
             return await rearm(chat, request);
           case 'check': {
             const { result, watch } = await check(find(chat, request.id), 'agent');
-            const run = { exitCode: result.exitCode, verdict: result.verdict, output: tail(result.output, 8 * 1024), ...(result.timedOut ? { timedOut: true } : {}) };
-            return { ok: true, watch: publicOf(watch), run };
+            return { ok: true, watch: publicOf(watch), run: runAnswer(result) };
           }
           case 'link': {
             const watch = find(chat, request.id);
@@ -749,6 +834,7 @@ export function createWatches({
       for (const watch of watches.values()) {
         clearTimeout(watch.timer);
         clearTimeout(watch.deadlineTimer);
+        clearInterval(watch.pidTimer);
         for (const waiter of [...watch.waiters]) waiter.resolve('gone');
         if (FINAL.has(watch.state)) continue;
         if (watch.child) stopChild(watch.child, killGraceMs);

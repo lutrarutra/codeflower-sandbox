@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -12,12 +12,12 @@ import { resolvePath } from '../src/files.js';
 import { startBridge } from '../src/server.js';
 import { createWatches, endNotice, endSummary } from '../src/watches.js';
 import { addWatchNeed, create as createIdea, endWatchNeeds, readAll as readIdeas } from '../src/roots-store.js';
-import { WatchError, defaultName, formatDuration, parseDuration, parseUntil, readStart, verdictOf } from '../src/watch-rules.js';
+import { WatchError, commandOf, defaultName, followedProcesses, formatDuration, misuseOf, parseDuration, parseFail, parsePids, parseUntil, processAlive, readStart, verdictOf } from '../src/watch-rules.js';
 
 const fakeAgent = fileURLToPath(new URL('../fixtures/fake-acp.js', import.meta.url));
 const watchCommand = fileURLToPath(new URL('../../../bin/codeflower-watch', import.meta.url));
 const token = 'w'.repeat(43);
-const FAST = { minEveryMs: 10, noticeDelayMs: 30, runTimeoutMs: 2000, killGraceMs: 100 };
+const FAST = { minEveryMs: 10, noticeDelayMs: 30, runTimeoutMs: 2000, killGraceMs: 100, pidCheckMs: 50 };
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function until(check, ms = 20_000) {
@@ -63,6 +63,61 @@ test('reads durations and conditions, and judges runs', () => {
   assert.equal(spec.wait, 85_000);
   assert.equal(spec.name, 'gh pr view');
   assert.equal(defaultName('/usr/bin/test -f done.flag'), 'test done.flag');
+});
+
+test('--fail ends on a failure whatever the exit status; a first run that misuses its command is wrong', () => {
+  assert.equal(parseFail(), undefined);
+  assert.deepEqual(parseFail('match:Error in rule'), { kind: 'match', pattern: 'Error in rule' });
+  assert.throws(() => parseFail('exit'), /--fail takes match:REGEX/);
+  const done = parseUntil('match:Finished jobid: 0');
+  const fail = parseFail('match:Error in rule|Traceback');
+  assert.equal(verdictOf(done, { exitCode: 0, output: 'rule a\n' }, undefined, fail), 'waiting');
+  assert.equal(verdictOf(done, { exitCode: 0, output: 'Finished jobid: 0\n' }, undefined, fail), 'met');
+  // A failure wins over the condition, and over the command's own exit status.
+  assert.equal(verdictOf(done, { exitCode: 0, output: 'Error in rule a\nFinished jobid: 0\n' }, undefined, fail), 'failed');
+  assert.equal(verdictOf({ kind: 'exit' }, { exitCode: 1, output: 'Traceback (most recent call last)' }, undefined, fail), 'failed');
+  assert.equal(verdictOf(done, { exitCode: 0, output: 'Traceback', timedOut: true }, undefined, fail), 'error');
+  assert.deepEqual(readStart({ command: 'x', fail: 'match:Error' }).fail, { kind: 'match', pattern: 'Error' });
+
+  assert.equal(misuseOf('Usage: grep [OPTION]... PATTERNS [FILE]...\nTry \'grep --help\''), 'Usage: grep [OPTION]... PATTERNS [FILE]...');
+  assert.equal(misuseOf('sh: 1: scirpts/status.sh: not found\nbash: foo: command not found'), 'bash: foo: command not found');
+  assert.equal(misuseOf('tail: cannot open \'logs/x.log\' for reading: No such file or directory'), "tail: cannot open 'logs/x.log' for reading: No such file or directory");
+  assert.equal(misuseOf('Fetching PR 12...\n'), undefined);
+  assert.equal(misuseOf(''), undefined);
+});
+
+test('--pid: the processes a watch follows, and the exited condition', async (t) => {
+  assert.deepEqual(parsePids(), []);
+  assert.deepEqual(parsePids(['12', '34,56', 12]), [12, 34, 56]);
+  assert.throws(() => parsePids('$!'), /--pid takes a process id/);
+  assert.throws(() => parsePids('1'), /--pid takes a process id/);
+  // With --pid the condition is the processes' end, unless another is given.
+  assert.deepEqual(readStart({ command: 'x', pid: '12' }).until, { kind: 'exited' });
+  assert.deepEqual(readStart({ command: 'x', pid: '12', until: 'match:done' }).until, { kind: 'match', pattern: 'done' });
+  assert.throws(() => readStart({ command: 'x', until: 'exited' }), /--until exited needs --pid/);
+  assert.equal(verdictOf({ kind: 'exited' }, { exitCode: 0, output: 'anything' }), 'waiting');
+  assert.equal(verdictOf({ kind: 'exited' }, { exitCode: 2 }), 'error');
+
+  const child = spawn('sleep', ['30'], { stdio: 'ignore' });
+  t.after(() => child.kill('SIGKILL'));
+  assert.equal(processAlive(child.pid), true);
+  assert.equal(processAlive(process.pid), true);
+  assert.deepEqual(followedProcesses([child.pid]).map(({ pid }) => pid), [child.pid]);
+  child.kill('SIGKILL');
+  await once(child, 'exit');
+  assert.equal(processAlive(child.pid), false);
+  assert.throws(() => followedProcesses([child.pid]), /No process \d+ runs/);
+});
+
+test('the words after -- stay as they were given', () => {
+  // The words of `-- bash -c 'grep -cE "Finished jobid" logs/run.log; tail -n 2 logs/run.log'`.
+  const words = ['bash', '-c', 'grep -cE "Finished jobid" logs/run.log; tail -n 2 logs/run.log'];
+  assert.equal(commandOf(words), `bash -c 'grep -cE "Finished jobid" logs/run.log; tail -n 2 logs/run.log'`);
+  assert.equal(commandOf(['gh', 'pr', 'view', '12', '--json', 'state']), 'gh pr view 12 --json state');
+  assert.equal(commandOf(['gh', 'run', 'list', '--jq', '.[0].conclusion']), "gh run list --jq '.[0].conclusion'");
+  assert.equal(commandOf(['echo', "it's", '']), `echo 'it'\\''s' ''`);
+  // One word is a shell command as given.
+  assert.equal(commandOf(['tail -n 5 logs/x.log | grep -c done']), 'tail -n 5 logs/x.log | grep -c done');
 });
 
 test('tells what ended, with the last output', () => {
@@ -411,6 +466,92 @@ test('check runs the command now; rearm changes how a watch runs and resets it',
   assert.equal((await watches.handle(chat, { action: 'show', id: fourth.watch.id })).watch.timeout, 86_400_000);
 });
 
+test('a watch whose output matches --fail ends as failed, and a first run with a usage error does not start', async (t) => {
+  const { watches, directory, told } = await watchesIn(t);
+  const log = join(directory, 'run.log');
+  await writeFile(log, 'rule a\n');
+  const started = await watches.handle(chat, {
+    action: 'start',
+    command: `cat ${log}`,
+    every: 0.05,
+    until: 'match:Finished jobid: 0',
+    fail: 'match:Error in rule',
+    cwd: directory
+  });
+  assert.equal(started.run.verdict, 'waiting');
+  assert.equal(started.watch.fail, 'match:Error in rule');
+  await writeFile(log, 'rule a\nError in rule b:\nFinished jobid: 0\n');
+  await until(() => told.length);
+  assert.match(told[0].text, /: failed, what it watched failed: its output matched match:Error in rule \(2 runs/);
+  assert.match(told[0].text, /Until: match:Finished jobid: 0, fail: match:Error in rule, every 50ms/);
+  assert.match(told[0].text, /once you fixed what failed/);
+  assert.equal(told[0].summary, `cat run.log failed`);
+
+  // A failure in the first run ends it at once, without a notice.
+  const at = await watches.handle(chat, { action: 'start', command: `cat ${log}`, every: 0.05, until: 'match:never', fail: 'match:Error in rule', cwd: directory });
+  assert.equal(at.watch.state, 'failed');
+
+  // `bash -c grep`: the shell ran grep without its arguments, which exits 2 but says why on stderr;
+  // `grep ... ; true` exits 0, and its stderr still makes the first run an error.
+  const misused = await watches.handle(chat, { action: 'start', command: 'grep; true', every: 0.05, until: 'match:Finished', cwd: directory });
+  assert.equal(misused.run.verdict, 'error');
+  assert.match(misused.run.misuse, /usage: grep/i);
+  assert.match(misused.run.stderr, /usage: grep/i);
+  assert.equal(misused.watch.state, 'failing');
+  assert.match(misused.watch.reason, /^the first run's stderr says the command is wrong: .*usage: grep/i);
+  // Only the first run is held to it: later runs are judged by the condition alone.
+  await writeFile(log, 'rule a\n');
+  const later = await watches.handle(chat, { action: 'start', command: `cat ${log}; test -f ${join(directory, 'second')} && ls ${join(directory, 'missing')}; true`, every: 0.05, until: 'match:never', cwd: directory });
+  assert.equal(later.watch.state, 'watching');
+  await writeFile(join(directory, 'second'), '');
+  const checked = await watches.handle(chat, { action: 'check', id: later.watch.id });
+  assert.equal(checked.run.verdict, 'waiting');
+  assert.match(checked.run.stderr, /No such file/);
+  await watches.handle(chat, { action: 'stop', id: later.watch.id });
+});
+
+test('a watch with --pid ends when its processes do, with a last run for the output', async (t) => {
+  const { watches, directory, told } = await watchesIn(t);
+  const log = join(directory, 'run.log');
+  await writeFile(log, 'step 1\n');
+  const jobs = [spawn('sleep', ['30'], { stdio: 'ignore' }), spawn('sleep', ['30'], { stdio: 'ignore' })];
+  t.after(() => jobs.forEach((job) => job.kill('SIGKILL')));
+  // Its runs come rarely; the processes are looked at more often.
+  const started = await watches.handle(chat, { action: 'start', command: `tail -n 2 ${log}`, every: 3600, pid: jobs.map((job) => String(job.pid)), cwd: directory });
+  assert.equal(started.watch.until, 'exited');
+  assert.deepEqual(started.watch.pids, jobs.map((job) => job.pid));
+  assert.equal(started.run.verdict, 'waiting');
+  // One of two ended: it goes on.
+  jobs[0].kill('SIGKILL');
+  await once(jobs[0], 'exit');
+  await sleep(200);
+  assert.equal((await watches.handle(chat, { action: 'show', id: started.watch.id })).watch.state, 'watching');
+  await writeFile(log, 'step 1\nstep 2: done\n');
+  jobs[1].kill('SIGKILL');
+  await once(jobs[1], 'exit');
+  await until(() => told.length);
+  const shown = await watches.handle(chat, { action: 'show', id: started.watch.id });
+  assert.equal(shown.watch.state, 'exited');
+  assert.equal(shown.watch.runs, 2);
+  assert.match(told[0].text, new RegExp(`: exited, the processes it followed ended \\(their exit status is not known to the watch: read the output\\): process ${jobs[0].pid}, ${jobs[1].pid} ended`));
+  assert.match(told[0].text, /Until: exited, while process \d+, \d+ runs, every 1h/);
+  assert.match(told[0].text, /step 2: done/);
+  assert.doesNotMatch(told[0].text, /Still worth waiting for/);
+  assert.match((await watches.handle(chat, { action: 'rearm', id: started.watch.id })).error, /ended with the processes it followed/);
+
+  // The last run decides when it says more: here, a failure.
+  const job = spawn('sleep', ['30'], { stdio: 'ignore' });
+  t.after(() => job.kill('SIGKILL'));
+  const second = await watches.handle(chat, { action: 'start', command: `cat ${log}`, every: 3600, pid: String(job.pid), fail: 'match:Error in rule', cwd: directory });
+  await writeFile(log, 'Error in rule b:\n');
+  job.kill('SIGKILL');
+  await until(() => told.length >= 2);
+  assert.equal((await watches.handle(chat, { action: 'show', id: second.watch.id })).watch.state, 'failed');
+
+  // A process that is gone already is refused.
+  assert.match((await watches.handle(chat, { action: 'start', command: 'true', pid: String(job.pid), cwd: directory })).error, /No process \d+ runs/);
+});
+
 // ---- through the bridge, with codeflower-watch ----
 
 async function startWatchBridge(t) {
@@ -485,6 +626,7 @@ test('codeflower-watch starts a watch the windows list and stop, and the chat he
   assert.equal(started.code, 0, started.stderr);
   assert.match(started.stdout, /First run: exit 1, not yet/);
   assert.match(started.stdout, /Started w-[0-9a-f]{8} \(flag\): runs every 50ms until exit/);
+  assert.match(started.stdout, /^Runs with sh -c: test -f done.flag$/m);
   const id = /Started (w-[0-9a-f]{8})/.exec(started.stdout)[1];
   const changed = await receive(window, (message) => message.method === '_codeflower/watches/changed' && message.params.watches.some((each) => each.id === id));
   const listed = changed.params.watches.find((each) => each.id === id);
@@ -515,6 +657,29 @@ test('codeflower-watch starts a watch the windows list and stop, and the chat he
   assert.equal(waited.code, 1);
   assert.match(waited.stdout, /ended: stopped after \d+ runs/);
   assert.equal((await call(window, '_codeflower/watches/list')).result.watches.length, 2);
+
+  // Quotes in the words after -- reach the shell; a first run with a usage error does not start.
+  const quoted = await watch(sessionId, ['start', '--every', '0.05', '--until', 'match:two words', '--', 'bash', '-c', 'echo "two words"; true']);
+  assert.equal(quoted.code, 0, quoted.stderr);
+  assert.match(quoted.stdout, /^Runs with sh -c: bash -c 'echo "two words"; true'$/m);
+  assert.match(quoted.stdout, /ended at once/);
+  // --pid, repeated, through the command.
+  const jobs = [spawn('sleep', ['30'], { stdio: 'ignore' }), spawn('sleep', ['30'], { stdio: 'ignore' })];
+  t.after(() => jobs.forEach((job) => job.kill('SIGKILL')));
+  const following = await watch(sessionId, ['start', '--every', '1h', '--name', 'job', '--pid', String(jobs[0].pid), `--pid=${jobs[1].pid}`, '--', 'echo', 'tail of the log']);
+  assert.equal(following.code, 0, following.stderr);
+  assert.match(following.stdout, new RegExp(`until exited, for at most`));
+  assert.match((await watch(sessionId, ['list'])).stdout, new RegExp(`until exited, while process ${jobs[0].pid}, ${jobs[1].pid} runs`));
+  jobs.forEach((job) => job.kill('SIGKILL'));
+  const exited = await receive(chat, (message) => message.method === '_codeflower/prompted' && /job \(w-/.test(message.params.prompt[0].text));
+  assert.match(exited.params.prompt[0].text, /job \(w-[0-9a-f]{8}\): exited/);
+  assert.match(exited.params.prompt[0].text, /tail of the log/);
+  assert.equal((await watch(sessionId, ['start', '--pid', String(jobs[0].pid), '--', 'true'])).code, 2);
+
+  const broken = await watch(sessionId, ['start', '--every', '0.05', '--until', 'match:x', '--', 'grep; true']);
+  assert.equal(broken.code, 1);
+  assert.match(broken.stdout, /!! Its stderr says the command is wrong: .*usage: grep/i);
+  assert.match(broken.stdout, /The first run is an error \(the first run's stderr says the command is wrong: /);
 });
 
 test('without the worker (a run task), start runs the watch in the foreground', async (t) => {

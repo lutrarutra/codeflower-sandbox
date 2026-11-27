@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 const rulesPath = [resolve(here, '../acp-ws/src/watch-rules.js'), resolve(here, '../dsh-plugins/acp-ws/src/watch-rules.js')].find(existsSync);
 const rules = await import(rulesPath);
-const { FINAL, MAX_FAILURES, RUN_TIMEOUT_MS, VERDICT_TEXT, WatchError, formatDuration, readStart, verdictOf } = rules;
+const { FINAL, MAX_FAILURES, PID_CHECK_MS, RUN_TIMEOUT_MS, VERDICT_TEXT, WatchError, commandOf, followedProcesses, formatDuration, misuseOf, processAlive, readStart, verdictOf } = rules;
 
 const usage = `Usage: codeflower-watch COMMAND [ARGS...]
 
@@ -22,16 +22,32 @@ Waits for something without holding your turn: the worker runs a command
 every so often until a condition holds, then sends you a message with its
 output. It runs while no one is connected. End your turn after starting one.
 
-  start [OPTIONS] -- COMMAND
+  start [OPTIONS] -- COMMAND [ARGS...]
                      run COMMAND (with sh -c, in this folder) now and then
-                     every --every, until --until holds; prints the first
-                     run's output, so check it reads as you meant
+                     every --every, until --until holds; prints the command
+                     line and the first run's output, so check it reads as
+                     you meant. One word after -- is a shell command as given
+                     (quote it whole for pipes or ;); several words are one
+                     command and its arguments, each kept as one argument.
+                     A status that needs several commands: put them in a
+                     script and watch the script
       --every TIME     how often (default 1m, at least 10s), e.g. 30s, 5m, 1h
       --until COND     when it is done (default exit):
                          exit         the command exits 0 (1: not yet;
                                       any other exit is an error)
                          match:REGEX  its output matches REGEX
                          change       its output differs from the first run's
+                         exited       none: only the end of the --pid
+                                      processes (the default with --pid)
+      --fail match:REGEX
+                       what you watch failed when the output matches REGEX
+                       (whatever the exit status): the watch ends as failed,
+                       e.g. --fail 'match:Error in rule|Traceback'
+      --pid PID        also end when this process (repeat it, or PID,PID: all
+                       of them) has ended, checked every ${formatDuration(PID_CHECK_MS)} whatever
+                       --every: the command runs once more and its output is
+                       sent; the watch ends exited (or failed or met, if that
+                       run says so). PID from $! or pgrep -f PATTERN
       --timeout TIME   give up after this long (default 24h, at most 7d); you
                        are told, and can rearm it
       --name NAME      a short name for it (default: the command's words)
@@ -52,11 +68,12 @@ output. It runs while no one is connected. End your turn after starting one.
   check ID           run its command now rather than at the next run (which
                      then counts from this one): prints the output and verdict;
                      if the condition holds, the watch ends here (no message)
-  rearm ID [--timeout TIME] [--every TIME] [--until COND] [--reset]
+  rearm ID [--timeout TIME] [--every TIME] [--until COND] [--fail COND] [--reset]
                      start a watch that timed out, failed or was stopped
                      again, as it was (same id, log and Roots need); on a
-                     running one, its timeout counts from now. --every and
-                     --until change how it runs; --reset (or a new --until)
+                     running one, its timeout counts from now. --every,
+                     --until and --fail change how it runs; --reset (or a
+                     new --until)
                      clears its errors, and change compares with the next run
   stop ID | --all    stop a watch (--all: all of this chat's); you get no
                      message for watches you stop
@@ -64,6 +81,8 @@ output. It runs while no one is connected. End your turn after starting one.
 ID is a watch's id (w-...) or name. A run that fails ${MAX_FAILURES} times in a row
 (exit status other than 0 and 1 for exit, any but 0 for the others, or
 longer than ${formatDuration(RUN_TIMEOUT_MS)}) ends the watch as failing, and you are told.
+A first run whose stderr says the command is wrong (usage:, command not
+found, No such file, syntax error) is an error even when it exits 0.
 Watches stop when the sandbox stops.
 
 Examples:
@@ -71,6 +90,11 @@ Examples:
     --name 'PR 12' -- gh pr view 12 --json state
   codeflower-watch start --every 30s -- test -f results/done.flag
   codeflower-watch start --every 1m --until exit -- 'curl -sf localhost:8000/health'
+  nohup snakemake --cores 8 > logs/run.log 2>&1 & echo $!
+  codeflower-watch start --pid 4242 --every 10m --name pipeline \\
+    --fail 'match:Error in rule|Traceback' -- tail -n 30 logs/run.log
+  codeflower-watch start --every 5m --name pipeline --until 'match:Finished jobid: 0' \\
+    --fail 'match:Error in rule|Traceback|pipeline failed' -- tail -n 200 logs/run.log
 
 Add --json to any command for JSON.`;
 
@@ -115,9 +139,12 @@ function parse(rest, valued, flags = [], optional = [], commandFollows = false) 
       else if (rest[index + 1] !== undefined && /^\d+(\.\d+)?[smhd]?([0-9smhd.]*)$/i.test(rest[index + 1])) options[name] = rest[++index];
       else options[name] = true;
     } else if (valued.includes(name)) {
-      if (value !== undefined) options[name] = value;
-      else if (index + 1 < rest.length) options[name] = rest[++index];
+      let given;
+      if (value !== undefined) given = value;
+      else if (index + 1 < rest.length) given = rest[++index];
       else fail(`--${name} needs a value. See codeflower-watch --help.`, 2);
+      // --pid may be given more than once.
+      options[name] = name === 'pid' ? [...(options.pid ?? []), given] : given;
     } else fail(`Unknown option --${name}. See codeflower-watch --help.`, 2);
   }
   return { options, words };
@@ -168,7 +195,7 @@ function line(watch) {
         ? `running now (run ${watch.runs})`
         : `watching, ${watch.runs} run${watch.runs === 1 ? '' : 's'}, next ${until(watch.nextRun)}`
       : `${watch.state}${watch.reason ? ` (${watch.reason})` : ''} ${ago(watch.ended)}, after ${watch.runs} run${watch.runs === 1 ? '' : 's'}`;
-  return `${watch.id}  ${watch.name}  every ${formatDuration(watch.every)} until ${watch.until}  ${state}${watch.idea !== undefined ? `  (idea #${watch.idea})` : ''}`;
+  return `${watch.id}  ${watch.name}  every ${formatDuration(watch.every)} until ${watch.until}${watch.fail ? `, fail ${watch.fail}` : ''}${watch.pids?.length ? `, while process ${watch.pids.join(', ')} runs` : ''}  ${state}${watch.idea !== undefined ? `  (idea #${watch.idea})` : ''}`;
 }
 
 function printRun(run) {
@@ -176,10 +203,12 @@ function printRun(run) {
   const output = (run.output ?? '').trimEnd();
   console.log(`${run.label ?? 'First run'}: exit ${run.exitCode}${run.timedOut ? ' (timed out)' : ''}, ${VERDICT_TEXT[run.verdict]}`);
   if (output) console.log(output);
+  if (run.misuse) console.log(`!! Its stderr says the command is wrong: ${run.misuse}`);
+  else if (run.stderr?.trim()) console.log('!! It wrote to stderr (in the output above): check that this is not an error.');
 }
 
-// What a watch's end means for the command's own exit status.
-const ended = (watch) => (watch.state === 'met' ? EXIT.met : FINAL.has(watch.state) ? EXIT.failed : EXIT.waiting);
+// What a watch's end means for the command's own exit status: its processes' end (--pid) is no failure.
+const ended = (watch) => (watch.state === 'met' || watch.state === 'exited' ? EXIT.met : FINAL.has(watch.state) ? EXIT.failed : EXIT.waiting);
 
 function afterWait(answer, json) {
   const { watch } = answer;
@@ -197,25 +226,40 @@ function afterWait(answer, json) {
 }
 
 // Without the bridge (a run task): the watch runs here, in the foreground, until it ends.
-async function runHere(spec, json) {
+async function runHere(spec, json, followed = []) {
   const deadline = Date.now() + spec.timeout;
   let baseline;
   let failures = 0;
+  // The run after the --pid processes ended, which ends the watch.
+  let last = false;
+  const stop = (end, number, output) => {
+    if (json) console.log(JSON.stringify({ ok: true, watch: { name: spec.name, state: end, runs: number }, output }, null, 2));
+    else console.log(`${spec.name} ended: ${end} after ${number} runs.${output.trim() ? `\nLast output:\n${output.trimEnd()}` : ''}`);
+    process.exit(end === 'met' || end === 'exited' ? 0 : 1);
+  };
   for (let number = 1; ; number++) {
     const result = spawnSync('/bin/sh', ['-c', spec.command], { encoding: 'utf8', timeout: RUN_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 });
     const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;
     const run = { exitCode: result.status ?? 1, output, timedOut: result.error?.code === 'ETIMEDOUT' };
-    const verdict = verdictOf(spec.until, run, baseline);
+    const misuse = number === 1 ? misuseOf(result.stderr ?? '') : undefined;
+    const verdict = misuse ? 'error' : verdictOf(spec.until, run, baseline, spec.fail);
     if (spec.until.kind === 'change' && baseline === undefined && verdict !== 'error') baseline = output;
     failures = verdict === 'error' ? failures + 1 : 0;
-    if (!json) console.error(`run ${number}: exit ${run.exitCode}, ${VERDICT_TEXT[verdict]}`);
-    const end = verdict === 'met' ? 'met' : failures >= MAX_FAILURES || (number === 1 && verdict === 'error') ? 'failing' : Date.now() + spec.every > deadline ? 'timeout' : undefined;
-    if (end) {
-      if (json) console.log(JSON.stringify({ ok: true, watch: { name: spec.name, state: end, runs: number }, output }, null, 2));
-      else console.log(`${spec.name} ended: ${end} after ${number} runs.${output.trim() ? `\nLast output:\n${output.trimEnd()}` : ''}`);
-      process.exit(end === 'met' ? 0 : 1);
+    if (!json) console.error(`run ${number}: exit ${run.exitCode}, ${VERDICT_TEXT[verdict]}${misuse ? ` (its stderr says the command is wrong: ${misuse})` : ''}`);
+    const end = verdict === 'met' || verdict === 'failed' ? verdict : last ? 'exited' : failures >= MAX_FAILURES || (number === 1 && verdict === 'error') ? 'failing' : !followed.length && Date.now() + spec.every > deadline ? 'timeout' : undefined;
+    if (end) stop(end, number, output);
+    // Until the next run; with --pid, looking every PID_CHECK_MS whether the processes still run,
+    // until the deadline at most.
+    const next = followed.length ? Math.min(Date.now() + spec.every, deadline) : Date.now() + spec.every;
+    while (Date.now() < next) {
+      await new Promise((done) => setTimeout(done, Math.min(next - Date.now(), followed.length ? PID_CHECK_MS : spec.every)));
+      if (followed.length && !followed.some(({ pid, start }) => processAlive(pid, start))) {
+        last = true;
+        if (!json) console.error(`process ${followed.map(({ pid }) => pid).join(', ')} ended: one last run`);
+        break;
+      }
     }
-    await new Promise((done) => setTimeout(done, spec.every));
+    if (!last && followed.length && Date.now() >= deadline) stop('timeout', number, output);
   }
 }
 
@@ -248,26 +292,31 @@ async function main() {
   const bridge = Boolean(process.env.CODEFLOWER_WATCH_SOCKET);
   switch (command) {
     case 'start': {
-      const { options, words } = parse(rest, ['every', 'until', 'timeout', 'name', 'idea'], [], ['wait'], true);
+      const { options, words } = parse(rest, ['every', 'until', 'fail', 'pid', 'timeout', 'name', 'idea'], [], ['wait'], true);
       const body = {
         action: 'start',
-        command: words.join(' '),
+        command: commandOf(words),
         cwd: process.cwd(),
-        ...Object.fromEntries(['every', 'until', 'timeout', 'name', 'wait', 'idea'].filter((key) => options[key] !== undefined).map((key) => [key, options[key]]))
+        ...Object.fromEntries(['every', 'until', 'fail', 'pid', 'timeout', 'name', 'wait', 'idea'].filter((key) => options[key] !== undefined).map((key) => [key, options[key]]))
       };
       // The bridge checks the request itself; without one, it is checked here.
       if (!bridge) {
         let spec;
+        let followed;
         try {
           spec = readStart(body);
+          followed = followedProcesses(spec.pids);
         } catch (error) {
           if (error instanceof WatchError) fail(error.message, 2);
           throw error;
         }
         console.error('No code flower worker here (a run task): the watch runs in the foreground until it ends.');
-        return runHere(spec, options.json);
+        console.error(`Runs with sh -c: ${spec.command}`);
+        return runHere(spec, options.json, followed);
       }
       const answer = answered(await request(body));
+      // The command line as sh gets it, so a quote that went missing shows here.
+      if (!options.json) console.log(`Runs with sh -c: ${answer.watch.command}`);
       if (options.wait !== undefined && !FINAL.has(answer.watch.state)) {
         if (!options.json) printRun(answer.run);
         return afterWait(answer, options.json);
@@ -277,7 +326,7 @@ async function main() {
       const { watch } = answer;
       if (watch.state === 'met') console.log(`The condition already holds: ${watch.name} ended at once.`);
       else if (watch.state === 'failing') {
-        console.log(`The first run is an error, so ${watch.name} did not start: fix the command or the condition (--until) and start it again.`);
+        console.log(`The first run is an error${watch.reason && watch.reason !== 'the first run failed' ? ` (${watch.reason})` : ''}, so ${watch.name} did not start: fix the command or the condition (--until) and start it again.`);
         process.exit(EXIT.failed);
       } else if (FINAL.has(watch.state)) {
         afterWait(answer, false);
@@ -347,14 +396,14 @@ async function main() {
       return process.exit(ended(watch));
     }
     case 'rearm': {
-      const { options, words } = parse(rest, ['timeout', 'every', 'until'], ['reset']);
+      const { options, words } = parse(rest, ['timeout', 'every', 'until', 'fail'], ['reset']);
       if (!bridge) fail('codeflower-watch rearm needs the code flower worker, which this sandbox is not running.', 2);
-      if (words.length !== 1) fail('codeflower-watch rearm ID [--timeout TIME] [--every TIME] [--until COND] [--reset]', 2);
+      if (words.length !== 1) fail('codeflower-watch rearm ID [--timeout TIME] [--every TIME] [--until COND] [--fail COND] [--reset]', 2);
       const answer = answered(
         await request({
           action: 'rearm',
           id: words[0],
-          ...Object.fromEntries(['timeout', 'every', 'until', 'reset'].filter((key) => options[key] !== undefined).map((key) => [key, options[key]]))
+          ...Object.fromEntries(['timeout', 'every', 'until', 'fail', 'reset'].filter((key) => options[key] !== undefined).map((key) => [key, options[key]]))
         })
       );
       if (options.json) return console.log(JSON.stringify(answer, null, 2));
