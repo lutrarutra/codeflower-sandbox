@@ -3237,7 +3237,16 @@ export async function startBridge(options) {
         const handoff = host.handoffs.get(message.params?.sessionId);
         // The prompts queued on the worker stay, paused once the turn ended
         // cancelled; a window takes the user's own back to its composer first
-        // (`_codeflower/queue/take`).
+        // (`_codeflower/queue/take`). Those queued after the Stop, while the
+        // turn winds down, go once it ended.
+        if (message.method === 'session/cancel' && typeof message.params?.sessionId === 'string') {
+          const stopped = message.params.sessionId;
+          // A prompt's turn, a window's or the bridge's own (not one Claude Code started by itself).
+          const promptRunning = handoff
+            ? handoff.busy || Boolean(handoff.current)
+            : [...host.requests.values()].some((request) => request.method === 'session/prompt' && request.params?.sessionId === stopped);
+          if (promptRunning) promptQueue.stopped(message.params.sessionId);
+        }
         if (handoff && message.method === 'session/cancel') {
           for (const queued of handoff.queue.splice(0)) {
             queued.client?.send({ jsonrpc: '2.0', id: queued.id, result: { stopReason: 'cancelled' } });

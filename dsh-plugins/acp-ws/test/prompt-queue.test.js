@@ -54,6 +54,36 @@ test('a cancel the queue asked for goes on with the next prompt', () => {
   assert.equal(queue.ready('s'), true);
 });
 
+test('a prompt queued after the user stopped the turn goes once it ended', () => {
+  const queue = createPromptQueue();
+  // Nothing waited at the Stop; the message comes while the turn winds down.
+  queue.stopped('s');
+  queue.add('s', prompt('after'));
+  assert.equal(queue.turnEnded('s', 'cancelled'), true);
+  assert.equal(queue.snapshot('s').paused, undefined);
+  assert.equal(queue.next('s').text, 'after');
+  // The Stop counted once: the next cancel pauses again.
+  queue.add('s', prompt('later'));
+  assert.equal(queue.turnEnded('s', 'cancelled'), false);
+  assert.deepEqual(queue.snapshot('s').paused, { stopReason: 'cancelled' });
+});
+
+test('what waited before the Stop pauses, with what came after it', () => {
+  const queue = createPromptQueue();
+  queue.add('s', { ...prompt('feedback'), editable: false });
+  queue.stopped('s');
+  queue.add('s', prompt('after'));
+  assert.equal(queue.turnEnded('s', 'cancelled'), false);
+  assert.deepEqual(queue.snapshot('s').paused, { stopReason: 'cancelled' });
+  // Gone before the turn ended (taken back, removed): nothing from before is left.
+  const other = createPromptQueue();
+  other.add('s', prompt('mine'));
+  other.stopped('s');
+  other.take('s', { editable: true });
+  other.add('s', prompt('after'));
+  assert.equal(other.turnEnded('s', 'cancelled'), true);
+});
+
 test('replace empties the queue and goes on after the cancel', () => {
   const queue = createPromptQueue();
   queue.add('s', prompt('one'));

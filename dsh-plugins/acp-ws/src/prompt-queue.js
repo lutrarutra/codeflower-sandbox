@@ -10,7 +10,9 @@
 // The next one goes once a turn ends with end_turn. Any other end (a refusal,
 // an error, a cancel the queue did not ask for) pauses the queue, which keeps
 // its prompts until a window resumes it. A cancel the queue asked for (send
-// now, an interrupting action) goes on with the next prompt.
+// now, an interrupting action) goes on with the next prompt. So does a user's
+// Stop (`stopped`) that left nothing waiting from before it: what was queued
+// while the stopped turn wound down was sent after the Stop, to go.
 //
 // It lives in the bridge's memory: windows come and go and the agent may
 // restart, but a new bridge starts with an empty queue.
@@ -19,14 +21,15 @@ export const MAX_QUEUED = 100;
 export const MAX_QUEUED_BYTES = 1_000_000;
 
 export function createPromptQueue({ onChange = () => {} } = {}) {
-  // Per session: { items, paused, resumeAfterCancel, together }.
+  // Per session: { items, paused, resumeAfterCancel, together, stoppedWith }:
+  // stoppedWith, the ids that waited when a window stopped the running turn.
   const chats = new Map();
   let nextId = 1;
 
   const chat = (sessionId) => {
     let state = chats.get(sessionId);
     if (!state) {
-      state = { items: [], paused: null, resumeAfterCancel: false, together: false };
+      state = { items: [], paused: null, resumeAfterCancel: false, together: false, stoppedWith: null };
       chats.set(sessionId, state);
     }
     return state;
@@ -34,7 +37,7 @@ export function createPromptQueue({ onChange = () => {} } = {}) {
   // Forgets a chat with nothing left to tell.
   const settle = (sessionId) => {
     const state = chats.get(sessionId);
-    if (state && !state.items.length && !state.paused && !state.resumeAfterCancel) chats.delete(sessionId);
+    if (state && !state.items.length && !state.paused && !state.resumeAfterCancel && !state.stoppedWith) chats.delete(sessionId);
   };
   const changed = (sessionId) => {
     settle(sessionId);
@@ -129,6 +132,17 @@ export function createPromptQueue({ onChange = () => {} } = {}) {
       onChange(sessionId);
     },
 
+    /**
+     * A window stopped the chat's running turn. The user's own prompts went back
+     * to it first (`take`); those that still wait pause once the turn ends
+     * cancelled, and those queued after this go on.
+     */
+    stopped(sessionId) {
+      const state = chats.get(sessionId);
+      if (state) state.stoppedWith = new Set(state.items.map((item) => item.id));
+      else chat(sessionId).stoppedWith = new Set();
+    },
+
     pause(sessionId, stopReason) {
       const state = chats.get(sessionId);
       if (!state?.items.length) return;
@@ -164,7 +178,11 @@ export function createPromptQueue({ onChange = () => {} } = {}) {
     turnEnded(sessionId, stopReason) {
       const state = chats.get(sessionId);
       if (!state) return false;
-      const asked = state.resumeAfterCancel;
+      // Stopped by the user with nothing from before the Stop left: the prompts go.
+      const stoppedWith = state.stoppedWith;
+      state.stoppedWith = null;
+      const asked =
+        state.resumeAfterCancel || (stoppedWith !== null && !state.items.some((item) => stoppedWith.has(item.id)));
       state.resumeAfterCancel = false;
       if (!state.items.length) {
         settle(sessionId);

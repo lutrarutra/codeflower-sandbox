@@ -1902,6 +1902,27 @@ test('any window removes, edits or sends now a queued prompt, and Stop takes the
   assert.deepEqual(paused.params.paused, { stopReason: 'cancelled' });
 });
 
+test('a message queued while a stopped turn winds down goes once it ended', async (t) => {
+  const { bridge } = await startTestBridge(t);
+  const socket = await openSocket(bridge.address);
+  t.after(() => closeSocket(socket));
+  await initialize(socket);
+  const sessionId = (await call(socket, 'session/new', { cwd: '/workspace', mcpServers: [] })).result.sessionId;
+  const key = sessionKey('claude', sessionId);
+  const queue = (text) => call(socket, '_codeflower/queue/add', { key, prompt: [{ type: 'text', text }], editable: true });
+  await queue('long task');
+  await receive(socket, (message) => text(message) === 'started');
+  // Stop; the agent takes a moment to end the turn, and the user writes meanwhile.
+  send(socket, { jsonrpc: '2.0', method: 'session/cancel', params: { sessionId } });
+  // Agent traffic goes in order, control requests ahead of it: once a request
+  // after the Stop came back, the Stop was taken, as when the user types next.
+  await call(socket, 'fake/unknown', {});
+  await queue('after the stop');
+  send(socket, { jsonrpc: '2.0', method: 'fake/finish', params: { sessionId, stopReason: 'cancelled' } });
+  await receive(socket, (message) => message.method === '_codeflower/prompted' && message.params.prompt[0].text === 'after the stop');
+  await receive(socket, (message) => text(message) === `reply to after the stop in ${sessionId}`);
+});
+
 test('the queue outlives a restart of the agent', async (t) => {
   const { bridge } = await startTestBridge(t);
   let socket = await openSocket(bridge.address);
