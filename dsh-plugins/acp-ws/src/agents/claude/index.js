@@ -85,6 +85,18 @@ export default function claude({ descriptor, home, modules, environment }) {
         options: { settings: { plansDirectory: 'plans' } }
       }
     },
+    // An orchestrator's session (orchestrators.js), on every start of it: none of
+    // Claude Code's tools but the web's, when the user allows it, and those of the
+    // bridge's `executor` MCP server, allowed without asking; neither the
+    // project's settings nor its CLAUDE.md (only the user's, where an API key
+    // may be), and what it is told of its situation after Claude Code's prompt.
+    orchestrator({ access, prompt }) {
+      const web = access?.web ? ['WebSearch', 'WebFetch'] : [];
+      return {
+        claudeCode: { options: { tools: web, allowedTools: ['mcp__executor', ...web], settingSources: ['user'] } },
+        systemPrompt: { append: prompt }
+      };
+    },
     // Claude Code starts turns by itself, e.g. when a background command it said
     // it waits for ends. The adapter tells of them only to a client of AIR's
     // async tasks: as a task of type `turn`, spawned when the turn starts and

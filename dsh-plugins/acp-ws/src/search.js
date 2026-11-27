@@ -27,6 +27,8 @@ const MAX_LINE = 240;
 const SNIPPET = 60;
 const SHELL_CONTEXT = 'codeflower/shellContext';
 const STEER_NOTE = 'codeflower/steerNote';
+const ORCHESTRATOR_NOTE = 'codeflower/orchestratorNote';
+const FROM = 'codeflower/from';
 
 // ---- fuzzy matching (the page's lib/fuzzy.ts is the same) ----
 
@@ -200,7 +202,14 @@ function ripgrep(rg, args, { onLine, signal, timeoutMs }) {
 function promptText(prompt) {
   if (!Array.isArray(prompt)) return '';
   return prompt
-    .filter((block) => block?.type === 'text' && typeof block.text === 'string' && !block._meta?.[SHELL_CONTEXT] && !block._meta?.[STEER_NOTE])
+    .filter(
+      (block) =>
+        block?.type === 'text' &&
+        typeof block.text === 'string' &&
+        !block._meta?.[SHELL_CONTEXT] &&
+        !block._meta?.[STEER_NOTE] &&
+        !block._meta?.[ORCHESTRATOR_NOTE]
+    )
     .map((block) => block.text)
     .join('\n');
 }
@@ -222,7 +231,9 @@ class ChatText {
     if (entry?.kind === 'prompt') {
       this.open = null;
       const text = promptText(entry.prompt);
-      if (text.trim()) this.parts.push({ role: 'user', text, entry: index });
+      // An orchestrator's message, or its executor's question (orchestrators.js): the other chat's.
+      const from = entry.prompt?.some?.((block) => block?._meta?.[FROM]);
+      if (text.trim()) this.parts.push({ role: from ? 'peer' : 'user', text, entry: index });
       return;
     }
     if (entry?.kind !== 'update') {

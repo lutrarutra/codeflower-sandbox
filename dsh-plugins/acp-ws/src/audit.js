@@ -31,9 +31,15 @@ export function redact(text) {
   return out.replace(EMAIL, '[e-mail]');
 }
 
+// The note the bridge adds before an orchestrator's message, for the agent alone.
+const HIDDEN = ['codeflower/orchestratorNote'];
+// An orchestrator's message, or its executor's question (orchestrators.js).
+const FROM = 'codeflower/from';
+
 function promptText(prompt) {
   if (!Array.isArray(prompt)) return '';
   return prompt
+    .filter((block) => !HIDDEN.some((name) => block?._meta?.[name]))
     .map((block) => {
       if (block?.type === 'text') return block.text ?? '';
       if (block?.type === 'resource_link' || block?.type === 'resource') return `[${block.name ?? block.uri ?? block.resource?.uri ?? 'file'}]`;
@@ -87,7 +93,16 @@ export function auditTranscript(entries) {
     }
     if (entry.kind === 'prompt') {
       flush();
-      records.push({ t: entry.t, role: 'user', text: redact(promptText(entry.prompt)) });
+      const from = Array.isArray(entry.prompt) ? entry.prompt.find((block) => block?._meta?.[FROM])?._meta[FROM] : undefined;
+      records.push({
+        t: entry.t,
+        role: from ? 'peer' : 'user',
+        ...(from ? { from: from.kind, ...(typeof from.title === 'string' ? { title: redact(from.title) } : {}) } : {}),
+        text: redact(promptText(entry.prompt))
+      });
+    } else if (entry.kind === 'sent') {
+      flush();
+      records.push({ t: entry.t, role: 'sent', text: redact(entry.text ?? ''), ...(entry.withheld ? { withheld: true } : {}) });
     } else if (entry.kind === 'shell') {
       flush();
       records.push({ t: entry.t, role: 'user-shell', text: redact(entry.command ?? '') });

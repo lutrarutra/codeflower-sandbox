@@ -1,0 +1,128 @@
+#!/usr/local/bin/node
+// The executor's way back to its orchestrator (docs/architecture.md,
+// "Orchestrators"): ask it something during a turn and wait for its answer.
+// The bridge does the work (orchestrators.js).
+import { readFileSync } from 'node:fs';
+import { createConnection } from 'node:net';
+import { basename } from 'node:path';
+
+const usage = `Usage: codeflower-orchestrator COMMAND [ARGS...]
+
+The orchestrators of this chat: hosted models the user connected to it to
+direct and check your work. They may not see the data, so send them code,
+schemas, column names, aggregates and errors, never rows or identifiers
+(the codeflower-executor skill).
+
+  ask [--to KEY] [--file FILE] MESSAGE | -
+                            ask the orchestrator something and wait for its
+                            answer, which this prints. MESSAGE (- reads it
+                            from stdin); --file adds a code file (no data
+                            files); --to picks one of several orchestrators
+                            (default: the one whose message you work on, or
+                            the only one)
+  whoami                    this chat's key and its orchestrators
+
+At most 5 questions per turn. Exit status 3: the user withheld the question,
+or it got no answer.
+
+Add --json to any command for JSON.`;
+
+const MAX_FILE_CHARS = 15_000;
+
+const fail = (message, code = 1) => {
+  console.error(message);
+  process.exit(code);
+};
+
+const args = process.argv.slice(2);
+if (!args.length || args[0] === '--help' || args[0] === '-h' || args[0] === 'help') {
+  console.log(usage);
+  process.exit(args.length ? 0 : 2);
+}
+
+function parse(rest, valued) {
+  const options = {};
+  const words = [];
+  for (let index = 0; index < rest.length; index++) {
+    const arg = rest[index];
+    if (arg === '--json') options.json = true;
+    else if (valued.includes(arg)) {
+      if (index + 1 >= rest.length) fail(`${arg} needs a value\n\n${usage}`, 2);
+      options[arg.slice(2)] = rest[++index];
+    } else if (arg.startsWith('--') && arg !== '--') fail(`Unknown option ${arg}\n\n${usage}`, 2);
+    else if (arg === '--') words.push(...rest.slice(index + 1)), (index = rest.length);
+    else words.push(arg);
+  }
+  return { options, words };
+}
+
+function request(body) {
+  const socketPath = process.env.CODEFLOWER_ORCHESTRATOR_SOCKET;
+  if (!socketPath) fail('codeflower-orchestrator needs the code flower worker, which this sandbox is not running (e.g. a batch job or a run task).');
+  return new Promise((done) => {
+    const socket = createConnection(socketPath);
+    let reply = '';
+    socket.setEncoding('utf8');
+    socket.on('connect', () =>
+      socket.write(
+        `${JSON.stringify({
+          ...body,
+          // The words the bridge finds this command by among the running ones (callingChat).
+          args: process.argv.slice(2).filter((arg) => /^[A-Za-z0-9._-]{1,100}$/.test(arg) && !arg.startsWith('-')).slice(0, 3),
+          agent: process.env.CODEFLOWER_AGENT_NAME,
+          sessionId: process.env.CLAUDE_CODE_SESSION_ID || process.env.CODEX_THREAD_ID || undefined
+        })}\n`
+      )
+    );
+    socket.on('data', (chunk) => (reply += chunk));
+    socket.on('error', (error) => fail(`Could not reach the code flower worker: ${error.message}`));
+    socket.on('end', () => {
+      try {
+        done(JSON.parse(reply));
+      } catch {
+        fail('The code flower worker sent no answer.');
+      }
+    });
+  });
+}
+
+const [command, ...rest] = args;
+
+async function main() {
+  switch (command) {
+    case 'ask': {
+      const { options, words } = parse(rest, ['--to', '--file']);
+      const message = words.length === 1 && words[0] === '-' ? readFileSync(0, 'utf8') : words.join(' ');
+      if (!message.trim()) fail(`What do you ask? codeflower-orchestrator ask MESSAGE\n\n${usage}`, 2);
+      let file;
+      if (options.file) {
+        let text;
+        try {
+          text = readFileSync(options.file, 'utf8');
+        } catch (error) {
+          fail(`Could not read ${options.file}: ${error.message}`, 2);
+        }
+        if (text.length > MAX_FILE_CHARS) fail(`${options.file} is longer than ${MAX_FILE_CHARS} characters: send the part that matters`, 2);
+        file = { name: basename(options.file), text };
+      }
+      const answer = await request({ action: 'ask', message, ...(options.to ? { to: options.to } : {}), ...(file ? { file } : {}) });
+      if (answer.error) fail(answer.error, answer.ok === false ? 3 : 2);
+      return console.log(options.json ? JSON.stringify(answer, null, 2) : answer.answer);
+    }
+    case 'whoami': {
+      const { options } = parse(rest, []);
+      const answer = await request({ action: 'whoami' });
+      if (answer.error) fail(answer.error, 2);
+      if (options.json) return console.log(JSON.stringify(answer, null, 2));
+      if (!answer.key) fail('Cannot tell which chat this command runs in.', 2);
+      if (!answer.orchestrators.length) return console.log(`${answer.key}: no orchestrator`);
+      console.log(`${answer.key}, directed by:`);
+      for (const link of answer.orchestrators) console.log(`  ${link.key}  ${link.agent}${link.disconnected ? '  (disconnected)' : ''}`);
+      return;
+    }
+    default:
+      fail(`Unknown command ${command}\n\n${usage}`, 2);
+  }
+}
+
+await main();

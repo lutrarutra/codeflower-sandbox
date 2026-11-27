@@ -298,7 +298,7 @@ export function createSessionStore({
      * it came from (`origin`, in its meta), and the entries of the other's
      * transcript it starts with, before anything recorded so far.
      */
-    adopt(nativeSessionId, { entries = [], origin } = {}) {
+    adopt(nativeSessionId, { entries = [], origin, fields } = {}) {
       const state = open.get(nativeSessionId);
       if (!state) return Promise.resolve();
       state.count += entries.length;
@@ -309,8 +309,27 @@ export function createSessionStore({
           await writeFile(state.paths.transcript, copied + recorded, { mode: 0o600 });
         }
         if (origin) state.meta.origin = origin;
+        // E.g. an orchestrator's role, executor and access (orchestrators.js).
+        if (fields) Object.assign(state.meta, fields);
         await writeJsonAtomically(state.paths.meta, state.meta);
       });
+    },
+
+    /**
+     * Changes fields of a chat's meta that are not its record's (e.g. an
+     * orchestrator's access): in the open chat's, else in its file. Not a
+     * change to the chat: its time stays.
+     */
+    async setFields(nativeSessionId, fields) {
+      const state = open.get(nativeSessionId);
+      if (state) {
+        Object.assign(state.meta, fields);
+        return enqueue(state, () => writeJsonAtomically(state.paths.meta, state.meta));
+      }
+      const file = paths(nativeSessionId).meta;
+      const meta = await readJson(file);
+      if (!meta) throw new Error('No such chat');
+      await writeJsonAtomically(file, { ...meta, ...fields });
     },
 
     /**
@@ -418,6 +437,10 @@ export async function listSessions(directory, now = Date.now()) {
       updatedAt: meta.updatedAt ?? meta.createdAt ?? '',
       usage: meta.usage ?? null,
       ...(meta.origin ? { origin: meta.origin } : {}),
+      // An orchestrator chat's (orchestrators.js): the chat it directs and what it may see.
+      ...(meta.role === 'orchestrator'
+        ? { role: meta.role, executor: meta.executor, access: meta.access, ...(meta.disconnected ? { disconnected: true } : {}) }
+        : {}),
       ...(leaseIsFresh(lease, now) ? { openOn: lease.instanceId } : {})
     });
   }

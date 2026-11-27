@@ -1,0 +1,142 @@
+#!/usr/local/bin/node
+// An orchestrator's tools (docs/architecture.md, "Orchestrators"): a small MCP
+// server on stdio that Claude Code starts for an orchestrator's session, the
+// only one it has. Each tool call goes to the bridge on the orchestrator
+// socket as one JSON line, `{ op: 'tool', link, tool, input }`, where `link`
+// (this command's argument) names the orchestrator; the bridge does the work
+// (orchestrators.js).
+import { createConnection } from 'node:net';
+import { createInterface } from 'node:readline';
+
+const link = process.argv[2];
+const socketPath = process.env.CODEFLOWER_ORCHESTRATOR_SOCKET;
+
+const INSTRUCTIONS =
+  'Your executor: a chat on a model on the user\'s cluster, which alone works with the data. ' +
+  'Send it a task with ask; you get its final message and the commands it ran. It may ask you something ' +
+  'instead (answer it with answer). Never ask it for rows, records or identifiers.';
+
+const TOOLS = [
+  {
+    name: 'ask',
+    description:
+      "Sends the executor a message and waits until it is done: returns its final message with the commands it ran (their input, not their output), or a question it asks you (answer it with answer). It may take minutes. Never ask for rows, records, identifiers or anything that could identify a person.",
+    inputSchema: {
+      type: 'object',
+      properties: { message: { type: 'string', description: 'What the executor should do: one concrete step, with how to check it.' } },
+      required: ['message']
+    }
+  },
+  {
+    name: 'answer',
+    description: "Answers the executor's question, which it waits for during its turn; then waits for its reply or its next question.",
+    inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] }
+  },
+  {
+    name: 'wait',
+    description: "Waits for the executor's reply to your last message (e.g. after your ask was interrupted), or says it works on nothing of yours.",
+    inputSchema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'list_directory',
+    description:
+      "Lists a folder the executor works in: names, types and sizes, never what the files hold. Without a path: the folders (workspace, inputs, outputs, code). Use it to plan what to ask the executor; you cannot read the files.",
+    inputSchema: { type: 'object', properties: { path: { type: 'string', description: 'An absolute path in one of those folders; empty for the folders themselves.' } } }
+  },
+  {
+    name: 'list_files',
+    description: "Lists the executor's figures and reports you may see, as the user allows.",
+    inputSchema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'view_figure',
+    description: 'Shows you one of the figures list_files lists.',
+    inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }
+  },
+  {
+    name: 'read_report',
+    description: 'Reads one of the reports list_files lists, as text.',
+    inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }
+  }
+];
+
+const send = (message) => process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', ...message })}\n`);
+
+// Tool calls on their way to the bridge, by request id, to stop when cancelled.
+const calls = new Map();
+
+function relay(id, tool, input) {
+  if (!socketPath || !link) {
+    send({ id, result: { content: [{ type: 'text', text: 'The code flower worker is not reachable from here.' }], isError: true } });
+    return;
+  }
+  const socket = createConnection(socketPath);
+  calls.set(id, socket);
+  let reply = '';
+  let done = false;
+  const finish = (result) => {
+    if (done) return;
+    done = true;
+    calls.delete(id);
+    send({ id, result });
+  };
+  socket.setEncoding('utf8');
+  socket.on('connect', () => socket.write(`${JSON.stringify({ op: 'tool', link, tool, input: input ?? {} })}\n`));
+  socket.on('data', (chunk) => (reply += chunk));
+  socket.on('error', (error) => finish({ content: [{ type: 'text', text: `Could not reach the code flower worker: ${error.message}` }], isError: true }));
+  socket.on('close', () => {
+    if (done) return;
+    let answer;
+    try {
+      answer = JSON.parse(reply);
+    } catch {
+      return finish({ content: [{ type: 'text', text: 'The code flower worker sent no answer.' }], isError: true });
+    }
+    if (answer.error) return finish({ content: [{ type: 'text', text: answer.error }], isError: true });
+    const content = [];
+    if (answer.image) content.push({ type: 'image', data: answer.image.data, mimeType: answer.image.mimeType });
+    if (answer.text) content.push({ type: 'text', text: answer.text });
+    finish({ content, ...(answer.isError ? { isError: true } : {}) });
+  });
+}
+
+createInterface({ input: process.stdin }).on('line', (line) => {
+  if (!line.trim()) return;
+  let message;
+  try {
+    message = JSON.parse(line);
+  } catch {
+    return;
+  }
+  const { id, method, params } = message;
+  switch (method) {
+    case 'initialize':
+      return send({
+        id,
+        result: {
+          protocolVersion: params?.protocolVersion ?? '2025-06-18',
+          capabilities: { tools: {} },
+          serverInfo: { name: 'codeflower-executor', version: '1.0.0' },
+          instructions: INSTRUCTIONS
+        }
+      });
+    case 'ping':
+      return send({ id, result: {} });
+    case 'tools/list':
+      return send({ id, result: { tools: TOOLS } });
+    case 'tools/call':
+      if (!TOOLS.some((tool) => tool.name === params?.name)) {
+        return send({ id, result: { content: [{ type: 'text', text: `Unknown tool ${params?.name}` }], isError: true } });
+      }
+      return relay(id, params.name, params.arguments);
+    // The client stopped waiting (e.g. the user stopped the turn): so does the bridge.
+    case 'notifications/cancelled':
+      calls.get(params?.requestId)?.destroy();
+      calls.delete(params?.requestId);
+      return;
+    default:
+      if (id !== undefined && method !== undefined) send({ id, error: { code: -32601, message: `Unknown method ${method}` } });
+  }
+});
+
+process.stdin.on('end', () => process.exit(0));

@@ -20,6 +20,9 @@ import { listSessions, listSubagents, readSessionMeta, readTranscript } from './
 export const FORK_CONTEXT_META = 'codeflower/forkContext';
 const NOTICE_META = 'codeflower/notice';
 const ACTION_META = 'codeflower/action';
+// An orchestrator's message, or its executor's question (orchestrators.js), and the note before it.
+const FROM_META = 'codeflower/from';
+const ORCHESTRATOR_NOTE_META = 'codeflower/orchestratorNote';
 
 // What `read` returns at most, and the seed of a fork without a native one.
 const READ_RECORDS = 50;
@@ -31,10 +34,10 @@ const MAX_TITLE_CHARS = 200;
 
 const plural = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
 
-/** A prompt the user typed: not a notice or an action of the bridge's. */
+/** A prompt the user typed: not a notice or an action of the bridge's, nor another chat's message. */
 export function userPrompt(entry) {
   if (entry?.kind !== 'prompt' || !Array.isArray(entry.prompt)) return false;
-  return !entry.prompt.some((block) => block?._meta?.[NOTICE_META] || block?._meta?.[ACTION_META]);
+  return !entry.prompt.some((block) => block?._meta?.[NOTICE_META] || block?._meta?.[ACTION_META] || block?._meta?.[FROM_META]);
 }
 
 /** The transcript index of the user's message `number` (from 1), or undefined. */
@@ -73,7 +76,7 @@ export function forkCursor(entries, index) {
 export function promptText(prompt) {
   if (!Array.isArray(prompt)) return '';
   return prompt
-    .filter((block) => !block?._meta?.[FORK_CONTEXT_META])
+    .filter((block) => !block?._meta?.[FORK_CONTEXT_META] && !block?._meta?.[ORCHESTRATOR_NOTE_META])
     .map((block) => (block?.type === 'text' ? (block.text ?? '') : ''))
     .filter(Boolean)
     .join('\n');
@@ -92,6 +95,10 @@ export function recordsText(records) {
       switch (record.role) {
         case 'user':
           return `[${record.i}] User (message ${record.n}):\n${record.text}`;
+        case 'peer':
+          return `[${record.i}] ${record.from === 'executor' ? 'Executor' : 'Orchestrator'}${record.title ? ` (${record.title})` : ''}:\n${record.text}`;
+        case 'sent':
+          return `[${record.i}] Sent to the orchestrator${record.withheld ? ': withheld by the user' : `:\n${record.text}`}`;
         case 'agent':
           return `[${record.i}] Agent:\n${record.text}`;
         case 'tool':
@@ -273,6 +280,8 @@ export function createChats({ directory, runtimes, askUser, flush = async () => 
     const runtime = runtimes.get(source.agent);
     if (!runtime) throw new InvalidRequest(`No agent ${source.agent} on this worker`);
     if (source.meta.parentKey) throw new InvalidRequest("A subagent's chat cannot be forked: fork its parent's");
+    // Its fork would be a chat of the hosted model without an orchestrator's limits.
+    if (source.meta.role === 'orchestrator') throw new InvalidRequest("An orchestrator's chat cannot be forked");
     const entries = await entriesOf(key);
     let index;
     if (beforeEntry !== undefined) {

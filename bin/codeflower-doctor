@@ -220,6 +220,15 @@ function otherChats() {
   ];
 }
 
+// Orchestrators of this chat (codeflower-orchestrator), which only a worker's bridge serves.
+function orchestrators() {
+  if (!process.env.CODEFLOWER_ORCHESTRATOR_SOCKET) return ['- Unavailable: this sandbox runs no code flower worker (e.g. a batch job or a run task).'];
+  return [
+    '- The user may connect an orchestrator to a chat: a hosted model that directs and checks your work, and may not see the data. `codeflower-orchestrator whoami` lists this chat\'s.',
+    '- Send it code, schemas and aggregates, never rows or identifiers; ask it with `codeflower-orchestrator ask "…"`. Follow the codeflower-executor skill.'
+  ];
+}
+
 // Waiting for something (codeflower-watch), which the worker's bridge runs.
 function watches() {
   if (!process.env.CODEFLOWER_WATCH_SOCKET) {
@@ -325,6 +334,7 @@ try {
     console.log('\n## Batch jobs\n' + batchJobs().join('\n'));
     console.log('\n## Roots (the map of ideas)\n' + roots().join('\n'));
     console.log('\n## Other chats\n' + otherChats().join('\n'));
+    console.log('\n## Orchestrators\n' + orchestrators().join('\n'));
     console.log('\n## Waiting (watches)\n' + watches().join('\n'));
     if (process.env.CODEFLOWER_NETWORK === 'isolated') {
       console.log('\n## Current network allowlist');

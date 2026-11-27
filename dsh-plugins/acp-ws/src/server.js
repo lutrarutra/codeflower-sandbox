@@ -27,6 +27,7 @@ import {
   listSessions,
   listSubagents,
   parentKeyOf,
+  readSessionMeta,
   readTranscript,
   readTranscriptPage,
   renameSession,
@@ -44,6 +45,7 @@ import { createPromptQueue, queuedPromptOf } from './prompt-queue.js';
 import { createJobs, readJobsInfo } from './jobs.js';
 import { createWatches } from './watches.js';
 import { createChats, FORK_CONTEXT_META } from './chats.js';
+import { ORCHESTRATOR_PROMPT, createOrchestrators, createTurnCollector } from './orchestrators.js';
 import { createRoots, RootsRequestError } from './roots.js';
 import { addWatchNeed, endWatchNeeds, readAll as readIdeas, rootsDir } from './roots-store.js';
 import { createSubagentSettings, mergeMeta, settingsEffects } from './subagents/settings.js';
@@ -598,6 +600,11 @@ export async function startBridge(options) {
     // `codeflower-watch` reaches the bridge here: commands the bridge runs
     // every so often for a chat until a condition holds (watches.js).
     watchSocket = join(tmpdir(), `codeflower-watch-${instanceId}.sock`),
+    // codeflower-orchestrator and the orchestrators' MCP server
+    // (codeflower-orchestrator-mcp, started as `orchestratorMcp`) reach the
+    // bridge here (orchestrators.js).
+    orchestratorSocket = join(tmpdir(), `codeflower-orchestrator-${instanceId}.sock`),
+    orchestratorMcp,
     // Tests make the watches' timings short (createWatches).
     watchesTiming = {},
     jobsInfo = readJobsInfo(workerEnvironment),
@@ -659,7 +666,7 @@ export async function startBridge(options) {
     CODEFLOWER_SHOW_SOCKET: showSocket,
     CODEFLOWER_BROWSER_SOCKET: browserSocket,
     ...(jobsInfo && jobsSpool ? { CODEFLOWER_JOBS_SOCKET: jobsSocket } : {}),
-    ...(sessionsDirectory ? { CODEFLOWER_CHATS_SOCKET: chatsSocket } : {}),
+    ...(sessionsDirectory ? { CODEFLOWER_CHATS_SOCKET: chatsSocket, CODEFLOWER_ORCHESTRATOR_SOCKET: orchestratorSocket } : {}),
     CODEFLOWER_WATCH_SOCKET: watchSocket,
     // Where the browser's Chromium is (once installed), for the agent's own Playwright too (executablePath).
     ...(browserExecutable ? { CODEFLOWER_BROWSER_BIN: browserExecutable } : {})
@@ -674,6 +681,9 @@ export async function startBridge(options) {
   // The project's chats for codeflower-chat and the windows' forks (chats.js).
   let chats;
   let chatsServer;
+  // Orchestrator chats and the chats they direct (orchestrators.js).
+  let orchestrators;
+  let orchestratorsServer;
   // The project's map of ideas (roots.js), once the agents are there.
   let roots;
   const uploads = createUploads({ workspace, fileOptions, maxBytes: uploadMaxBytes, log });
@@ -1757,6 +1767,11 @@ export async function startBridge(options) {
           host.ownPrompts.set(sessionId, (host.ownPrompts.get(sessionId) ?? 0) + 1);
         }
         if (prompt) {
+          // The turn an orchestrator's message started is followed for its reply (runtime.ask).
+          turnCollectors.delete(sessionId);
+          turnCounts.set(sessionId, (turnCounts.get(sessionId) ?? 0) + 1);
+          if (request.collector) turnCollectors.set(sessionId, request.collector);
+          request.onSend?.();
           activity.turnStarted(key, sessionId);
           sessionInfo.turn(sessionId, true);
           if (request.client) {
@@ -1772,7 +1787,7 @@ export async function startBridge(options) {
         }
         writeToAgent(
           host,
-          withClientCapabilities(withSessionMeta(withMcp(host, request, { jsonrpc: '2.0', id: request.bridgeId, method, params }))),
+          withClientCapabilities(withSessionMeta(withMcp(host, request, { jsonrpc: '2.0', id: request.bridgeId, method, params }), request)),
           webSocket
         );
       };
@@ -2487,15 +2502,20 @@ export async function startBridge(options) {
 
     // The history a seeded fork's first prompt brings the agent (chats.js), by session.
     const forkSeeds = new Map();
+    // The turns whose reply someone waits for (runtime.ask), by session; and how many turns each started here.
+    const turnCollectors = new Map();
+    const turnCounts = new Map();
 
     // A chat the bridge starts for a window's fork or an agent's codeflower-chat
     // (chats.js): `fork` the agent's own fork of a chat, else a new one; its
     // record starts with `entries`, and its first prompt, if any, goes now.
-    const startChat = async ({ fork, cwd = workspace, settings, seed, entries, origin, title, prompt }) => {
+    // `fields`: more for its meta, and `orchestrator` what an orchestrator's
+    // session starts with (orchestrators.js).
+    const startChat = async ({ fork, cwd = workspace, settings, seed, entries, origin, fields, orchestrator, title, prompt }) => {
       if (!store) throw new Error('This worker keeps no chats');
       const host = await ensureAgent();
       await ensureInitialized(host);
-      const options = settings ? { settings } : {};
+      const options = { ...(settings ? { settings } : {}), ...(orchestrator ? { orchestrator } : {}) };
       const session = fork
         ? await requestAgent(host, 'session/fork', { sessionId: fork.sessionId, cwd, mcpServers: [], ...(fork.cursorId ? { cursorId: fork.cursorId } : {}) }, options)
         : await requestAgent(host, 'session/new', { cwd, mcpServers: [] }, options);
@@ -2503,7 +2523,7 @@ export async function startBridge(options) {
       const { sessionId } = session;
       const key = sessionKey(agentName, sessionId);
       await recorder?.isOpen(sessionId);
-      await store.adopt(sessionId, { entries, origin });
+      await store.adopt(sessionId, { entries, origin, fields });
       if (title) await renameSession(sessionsDirectory, key, title);
       if (seed) forkSeeds.set(sessionId, seed);
       if (prompt) {
@@ -2512,6 +2532,43 @@ export async function startBridge(options) {
         );
       }
       return { sessionId, key };
+    };
+
+    // A prompt of someone else's (an orchestrator's, or its executor's question)
+    // in a recorded chat, opened first if need be, once its turn is free: the
+    // turn's stop reason, its last message, and the tools it called with their
+    // input (orchestrators.js). `onStart` when the turn starts.
+    const ask = async (sessionId, prompt, { onStart } = {}) => {
+      if (!store) throw new InvalidRequest('This worker keeps no chats');
+      const host = await ensureAgent();
+      await ensureInitialized(host);
+      if (host.handoffs.has(sessionId)) {
+        throw new InvalidRequest(`The chat is open in ${agent.label ?? agentName}'s terminal UI: quit it there first (~q)`);
+      }
+      if (!host.sessions.has(sessionId)) {
+        const meta = await readSessionMeta(sessionsDirectory, sessionKey(agentName, sessionId));
+        if (!meta) throw new InvalidRequest(`No chat ${sessionKey(agentName, sessionId)}`);
+        await openSession(host, sessionId, meta.cwd ?? workspace);
+      }
+      const collector = createTurnCollector();
+      try {
+        const result = await requestAgent(host, 'session/prompt', { sessionId, prompt }, { collector, onSend: onStart });
+        return { stopReason: result?.stopReason ?? null, ...collector.result() };
+      } finally {
+        if (turnCollectors.get(sessionId) === collector) turnCollectors.delete(sessionId);
+      }
+    };
+
+    // What went from the chat to its orchestrator (orchestrators.js), in its
+    // record and to its windows (`_codeflower/sent`): `{ to, what: reply | question, text, ... }`.
+    const noteSent = (sessionId, entry) => {
+      const noted = { ...entry, kind: 'sent' };
+      recorder?.record(sessionId, noted);
+      toSession(sessionId, {
+        jsonrpc: '2.0',
+        method: '_codeflower/sent',
+        params: { key: sessionKey(agentName, sessionId), sessionId, entry: { t: new Date().toISOString(), ...noted } }
+      });
     };
 
     const wrapUpChat = async (host, sessionId, notice, template) => {
@@ -2971,6 +3028,7 @@ export async function startBridge(options) {
       trackSettings(host, sessionId, update);
       // A subagent's tools and usage are its parent's turn's, shown in its summary.
       if (!host.subagents.isChild(sessionId)) {
+        turnCollectors.get(sessionId)?.update(update);
         if (update?.sessionUpdate === 'tool_call') activity.toolCall(sessionId, update);
         if (update?.sessionUpdate === 'usage_update') usage.update(sessionId, update);
       }
@@ -3084,11 +3142,21 @@ export async function startBridge(options) {
     // What the bridge asks of every session the agent starts, e.g. Claude Code's
     // rate limit events, next to what the window asked.
     // So are the subagent settings the agent takes per session (subagents/settings.js).
-    const withSessionMeta = (message) => {
+    // An orchestrator's session (orchestrators.js), on every start of it, also a
+    // window's: its folder, only the bridge's MCP server, and what the agent's
+    // index.js says it takes (Claude: no tools but the web's, and its prompt).
+    const withSessionMeta = (message, request) => {
       if (!SESSION_STARTS.includes(message.method) || !protocolObject(message.params)) return message;
-      const extra = mergeMeta(agent.sessionMeta, subagentEffects().sessionMeta);
-      if (!Object.keys(extra).length) return message;
-      return { ...message, params: { ...message.params, _meta: mergeMeta(message.params._meta, extra) } };
+      let extra = mergeMeta(agent.sessionMeta, subagentEffects().sessionMeta);
+      let params = message.params;
+      const orchestrator =
+        message.method === 'session/new' ? request?.orchestrator : orchestrators?.session(agentName, params.sessionId);
+      if (orchestrator && agent.orchestrator) {
+        extra = mergeMeta(extra, agent.orchestrator({ access: orchestrator.access, prompt: ORCHESTRATOR_PROMPT }));
+        params = { ...params, cwd: orchestrator.cwd, mcpServers: [orchestrators.mcpServer(orchestrator.link)] };
+      }
+      if (!Object.keys(extra).length) return params === message.params ? message : { ...message, params };
+      return { ...message, params: { ...params, _meta: mergeMeta(params._meta, extra) } };
     };
 
     // The agent hears of everything the bridge handles for its windows, e.g.
@@ -3552,9 +3620,17 @@ export async function startBridge(options) {
           break;
         }
         case '_codeflower/terminal/start':
+          // An orchestrator's chat is not handed to the terminal UI, whose Claude Code has every tool.
+          if (params.kind === 'chat' && orchestrators?.isOrchestrator(params.sessionKey)) {
+            throw new InvalidRequest("An orchestrator's chat cannot be opened in the terminal UI");
+          }
           respond(params.kind === 'chat' ? await startChatTerminal(params, self) : await startTerminal(self, params));
           break;
         case '_codeflower/shell/run':
+          // The command's output would go to an orchestrator's model.
+          if (typeof params.sessionId === 'string' && orchestrators?.isOrchestrator(sessionKey(agentName, params.sessionId))) {
+            throw new InvalidRequest("Shell commands do not run in an orchestrator's chat: its model may not see their output");
+          }
           // Answered when the command ends; other requests keep flowing meanwhile.
           void runShell(self, params).then(respond, (error) =>
             self.send({ jsonrpc: '2.0', id: message.id, error: { code: -32602, message: error.message } })
@@ -3913,6 +3989,15 @@ export async function startBridge(options) {
       startInitialSession,
       forkKind,
       startChat,
+      ask,
+      noteSent,
+      // How many prompted turns the chat started on this worker: an executor's questions count per turn (orchestrators.js).
+      turnCount: (sessionId) => turnCounts.get(sessionId) ?? 0,
+      // Fields of a chat's meta that are not its record's (an orchestrator's access).
+      setMetaFields: (sessionId, fields) => {
+        if (!store) throw new InvalidRequest('This worker keeps no chats');
+        return store.setFields(sessionId, fields);
+      },
       async close() {
         stopPluginNotices?.();
         clearInterval(releaseTimer);
@@ -4096,7 +4181,9 @@ export async function startBridge(options) {
             // Chats fork (`_codeflower/sessions/fork`), and agents fork and start them (codeflower-chat).
             forkChats: Boolean(chats),
             // Agents' watches (codeflower-watch, `_codeflower/watches/*`).
-            ...(watches ? { watches: { active: watches.count() } } : {})
+            ...(watches ? { watches: { active: watches.count() } } : {}),
+            // Orchestrator chats (`_codeflower/orchestrators/*`), of these agents.
+            ...(orchestrators ? { orchestrators: { agents: orchestrators.agents() } } : {})
           });
           break;
         }
@@ -4320,6 +4407,27 @@ export async function startBridge(options) {
           }
           break;
         }
+        // Orchestrator chats (orchestrators.js): started on a chat for good,
+        // what they may see, figures and reports the user shares, the link ended.
+        case '_codeflower/orchestrators/list':
+          respond({ orchestrators: orchestrators ? await orchestrators.list() : [] });
+          break;
+        case '_codeflower/orchestrators/create':
+          if (!orchestrators) throw new InvalidRequest('This worker keeps no chats');
+          respond(await orchestrators.create({ executor: params.executor, agent: params.agent ?? undefined, title: params.title ?? undefined, access: params.access ?? undefined }));
+          break;
+        case '_codeflower/orchestrators/setAccess':
+          if (!orchestrators) throw new InvalidRequest('This worker keeps no chats');
+          respond(await orchestrators.setAccess({ key: params.key, access: params.access }));
+          break;
+        case '_codeflower/orchestrators/share':
+          if (!orchestrators) throw new InvalidRequest('This worker keeps no chats');
+          respond(await orchestrators.share({ executor: params.executor, key: params.orchestrator ?? undefined, path: params.path }));
+          break;
+        case '_codeflower/orchestrators/disconnect':
+          if (!orchestrators) throw new InvalidRequest('This worker keeps no chats');
+          respond(await orchestrators.disconnect({ key: params.key }));
+          break;
         // The user is done in the browser: the agent gets it back, and a
         // message if it handed it over.
         case '_codeflower/browser/handBack': {
@@ -4585,6 +4693,38 @@ export async function startBridge(options) {
     } catch (error) {
       log(`codeflower-chat is unavailable: ${error.message}`);
     }
+
+    // Orchestrators: chats of a hosted model that direct a chat on the user's
+    // own model, which alone works with the data (orchestrators.js).
+    orchestrators = createOrchestrators({
+      directory: sessionsDirectory,
+      privateDirectory: privateDirectory ?? dirname(sessionsDirectory),
+      runtimes,
+      socket: orchestratorSocket,
+      ...(orchestratorMcp ? { mcpCommand: orchestratorMcp } : {}),
+      thumbnails,
+      fileOptions,
+      folders: async () => searchFolders(workspace, (await describe())?.mounts ?? []),
+      changed: (list) => {
+        for (const target of clients) {
+          if (target.agentName === undefined) target.send({ jsonrpc: '2.0', method: '_codeflower/orchestrators/changed', params: { orchestrators: list } });
+        }
+      },
+      sessionsChanged: () => {
+        for (const target of clients) {
+          if (target.agentName === undefined) target.send({ jsonrpc: '2.0', method: '_codeflower/sessions/changed', params: {} });
+        }
+      },
+      log
+    });
+    await orchestrators.load();
+    try {
+      orchestratorsServer = await startShowServer(orchestratorSocket, (request, { signal }) =>
+        orchestrators.handle(request, { signal, callingChat: (asked) => callingChat(asked, 'codeflower-orchestrator') })
+      );
+    } catch (error) {
+      log(`Orchestrators are unavailable: ${error.message}`);
+    }
   }
 
   // codeflower-job: batch jobs, asked for in the chat its command runs in.
@@ -4737,6 +4877,7 @@ export async function startBridge(options) {
       await browserServer?.close();
       await jobsServer?.close();
       await chatsServer?.close();
+      await orchestratorsServer?.close();
       await watchesServer?.close();
       jobs?.close();
       await watches?.close();

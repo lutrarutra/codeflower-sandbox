@@ -88,6 +88,11 @@ history (read-only), `fork` copies a chat (all of it, or from before one of the 
 try another way, and `new --title T [--agent NAME] MESSAGE` starts a chat that works on its own. The
 user allows each fork and new chat. Follow the codeflower-chats skill.
 
+The user may connect an orchestrator to a chat: a hosted model that directs and checks your work
+but may not see the data. Its messages are marked as the orchestrator's; send it code, schemas and
+aggregates, never rows or identifiers, and ask it things with `codeflower-orchestrator ask`. Follow
+the codeflower-executor skill.
+
 To wait for something (a pull request merged, a file written, a server up, a line in a log), use
 `codeflower-watch` rather than a sleep loop: `codeflower-watch start --every 2m --until
 'match:MERGED|CLOSED' -- gh pr view 12 --json state` runs the command now and every 2 minutes until

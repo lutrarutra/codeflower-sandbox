@@ -19,6 +19,7 @@ const input = createInterface({ input: process.stdin });
 let nextSession = Number(process.env.FAKE_ACP_FIRST_SESSION) || 1;
 let nextRequest = 1;
 let pendingPrompt;
+const sessionStarts = new Map();
 // Turns that run until the test lets them finish, by session.
 const longTasks = new Map();
 // Steering requests, as the agent got them.
@@ -304,6 +305,7 @@ input.on('line', async (line) => {
         mcp: (message.params?.mcpServers ?? []).map((server) => server.command ?? server.url)
       });
       sessionMeta.set(sessionId, message.params?._meta ?? null);
+      sessionStarts.set(sessionId, { cwd: message.params?.cwd, mcpServers: message.params?.mcpServers ?? [] });
       send({ jsonrpc: '2.0', id: message.id, result: { sessionId, configOptions: configOptions(sessionId), ...mcpEcho(message) } });
       break;
     }
@@ -332,7 +334,8 @@ input.on('line', async (line) => {
     case 'session/prompt': {
       const seed = message.params.prompt?.find((block) => block?._meta?.['codeflower/forkContext']);
       if (seed) seeds.set(message.params.sessionId, seed.text);
-      const text = message.params.prompt?.filter((block) => block !== seed)[0]?.text;
+      // The note before an orchestrator's message is for the model to read, not a request.
+      const text = message.params.prompt?.filter((block) => block !== seed && !block?._meta?.['codeflower/orchestratorNote'])[0]?.text;
       if (forking) {
         const cursorId = `cursor-${nextMessage++}`;
         send({
@@ -588,6 +591,11 @@ input.on('line', async (line) => {
         reply(sessionId, message.id, 'it failed');
         break;
       }
+      // How the session last started: its folder and MCP servers.
+      if (text === 'what start') {
+        reply(message.params.sessionId, message.id, JSON.stringify(sessionStarts.get(message.params.sessionId) ?? null));
+        break;
+      }
       if (text === 'what meta') {
         reply(message.params.sessionId, message.id, JSON.stringify(sessionMeta.get(message.params.sessionId)));
         break;
@@ -740,6 +748,7 @@ input.on('line', async (line) => {
       costs.delete(message.params?.sessionId);
       lostSessions.delete(message.params?.sessionId);
       sessionMeta.set(message.params?.sessionId, message.params?._meta ?? null);
+      sessionStarts.set(message.params?.sessionId, { cwd: message.params?.cwd, mcpServers: message.params?.mcpServers ?? [] });
       if (!tasks.has(message.params?.sessionId)) tasks.set(message.params?.sessionId, { systemPrompt: null });
       // Like Claude's adapter: the settings this process has for it, its defaults after a restart.
       send({ jsonrpc: '2.0', id: message.id, result: { configOptions: configOptions(message.params?.sessionId), ...mcpEcho(message) } });
