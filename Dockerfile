@@ -69,7 +69,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=${CODEFLOWER_AUDI
 # codeflower-ui's web build, pinned by tag. A development build uses the
 # workspace's build instead: --build-context page=../ui/dist-web.
 FROM scratch AS ui-source
-ADD --keep-git-dir=false https://github.com/lutrarutra/codeflower-ui.git#v0.47.0 /
+ADD --keep-git-dir=false https://github.com/lutrarutra/codeflower-ui.git#v0.48.0 /
 
 FROM node:24-bookworm-slim@sha256:873f586f3794f52281bd039bf02c048a0be08fde619338f9941bad1eb6b34530 AS page-build
 WORKDIR /ui
