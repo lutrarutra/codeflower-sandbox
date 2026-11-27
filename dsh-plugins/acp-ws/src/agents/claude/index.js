@@ -102,6 +102,13 @@ export default function claude({ descriptor, home, modules, environment }) {
     commands: {
       env: ({ wrapper, environment }) => (environment.CLAUDE_CODE_SHELL_PREFIX ? {} : { CLAUDE_CODE_SHELL_PREFIX: wrapper })
     },
+    // A subagent stops on its own like a chat, with a `session/cancel` of its
+    // session, although the draft form grants no cancel: launch.js has the
+    // adapter take it (stop-subagent.js).
+    subagents: {
+      cancel: (childId, summary) =>
+        summary?.state === 'running' ? { method: 'session/cancel', params: { sessionId: childId } } : undefined
+    },
     autonomousTurn(update) {
       if (typeof update?.asyncTaskId !== 'string') return undefined;
       if (update.sessionUpdate === 'async_task_spawned' && update.taskType === 'turn') return { id: update.asyncTaskId, started: true };
