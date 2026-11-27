@@ -59,3 +59,13 @@ test('rejects malformed action metadata', () => {
     /mode must be/
   );
 });
+
+test("an action's .orchestrator.md sibling is the prompt it takes in an orchestrator's chat", async (t) => {
+  const actions = await readActions(templates);
+  assert.match(actions.find((action) => action.id === 'generate-report').orchestratorPrompt, /review it with the executor/i);
+  assert.equal(actions.find((action) => action.id === 'methods').orchestratorPrompt, undefined);
+  const directory = await mkdtemp(join(tmpdir(), 'cf-actions-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  await writeFile(join(directory, '01-lonely.orchestrator.md'), 'x');
+  await assert.rejects(readActions(directory), /no action 01-lonely\.md/);
+});

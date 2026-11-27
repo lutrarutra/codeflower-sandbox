@@ -3,6 +3,7 @@ import { basename, join } from 'node:path';
 
 const ACTION_FILE = /^(\d+)-([a-z0-9]+(?:-[a-z0-9]+)*)\.md$/;
 const FIELDS = new Set(['title', 'description', 'icon', 'mode']);
+const ORCHESTRATOR_SUFFIX = '.orchestrator.md';
 
 export function parseActionTemplate(fileName, text) {
   const name = basename(fileName);
@@ -37,11 +38,21 @@ export function parseActionTemplate(fileName, text) {
 export async function readActions(directory) {
   const entries = await readdir(directory, { withFileTypes: true });
   const files = entries.filter((entry) => entry.isFile() && entry.name.endsWith('.md'));
+  // An action's sibling NN-name.orchestrator.md: the prompt it takes in an orchestrator's chat, plain text.
+  const orchestrator = files.filter((file) => file.name.endsWith(ORCHESTRATOR_SUFFIX));
   const actions = await Promise.all(
-    files.map(async (file) =>
-      parseActionTemplate(file.name, await readFile(join(directory, file.name), 'utf8'))
-    )
+    files
+      .filter((file) => !file.name.endsWith(ORCHESTRATOR_SUFFIX))
+      .map(async (file) => parseActionTemplate(file.name, await readFile(join(directory, file.name), 'utf8')))
   );
+  for (const file of orchestrator) {
+    const name = `${file.name.slice(0, -ORCHESTRATOR_SUFFIX.length)}.md`;
+    const action = actions.find((candidate) => ACTION_FILE.exec(name)?.[2] === candidate.id);
+    if (!action) throw new Error(`${file.name}: no action ${name} for it`);
+    const prompt = (await readFile(join(directory, file.name), 'utf8')).trim();
+    if (!prompt) throw new Error(`${file.name}: prompt is empty`);
+    action.orchestratorPrompt = prompt;
+  }
   actions.sort((a, b) => a.order - b.order || a.id.localeCompare(b.id));
 
   const ids = new Set();
