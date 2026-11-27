@@ -8,7 +8,7 @@ ARG CLAUDE_AGENT_SDK_VERSION=0.3.330
 # codeflower-audit, for paper audits (the audit stage below).
 ARG CODEFLOWER_AUDIT_VERSION=v0.3.0
 
-FROM node:24-bookworm-slim@sha256:873f586f3794f52281bd039bf02c048a0be08fde619338f9941bad1eb6b34530 AS dsh-runtime
+FROM node:26-bookworm-slim@sha256:0042e17d232a87a2cd485be1da7900fca4d10a4ad11b29e9285da1d2e54798c9 AS dsh-runtime
 ARG CLAUDE_AGENT_SDK_VERSION
 
 # Harness runtimes: DeepSeek Harness, the Claude Code and Codex ACP adapters,
@@ -71,7 +71,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=${CODEFLOWER_AUDI
 FROM scratch AS ui-source
 ADD --keep-git-dir=false https://github.com/lutrarutra/codeflower-ui.git#v0.50.0 /
 
-FROM node:24-bookworm-slim@sha256:873f586f3794f52281bd039bf02c048a0be08fde619338f9941bad1eb6b34530 AS page-build
+FROM node:26-bookworm-slim@sha256:0042e17d232a87a2cd485be1da7900fca4d10a4ad11b29e9285da1d2e54798c9 AS page-build
 WORKDIR /ui
 COPY --from=ui-source / ./
 RUN npm ci --no-audit --no-fund && npm run build:web
