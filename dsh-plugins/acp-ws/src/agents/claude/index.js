@@ -8,9 +8,18 @@ const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 const USAGE_TIMEOUT_MS = 15_000;
 // How an async task's end reads as a turn's stop reason.
 const TURN_END = { completed: 'end_turn', stopped: 'cancelled', failed: 'error' };
+// The longest a Bash command may run: 7 days, for long pipelines run in the
+// background. Under the SDK, Claude Code stops a background command after 30
+// minutes unless its `timeout` says longer, and that `timeout` is capped at
+// BASH_MAX_TIMEOUT_MS (10 minutes by default; above 2 hours it raises the
+// background cap too). Without this, the agent starts long jobs with nohup,
+// where neither it nor the chat hears when they end.
+const BASH_MAX_TIMEOUT_MS = String(7 * 24 * 60 * 60_000);
 
 export default function claude({ descriptor, home, modules, environment }) {
   return {
+    // The user's own BASH_MAX_TIMEOUT_MS (the worker's environment) wins.
+    env: { ...(environment?.BASH_MAX_TIMEOUT_MS ? {} : { BASH_MAX_TIMEOUT_MS }), ...descriptor.env },
     // Claude Code is not in the image, whose license does not allow passing it
     // on: the app downloads it and binds the SDK into `modules` and the CLI at
     // CLAUDE_CODE_EXECUTABLE. Says what is missing, if anything.

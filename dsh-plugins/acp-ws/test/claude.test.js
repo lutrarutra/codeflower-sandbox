@@ -26,6 +26,14 @@ test('the image runs Claude Code from where the app binds it in', async () => {
   assert.equal(descriptor.env.CLAUDE_CODE_EXECUTABLE, '/opt/codeflower/agents/claude/claude');
 });
 
+test('long background commands: Claude Code may run a command for up to 7 days, unless the user set its limit', async (t) => {
+  const { claude, executable } = await setup(t);
+  assert.deepEqual(claude.env, { BASH_MAX_TIMEOUT_MS: '604800000', CLAUDE_CODE_EXECUTABLE: executable });
+  const registry = (await loadRegistry()).filter(({ descriptor }) => descriptor.id === 'claude');
+  const own = createAgents({ nodePath: 'node', environment: { BASH_MAX_TIMEOUT_MS: '3600000' }, agents: registry }).claude;
+  assert.equal(own.env.BASH_MAX_TIMEOUT_MS, undefined);
+});
+
 test('reads the turns Claude Code starts by itself from its async tasks', async (t) => {
   const { claude } = await setup(t);
   assert.deepEqual(claude.clientCapabilities._meta.jetbrains.air, { version: 1, capabilities: ['asyncTasks', 'backgroundSubagents'] });

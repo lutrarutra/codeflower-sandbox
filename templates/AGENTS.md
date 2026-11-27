@@ -238,10 +238,13 @@ track. Use `codeflower-roots` (the codeflower-roots skill) from the start:
 4. **Iterate.** Let what you see decide the next step (thresholds, parameters, another method), and
    note the decisions and why you made them.
 5. **Long steps** (more than a few minutes: analyses, pipelines, builds, installs): run them in the
-   background with output to `logs/` (your shell tool's background option, where it has one), and
-   check on them, rather than blocking. A message the user sends meanwhile then does not stop them.
-   To wait for one to finish, watch for its result or a line in its log with `codeflower-watch` and
-   end your turn, rather than polling in a loop.
+   background with output to `logs/`, rather than blocking. A message the user sends meanwhile then
+   does not stop them. Use your shell tool's background option where it has one (Claude Code: with
+   a `timeout` as long as the step may take, up to 7 days; without one it stops after 30 minutes),
+   not `nohup … &`: you then hear when the step exits, with its exit status, and the user sees it
+   running. Then end your turn rather than polling in a loop. Before telling the user that a step
+   runs, check it (your background tasks, `pgrep -af`). The codeflower-watch skill ("Long jobs you
+   start yourself") covers shells without a background option, and watching a log's progress.
 
 Figures: before the first figure of an analysis or a report, ask the user which plotting library
 they want their figures in: matplotlib or seaborn (Python), Plotly (interactive in the report),
