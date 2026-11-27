@@ -22,10 +22,13 @@ import {
   ORCHESTRATOR_NOTE_META,
   cleanAccess,
   createTurnCollector,
+  notebookSource,
   replyText,
   reportText,
   toolInput
 } from '../src/orchestrators.js';
+import { createExecutorFolders, parts, resolveIncludes } from '../src/executor-folder.js';
+import { createOrchestrators } from '../src/orchestrators.js';
 import { startBridge } from '../src/server.js';
 import { sessionKey } from '../src/sessions.js';
 
@@ -53,20 +56,55 @@ test("a turn's reply is its last message, with the tools it called and their inp
   turn.update({ sessionUpdate: 'tool_call', toolCallId: 't2', title: 'Edit fit.R', kind: 'edit', rawInput: { path: 'fit.R', new: 'PAT-123,Jane Doe' } });
   turn.update({ sessionUpdate: 'tool_call', toolCallId: 't3', title: 'python', kind: 'execute', rawInput: { code: 'x'.repeat(3000) } });
   turn.update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'HR 1.4 (95% CI 1.1-1.8).' } });
-  const { reply, commands } = turn.result();
+  const { reply, commands, written } = turn.result();
   assert.equal(reply, 'HR 1.4 (95% CI 1.1-1.8).');
   // The command is its title: not repeated.
-  assert.deepEqual(commands[0], { title: 'Rscript fit.R', kind: 'execute' });
+  assert.deepEqual(commands[0], { title: 'Rscript fit.R', kind: 'execute', command: true });
   assert.equal(commands[1].input, 'path: fit.R');
   assert.match(commands[2].input, /… \(cut\)$/);
   assert.ok(commands[2].input.length < 2100);
-  const text = replyText({ reply, commands, stopReason: 'max_tokens' });
+  const text = replyText({ reply, commands, written, stopReason: 'max_tokens' });
   assert.match(text, /ended early \(max_tokens\)/);
   assert.match(text, /1\. Rscript fit\.R\n2\. Edit fit\.R\n {3}path: fit\.R/);
+  // The bridge's own count comes first; the edited script is listed for read_code.
+  assert.match(text, /^This step \(the bridge's count\): 2 commands, 0 failed, 1 script written, 0 files shown, 0 questions asked\./);
+  assert.match(text, /Code it wrote or changed this step \(read it with read_code\):\n- fit\.R/);
   assert.doesNotMatch(text, /Jane Doe/);
   assert.equal(toolInput({ file_path: '/w/a.csv', content: 'id,name' }), 'file_path: /w/a.csv');
   assert.equal(toolInput({ content: 'id,name' }), undefined);
   assert.equal(toolInput({ cmd: ['ls', '-l'] }), 'ls -l');
+});
+
+test("a turn's commands carry their exit status, never their output; too much work is flagged", () => {
+  const turn = createTurnCollector();
+  // Claude Code: a failed Bash call; dsh: exit code in rawOutput; Codex: exit_code.
+  turn.update({ sessionUpdate: 'tool_call', toolCallId: 'a', title: 'python plot.py', kind: 'execute', rawInput: { command: 'python plot.py' } });
+  turn.update({ sessionUpdate: 'tool_call_update', toolCallId: 'a', status: 'failed', rawOutput: 'Traceback… PAT-123' });
+  turn.update({ sessionUpdate: 'tool_call', toolCallId: 'b', title: 'bash', kind: 'other', rawInput: { command: 'Rscript x.R' } });
+  turn.update({ sessionUpdate: 'tool_call_update', toolCallId: 'b', status: 'completed', rawOutput: { exitCode: 2, output: 'Jane Doe' } });
+  turn.update({ sessionUpdate: 'tool_call', toolCallId: 'c', title: 'ls', kind: 'execute', rawInput: { command: ['ls'] } });
+  turn.update({ sessionUpdate: 'tool_call_update', toolCallId: 'c', status: 'completed', rawOutput: { exit_code: 0, stdout: 'a b' } });
+  // Written files: by input, by Codex's patch, by location; a failed write wrote nothing.
+  turn.update({ sessionUpdate: 'tool_call', toolCallId: 'd', title: 'Write', kind: 'edit', rawInput: { file_path: '/w/scripts/01.py', content: 'x' }, status: 'completed' });
+  turn.update({ sessionUpdate: 'tool_call', toolCallId: 'e', title: 'Editing files', kind: 'edit', rawInput: { changes: { '/w/scripts/02.R': {}, '/w/notes.txt': {} } }, status: 'completed' });
+  turn.update({ sessionUpdate: 'tool_call', toolCallId: 'f', title: 'Edit', kind: 'edit', locations: [{ path: '/w/scripts/03.sql' }], status: 'completed' });
+  turn.update({ sessionUpdate: 'tool_call', toolCallId: 'g', title: 'Write', kind: 'edit', rawInput: { file_path: '/w/scripts/04.py', content: 'y' }, status: 'failed' });
+  const result = turn.result();
+  assert.deepEqual(result.commands.slice(0, 3).map((command) => [command.status, command.exitCode]), [['failed', undefined], ['failed', 2], ['ok', 0]]);
+  assert.deepEqual(result.written, ['/w/scripts/01.py', '/w/scripts/02.R', '/w/notes.txt', '/w/scripts/03.sql']);
+  const text = replyText({ reply: 'All plots done.', ...result, files: [{ path: '/w/f.png', status: 'visible' }], questions: 1 });
+  assert.doesNotMatch(text, /PAT-123|Jane Doe|a b/);
+  assert.match(text, /1\. python plot\.py: failed\n/);
+  assert.match(text, /2\. bash: failed \(exit 2\)\n {3}Rscript x\.R/);
+  assert.match(text, /3\. ls: ok/);
+  assert.match(text, /3 commands, 2 failed, 3 scripts written, 1 file shown, 1 question asked\. This is more than one small step/);
+  assert.match(text, /Some tool calls failed/);
+  assert.match(text, /Other files it wrote with its file tools:\n- \/w\/notes\.txt/);
+  assert.match(text, /- \/w\/f\.png: shared with you: look at it/);
+  assert.doesNotMatch(text, /It installed software/);
+  const installing = createTurnCollector();
+  installing.update({ sessionUpdate: 'tool_call', toolCallId: 'i', title: 'bash', kind: 'execute', rawInput: { command: 'uv pip install lifelines' }, status: 'completed' });
+  assert.match(replyText({ reply: 'Done.', ...installing.result() }), /It installed software \(command 1 below\): was that in your step\?/);
 });
 
 test("a report's text: HTML without scripts, styles and tags", () => {
@@ -146,7 +184,7 @@ function mcpClient(t, link, socket) {
   return { request, tool };
 }
 
-async function start(t) {
+async function start(t, { executorAgent = 'codex' } = {}) {
   const directory = await realpath(await mkdtemp(join(tmpdir(), 'cf-orch-')));
   const workspace = join(directory, 'state', 'workspace');
   const sessionsDirectory = join(directory, 'state', 'sessions');
@@ -171,6 +209,8 @@ async function start(t) {
     watchSocket: join(directory, 'watch.sock'),
     orchestratorSocket,
     orchestratorMcp: [process.execPath, mcpCommand],
+    executorText: '# Executor\n\nOne step at a time.\n',
+    orchestratorRootsCommand: [process.execPath, fileURLToPath(new URL('../../../bin/codeflower-roots', import.meta.url))],
     log: (message) => process.env.BRIDGE_DEBUG && console.error(message)
   });
   t.after(async () => {
@@ -195,14 +235,15 @@ async function start(t) {
     });
   const say = async (socket, sessionId, text) => (await call(socket, 'session/prompt', { sessionId, prompt: [{ type: 'text', text }] })).result;
 
-  // An executor chat (Codex), and its orchestrator (Claude).
+  // A pair: an executor chat (Codex) and its orchestrator (Claude), made together; a window opens the executor.
   const worker = await open();
-  const codex = await open('codex');
+  const created = (await call(worker, '_codeflower/orchestrators/create', { executor: { agent: executorAgent }, title: 'Survival' })).result;
+  const executor = created.executor;
+  const executorId = executor.slice(`${executorAgent}-`.length);
+  const codex = await open(executorAgent);
   await call(codex, 'initialize', { protocolVersion: 1 });
-  const executorId = (await call(codex, 'session/new', { cwd: workspace, mcpServers: [] })).result.sessionId;
+  await call(codex, 'session/resume', { sessionId: executorId, cwd: workspace, mcpServers: [] });
   await say(codex, executorId, 'hello');
-  const executor = sessionKey('codex', executorId);
-  const created = (await call(worker, '_codeflower/orchestrators/create', { executor })).result;
   const meta = JSON.parse(await readFile(join(sessionsDirectory, created.key, 'meta.json'), 'utf8'));
   const transcript = async (key) => (await call(worker, '_codeflower/sessions/transcript', { key })).result.entries;
   return { bridge, directory, workspace, sessionsDirectory, orchestratorSocket, worker, codex, open, say, executorAsks, executor, executorId, created, meta, transcript };
@@ -210,8 +251,7 @@ async function start(t) {
 
 test("an orchestrator's session: its folder, the bridge's MCP server only, no tools but the web's, its prompt", async (t) => {
   const { worker, open, say, executor, created, meta, sessionsDirectory } = await start(t);
-  // The executor's title may not be written yet: named after it, or untitled.
-  assert.match(created.title, /^Orchestrator of /);
+  assert.equal(created.title, 'Survival');
   assert.equal(meta.role, 'orchestrator');
   assert.equal(meta.executor, executor);
   assert.deepEqual(meta.access, DEFAULT_ACCESS);
@@ -237,8 +277,8 @@ test("an orchestrator's session: its folder, the bridge's MCP server only, no to
   assert.match((await call(worker, '_codeflower/sessions/fork', { key: created.key })).error.message, /cannot be forked/);
   assert.match((await call(claude, '_codeflower/shell/run', { sessionId, runId: 'r1', command: 'ls' })).error.message, /orchestrator/);
   assert.match((await call(worker, '_codeflower/terminal/start', { kind: 'chat', sessionKey: created.key })).error.message, /terminal UI/);
-  // Nor an orchestrator of its own.
-  assert.match((await call(worker, '_codeflower/orchestrators/create', { executor: created.key })).error.message, /cannot have an orchestrator/);
+  // An existing chat cannot be made an executor: pairs are made together.
+  assert.match((await call(worker, '_codeflower/orchestrators/create', { executor: created.key })).error.message, /executor chat of its own/);
 
   // A window resumes it in a new Claude Code, without the web now: the same limits, from its record.
   await call(worker, '_codeflower/orchestrators/setAccess', { key: created.key, access: { web: false } });
@@ -267,12 +307,13 @@ test('the orchestrator asks its executor and gets its reply and commands; the ex
   const init = await mcp.request('initialize', { protocolVersion: '2025-06-18' });
   assert.equal(init.result.serverInfo.name, 'codeflower-executor');
   const names = (await mcp.request('tools/list')).result.tools.map((tool) => tool.name);
-  assert.deepEqual(names, ['ask', 'answer', 'wait', 'list_directory', 'list_files', 'view_figure', 'read_report']);
+  assert.deepEqual(names, ['ask', 'answer', 'wait', 'read_code', 'roots', 'write_draft', 'report_guide', 'list_directory', 'environment', 'list_files', 'view_figure', 'read_report']);
 
   const result = await mcp.tool('ask', { message: 'run failing command' });
   assert.equal(result.isError, undefined);
   assert.match(result.content[0].text, /The executor's reply:\nit failed/);
-  assert.match(result.content[0].text, /1\. bash\n {3}false/);
+  // Codex reported it completed (only dsh's marker is read, by its adjustUpdate): ok, with its input.
+  assert.match(result.content[0].text, /1\. bash: ok\n {3}false/);
   // Nothing left to wait for.
   assert.match((await mcp.tool('wait')).content[0].text, /not working on anything of yours/);
 
@@ -397,11 +438,263 @@ test("the executor's questions are limited per turn of its own", async (t) => {
   for (let round = 0; round < 2; round++) {
     codex.send(JSON.stringify({ jsonrpc: '2.0', id: 9100 + round, method: 'session/prompt', params: { sessionId: executorId, prompt: [{ type: 'text', text: 'long task' }] } }));
     await new Promise((resolve) => setTimeout(resolve, 200));
-    for (let index = 0; index < 5; index++) assert.equal((await executorAsks(executorId, ['ask', `Question ${index}?`])).code, 0);
+    for (let index = 0; index < 10; index++) assert.equal((await executorAsks(executorId, ['ask', `Question ${index}?`])).code, 0);
     const over = await executorAsks(executorId, ['ask', 'One more?']);
     assert.equal(over.code, 2);
-    assert.match(over.stderr, /5 questions this turn/);
+    assert.match(over.stderr, /10 questions this turn/);
     codex.send(JSON.stringify({ jsonrpc: '2.0', id: 9200 + round, method: 'fake/finish', params: { sessionId: executorId } }));
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
+});
+
+// ---- executors: a role of their own ----
+
+const templates = fileURLToPath(new URL('../../../templates/', import.meta.url));
+
+test("the executor's instructions take AGENTS.md's marked parts word for word, and stay short", async () => {
+  const agents = await readFile(join(templates, 'AGENTS.md'), 'utf8');
+  const text = resolveIncludes(await readFile(join(templates, 'EXECUTOR.md'), 'utf8'), { 'AGENTS.md': agents });
+  assert.doesNotMatch(text, /<!-- include/);
+  for (const name of ['where', 'doctor', 'jobs', 'install', 'r']) assert.ok(text.includes(parts(agents).get(name)), name);
+  assert.match(text, /codeflower-path/);
+  assert.match(text, /codeflower-job submit/);
+  assert.match(text, /codeflower-doctor --executor/);
+  // Nothing of what an executor does not do.
+  assert.doesNotMatch(text, /codeflower-roots|storyteller|## First messages|codeflower-browser|codeflower-chat /);
+  const lines = text.split('\n').length;
+  assert.ok(lines < 230, `EXECUTOR.md resolves to ${lines} lines`);
+  assert.ok(lines < agents.split('\n').length * 0.7);
+  assert.throws(() => resolveIncludes('<!-- include AGENTS.md#nowhere -->', { 'AGENTS.md': agents }), /no part nowhere/);
+});
+
+test("an executor's folder: written at creation, updated by a new version only while unedited", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'cf-exec-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const installed = join(directory, 'run', 'templates', 'EXECUTOR.md');
+  const first = createExecutorFolders({ directory: join(directory, 'executors'), installed, text: 'v1\n' });
+  await first.update();
+  const kept = await first.create('a');
+  const edited = await first.create('b');
+  assert.equal(await readFile(join(kept, 'CLAUDE.md'), 'utf8'), '@AGENTS.md\n');
+  await writeFile(join(edited, 'AGENTS.md'), 'my own\n');
+  await createExecutorFolders({ directory: join(directory, 'executors'), installed, text: 'v2\n' }).update();
+  assert.equal(await readFile(join(kept, 'AGENTS.md'), 'utf8'), 'v2\n');
+  assert.equal(await readFile(join(edited, 'AGENTS.md'), 'utf8'), 'my own\n');
+  assert.equal(await readFile(installed, 'utf8'), 'v2\n');
+});
+
+test('a pair: the executor chat starts in its own folder, as role executor, named after its orchestrator', async (t) => {
+  const { worker, codex, say, executor, executorId, created, meta, sessionsDirectory } = await start(t);
+  const folder = join(sessionsDirectory, '..', 'executors', meta.link);
+  assert.equal(await readFile(join(folder, 'AGENTS.md'), 'utf8'), '# Executor\n\nOne step at a time.\n');
+  const executorMeta = JSON.parse(await readFile(join(sessionsDirectory, executor, 'meta.json'), 'utf8'));
+  assert.equal(executorMeta.role, 'executor');
+  assert.equal(executorMeta.orchestrator, created.key);
+  assert.equal(executorMeta.link, meta.link);
+  const listed = (await call(worker, '_codeflower/sessions/list')).result.sessions.find((session) => session.key === executor);
+  assert.equal(listed.role, 'executor');
+  assert.equal(listed.title, 'Survival');
+  // A window opened it with the workspace: it works in its folder all the same.
+  const started = JSON.parse((await say(codex, executorId, 'what start')) && (await lastText(codex)));
+  assert.equal(started.cwd, folder);
+  // Codex cannot limit its tools: the list says so.
+  const [listedPair] = (await call(worker, '_codeflower/orchestrators/list')).result.orchestrators;
+  assert.equal(listedPair.executorLimited, false);
+  assert.equal(listedPair.executorAgent, 'codex');
+});
+
+test("a Claude executor gets fewer tools and the workspace next to its folder", async (t) => {
+  const { worker, codex: claude, say, executorId, workspace } = await start(t, { executorAgent: 'claude' });
+  const sent = JSON.parse((await say(claude, executorId, 'what meta')) && (await lastText(claude)));
+  assert.deepEqual(sent.claudeCode.options.tools, ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'NotebookEdit']);
+  assert.deepEqual(sent.claudeCode.options.additionalDirectories, [workspace]);
+  assert.deepEqual(sent.claudeCode.options.settingSources, ['user', 'project']);
+  assert.equal(sent.systemPrompt, undefined);
+  const [pair] = (await call(worker, '_codeflower/orchestrators/list')).result.orchestrators;
+  assert.equal(pair.executorLimited, true);
+  assert.deepEqual(pair.executorTools, ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'NotebookEdit']);
+});
+
+test('an orchestrator attached to an ordinary chat, from before pairs, is disconnected at start', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'cf-old-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const sessions = join(directory, 'sessions');
+  const write = async (key, meta) => {
+    await mkdir(join(sessions, key), { recursive: true });
+    await writeFile(join(sessions, key, 'meta.json'), JSON.stringify({ harness: key.split('-')[0], nativeSessionId: key.split('-').slice(1).join('-'), ...meta }));
+  };
+  await write('codex-old', {});
+  await write('claude-orch', { role: 'orchestrator', executor: 'codex-old', link: 'l1' });
+  await write('codex-new', { role: 'executor', link: 'l2' });
+  await write('claude-pair', { role: 'orchestrator', executor: 'codex-new', link: 'l2' });
+  const written = [];
+  const runtime = (name) => ({ name, agent: {}, setMetaFields: async (sessionId, fields) => written.push([`${name}-${sessionId}`, fields]) });
+  const orchestrators = createOrchestrators({ directory: sessions, privateDirectory: directory, runtimes: new Map([['claude', runtime('claude')], ['codex', runtime('codex')]]), socket: 'x' });
+  await orchestrators.load();
+  assert.deepEqual(written, [['claude-orch', { disconnected: true }]]);
+  const listed = await orchestrators.list();
+  assert.equal(listed.find((link) => link.key === 'claude-orch').disconnected, true);
+  assert.equal(listed.find((link) => link.key === 'claude-pair').disconnected, undefined);
+  assert.equal(orchestrators.isExecutor('codex-old'), false);
+  assert.equal(orchestrators.isExecutor('codex-new'), true);
+});
+
+test('the orchestrator reads the code its executor wrote in its steps, and only that; the user sees it go', async (t) => {
+  const { meta, orchestratorSocket, workspace, worker, created, executor, transcript } = await start(t);
+  const mcp = mcpClient(t, meta.link, orchestratorSocket);
+  await mcp.request('initialize', {});
+  const script = join(workspace, 'scripts', '01_load.py');
+  const other = join(workspace, 'scripts', 'secret.py');
+  await mkdir(join(workspace, 'scripts'), { recursive: true });
+  await writeFile(other, 'x = 1\n');
+  const replied = (await mcp.tool('ask', { message: `write script ${script}` })).content[0].text;
+  assert.match(replied, /1 script written/);
+  assert.match(replied, new RegExp(`Code it wrote or changed this step \\(read it with read_code\\):\\n- ${script}`));
+  const read = await mcp.tool('read_code', { path: script });
+  assert.equal(read.isError, undefined);
+  assert.match(read.content[0].text, /pd\.read_csv\('x\.csv'\)/);
+  // Not a file it did not write in a step.
+  assert.equal((await mcp.tool('read_code', { path: other })).isError, true);
+  const noted = (await transcript(executor)).filter((entry) => entry.kind === 'sent' && entry.what === 'code');
+  assert.equal(noted.length, 1);
+  assert.equal(noted[0].path, script);
+  // The user may turn it off.
+  await call(worker, '_codeflower/orchestrators/setAccess', { key: created.key, access: { code: false } });
+  assert.match((await mcp.tool('read_code', { path: script })).content[0].text, /does not let you read/);
+});
+
+test("a notebook's code goes without its outputs", () => {
+  const notebook = JSON.stringify({ cells: [{ cell_type: 'code', source: ['df = load()\n', 'df.head()'], outputs: [{ text: 'PAT-1 Jane' }] }, { cell_type: 'markdown', source: '# QC' }] });
+  const text = notebookSource(notebook);
+  assert.match(text, /df = load\(\)\ndf\.head\(\)/);
+  assert.match(text, /# QC/);
+  assert.doesNotMatch(text, /Jane/);
+});
+
+test("a figure shown in a step is asked about in the executor's chat, and the reply waits for the answer", async (t) => {
+  const { meta, orchestratorSocket, worker, workspace, codex, executorId } = await start(t);
+  const mcp = mcpClient(t, meta.link, orchestratorSocket);
+  await mcp.request('initialize', {});
+  const figure = join(workspace, 'figures', 'km.png');
+  const declined = join(workspace, 'figures', 'raw.png');
+  await mkdir(join(workspace, 'figures'), { recursive: true });
+  for (const file of [figure, declined]) await sharp({ create: { width: 20, height: 20, channels: 3, background: '#000' } }).png().toFile(file);
+  // The step's turn stays open until the fake is told to finish.
+  const asking = mcp.tool('ask', { message: 'long task' });
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  await call(codex, '_codeflower/sessions/record', { sessionId: executorId, entry: { kind: 'show', files: [figure, declined] } });
+  const first = await receive(codex, (message) => message.method === 'session/request_permission');
+  const second = await receive(codex, (message) => message.method === 'session/request_permission');
+  const prompts = [first, second];
+  assert.deepEqual(prompts.map((request) => request.params.toolCall.title).sort(), ['Share km.png with the orchestrator?', 'Share raw.png with the orchestrator?']);
+  codex.send(JSON.stringify({ jsonrpc: '2.0', id: 9301, method: 'fake/finish', params: { sessionId: executorId } }));
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  // The turn ended; the reply waits for the user.
+  const [waiting] = (await call(worker, '_codeflower/orchestrators/list')).result.orchestrators;
+  assert.equal(waiting.state, 'sharing');
+  for (const request of prompts) {
+    const share = request.params.toolCall.title.includes('km.png');
+    codex.send(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { outcome: { outcome: 'selected', optionId: share ? 'allow' : 'deny' } } }));
+  }
+  const text = (await asking).content[0].text;
+  assert.match(text, /2 files shown/);
+  assert.match(text, new RegExp(`- ${figure}: shared with you: look at it`));
+  assert.match(text, new RegExp(`- ${declined}: the user didn't share it with you`));
+  assert.equal((await mcp.tool('view_figure', { path: figure })).content[0].type, 'image');
+  assert.equal((await mcp.tool('view_figure', { path: declined })).isError, true);
+  const listed = (await mcp.tool('list_files')).content[0].text;
+  assert.match(listed, new RegExp(`- ${figure}\n`));
+  assert.match(listed, /The user did not share: .*raw\.png/);
+  const [pair] = (await call(worker, '_codeflower/orchestrators/list')).result.orchestrators;
+  assert.deepEqual(pair.files.map((file) => [file.path, file.kind, file.status]).sort(), [[declined, 'figure', 'declined'], [figure, 'figure', 'visible']].sort());
+});
+
+test("shows outside a step ask nothing; a figure shared later is told once; always shares without asking", async (t) => {
+  const { meta, orchestratorSocket, worker, workspace, codex, executorId, executor, created } = await start(t);
+  const mcp = mcpClient(t, meta.link, orchestratorSocket);
+  await mcp.request('initialize', {});
+  const figure = join(workspace, 'later.png');
+  await sharp({ create: { width: 20, height: 20, channels: 3, background: '#000' } }).png().toFile(figure);
+  await call(codex, '_codeflower/sessions/record', { sessionId: executorId, entry: { kind: 'show', files: [figure] } });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(codex.inbox.some((message) => message.method === 'session/request_permission'), false);
+  await call(worker, '_codeflower/orchestrators/share', { executor, path: figure });
+  assert.match((await mcp.tool('wait')).content[0].text, new RegExp(`Shared with you since your last call.*\n- ${figure}`, 's'));
+  assert.doesNotMatch((await mcp.tool('wait')).content[0].text, /Shared with you since/);
+
+  await call(worker, '_codeflower/orchestrators/setAccess', { key: created.key, access: { figures: 'always' } });
+  const asking = mcp.tool('ask', { message: 'long task' });
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  const fresh = join(workspace, 'fresh.png');
+  await call(codex, '_codeflower/sessions/record', { sessionId: executorId, entry: { kind: 'show', files: [fresh] } });
+  codex.send(JSON.stringify({ jsonrpc: '2.0', id: 9302, method: 'fake/finish', params: { sessionId: executorId } }));
+  assert.match((await asking).content[0].text, new RegExp(`- ${fresh}: shared with you`));
+  assert.equal(codex.inbox.some((message) => message.method === 'session/request_permission'), false);
+});
+
+test("the user's message queued to the orchestrator is steered into its turn after the executor's step", async (t) => {
+  const { meta, orchestratorSocket, open, created } = await start(t);
+  const mcp = mcpClient(t, meta.link, orchestratorSocket);
+  await mcp.request('initialize', {});
+  const claude = await open('claude');
+  await call(claude, 'initialize', { protocolVersion: 1 });
+  const sessionId = created.key.slice('claude-'.length);
+  await call(claude, 'session/resume', { sessionId, cwd: '/elsewhere', mcpServers: [] });
+  const queue = (text) => call(claude, '_codeflower/queue/add', { key: created.key, prompt: [{ type: 'text', text }], steer: [{ type: 'text', text }], editable: true });
+  // The orchestrator's turn runs (it would wait in the ask tool); the user queues a message meanwhile.
+  await queue('long task');
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  await queue('Use the log-rank test instead');
+  const result = (await mcp.tool('ask', { message: 'run failing command' })).content[0].text;
+  assert.match(result, /The user sent you a message while the executor worked/);
+  const steered = await receive(claude, (message) => message.params?.update?.content?.text === 'steered by Use the log-rank test instead');
+  assert.ok(steered);
+  // Nothing left waiting: the next step says nothing.
+  assert.doesNotMatch((await mcp.tool('ask', { message: 'run failing command' })).content[0].text, /The user (sent you|has) a message/);
+});
+
+test('the orchestrator keeps the map of ideas as its chat, and writes report drafts in the workspace', async (t) => {
+  const { meta, orchestratorSocket, workspace, worker, created, executor, transcript } = await start(t);
+  const mcp = mcpClient(t, meta.link, orchestratorSocket);
+  await mcp.request('initialize', {});
+  const made = await mcp.tool('roots', { args: ['new', 'Survival by arm', '--todo', 'Load the table'] });
+  assert.equal(made.isError, undefined, made.content[0].text);
+  const comment = await mcp.tool('roots', { args: ['comment', '1', 'Decision: status 2 is censored (codebook)'] });
+  assert.equal(comment.isError, undefined, comment.content[0].text);
+  const shown = (await mcp.tool('roots', { args: ['show', '1'] })).content[0].text;
+  assert.match(shown, /Survival by arm/);
+  assert.match(shown, /Decision: status 2 is censored/);
+  const idea = await readFile(join(workspace, 'roots', '001-survival-by-arm.md'), 'utf8').catch(async () => {
+    const { readdir } = await import('node:fs/promises');
+    return readFile(join(workspace, 'roots', (await readdir(join(workspace, 'roots'))).find((name) => name.endsWith('.md'))), 'utf8');
+  });
+  assert.match(idea, new RegExp(`"agent":"claude","sessionId":"${created.key.slice("claude-".length)}"`));
+  // Reads are noted in the executor's chat; writes are not.
+  const noted = (await transcript(executor)).filter((entry) => entry.kind === 'sent' && entry.what === 'roots');
+  assert.equal(noted.length, 1);
+  assert.equal((await mcp.tool('roots', { args: ['rm', '1'] })).isError, true);
+
+  // Another chat's idea, which may hold what that chat saw of the data: neither listed, read nor changed.
+  await new Promise((resolve, reject) =>
+    execFile(process.execPath, [fileURLToPath(new URL('../../../bin/codeflower-roots', import.meta.url)), 'new', 'Patient-level notes', '--todo', 'PAT-123 looks odd'], {
+      env: { ...process.env, CODEFLOWER_WORKSPACE: workspace, CODEFLOWER_ROOTS_DIR: '', CODEFLOWER_SHOW_SOCKET: '', CODEFLOWER_AGENT_NAME: 'codex', CODEX_THREAD_ID: 'other-chat', CLAUDE_CODE_SESSION_ID: '' }
+    }, (error) => (error ? reject(error) : resolve()))
+  );
+  const tree = (await mcp.tool('roots', { args: ['tree'] })).content[0].text;
+  assert.match(tree, /#1 \[active\] Survival by arm/);
+  assert.doesNotMatch(tree, /Patient-level|PAT-123/);
+  for (const args of [['show', '2'], ['comment', '2', 'hi'], ['todos', '2'], ['new', 'More', '--from', '2']]) {
+    const refused = await mcp.tool('roots', { args });
+    assert.equal(refused.isError, true, args.join(' '));
+    assert.match(refused.content[0].text, /not one of yours/);
+  }
+  assert.doesNotMatch((await mcp.tool('roots', { args: ['todos'] })).content[0].text, /PAT-123/);
+
+  const draft = await mcp.tool('write_draft', { name: 'survival', markdown: '# Survival\n\n<!-- figure figures/km.png key=fig-km -->' });
+  assert.equal(draft.isError, undefined);
+  assert.equal(await readFile(join(workspace, 'orchestrator', 'survival.md'), 'utf8'), '# Survival\n\n<!-- figure figures/km.png key=fig-km -->\n');
+  assert.equal((await mcp.tool('write_draft', { name: '../escape', markdown: 'x' })).isError, true);
+
+  await call(worker, '_codeflower/orchestrators/setAccess', { key: created.key, access: { roots: false } });
+  assert.match((await mcp.tool('roots', { args: ['tree'] })).content[0].text, /does not let you keep/);
 });

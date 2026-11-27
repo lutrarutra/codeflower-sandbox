@@ -605,6 +605,10 @@ export async function startBridge(options) {
     // bridge here (orchestrators.js).
     orchestratorSocket = join(tmpdir(), `codeflower-orchestrator-${instanceId}.sock`),
     orchestratorMcp,
+    // An executor's instructions: templates/EXECUTOR.md with its includes resolved (executor-folder.js).
+    executorText,
+    // How the orchestrators' `roots` tool runs codeflower-roots (tests run the checkout's).
+    orchestratorRootsCommand,
     // Tests make the watches' timings short (createWatches).
     watchesTiming = {},
     jobsInfo = readJobsInfo(workerEnvironment),
@@ -1315,6 +1319,8 @@ export async function startBridge(options) {
       const files = paths.slice(0, 20).map((file) => file.slice(0, 4096));
       const note = typeof message === 'string' && message ? message.slice(0, 2000) : undefined;
       recorder.record(sessionId, { kind: 'show', files, ...(note ? { message: note } : {}) });
+      // An executor's show during its orchestrator's step: shared, or asked about (orchestrators.js).
+      orchestrators?.shown(sessionKey(agentName, sessionId), files);
       const since = Date.now() - 60_000;
       for (const [id, shows] of recentShows) {
         const kept = shows.filter((show) => show.at > since);
@@ -1863,6 +1869,23 @@ export async function startBridge(options) {
       const handoff = host.handoffs.get(sessionId);
       if (handoff) return handoff.busy || Boolean(handoff.current);
       return activity.busy(sessionId) || host.prompts.has(sessionId);
+    };
+
+    // Waiting prompts (each with its `steer`) into the chat's running turn, as
+    // one message, where the agent takes messages while it works: taken from
+    // the queue, and put back first when that fails. Whether they went.
+    const steerQueued = async (host, sessionId, items) => {
+      if (!items.length || !chatRunning(host, sessionId) || host.handoffs.has(sessionId)) return false;
+      if ((await host.initialized)?._meta?.steering?.supported !== true) return false;
+      for (const item of items) promptQueue.take(sessionId, { id: item.id });
+      const steered = await requestAgent(host, STEER_METHOD, {
+        sessionId,
+        prompt: items.flatMap((item) => item.steer),
+        _meta: { steering: { idleBehavior: 'promptRequired' } }
+      }).catch(() => undefined);
+      if (steered?.outcome === 'injected' || steered?.outcome === 'startedNewTurn') return true;
+      promptQueue.putFirst(sessionId, items);
+      return false;
     };
 
     // ---- letting go of chats: to another worker, or when no window has them ----
@@ -2509,13 +2532,13 @@ export async function startBridge(options) {
     // A chat the bridge starts for a window's fork or an agent's codeflower-chat
     // (chats.js): `fork` the agent's own fork of a chat, else a new one; its
     // record starts with `entries`, and its first prompt, if any, goes now.
-    // `fields`: more for its meta, and `orchestrator` what an orchestrator's
-    // session starts with (orchestrators.js).
-    const startChat = async ({ fork, cwd = workspace, settings, seed, entries, origin, fields, orchestrator, title, prompt }) => {
+    // `fields`: more for its meta, and `orchestrator` or `executor` what an
+    // orchestrator's or an executor's session starts with (orchestrators.js).
+    const startChat = async ({ fork, cwd = workspace, settings, seed, entries, origin, fields, orchestrator, executor, title, prompt }) => {
       if (!store) throw new Error('This worker keeps no chats');
       const host = await ensureAgent();
       await ensureInitialized(host);
-      const options = { ...(settings ? { settings } : {}), ...(orchestrator ? { orchestrator } : {}) };
+      const options = { ...(settings ? { settings } : {}), ...(orchestrator ? { orchestrator } : {}), ...(executor ? { executor } : {}) };
       const session = fork
         ? await requestAgent(host, 'session/fork', { sessionId: fork.sessionId, cwd, mcpServers: [], ...(fork.cursorId ? { cursorId: fork.cursorId } : {}) }, options)
         : await requestAgent(host, 'session/new', { cwd, mcpServers: [] }, options);
@@ -3145,6 +3168,8 @@ export async function startBridge(options) {
     // An orchestrator's session (orchestrators.js), on every start of it, also a
     // window's: its folder, only the bridge's MCP server, and what the agent's
     // index.js says it takes (Claude: no tools but the web's, and its prompt).
+    // An executor's: its own folder, whose AGENTS.md is its prompt, and what
+    // its agent's `executor` hook gives it (Claude: fewer tools).
     const withSessionMeta = (message, request) => {
       if (!SESSION_STARTS.includes(message.method) || !protocolObject(message.params)) return message;
       let extra = mergeMeta(agent.sessionMeta, subagentEffects().sessionMeta);
@@ -3154,6 +3179,11 @@ export async function startBridge(options) {
       if (orchestrator && agent.orchestrator) {
         extra = mergeMeta(extra, agent.orchestrator({ access: orchestrator.access, prompt: ORCHESTRATOR_PROMPT }));
         params = { ...params, cwd: orchestrator.cwd, mcpServers: [orchestrators.mcpServer(orchestrator.link)] };
+      }
+      const executor = message.method === 'session/new' ? request?.executor : orchestrators?.executorSession(agentName, params.sessionId);
+      if (executor) {
+        if (executor.meta) extra = mergeMeta(extra, executor.meta);
+        params = { ...params, cwd: executor.cwd };
       }
       if (!Object.keys(extra).length) return params === message.params ? message : { ...message, params };
       return { ...message, params: { ...params, _meta: mergeMeta(params._meta, extra) } };
@@ -3649,6 +3679,7 @@ export async function startBridge(options) {
           // A show the bridge noted itself, which older windows note again.
           if (!notedAlready(sessionId, noted, note)) {
             recorder.record(sessionId, { kind: 'show', files: noted, ...(note !== undefined ? { message: note } : {}) });
+            orchestrators?.shown(sessionKey(agentName, sessionId), noted);
           }
           respond({});
           break;
@@ -3741,19 +3772,9 @@ export async function startBridge(options) {
             break;
           }
           // A command or an action is a prompt of its own: the window gave no `steer` for it.
-          const running = chatRunning(host, sessionId);
-          if (running && item.steer && !host.handoffs.has(sessionId) && (await host.initialized)?._meta?.steering?.supported === true) {
-            promptQueue.take(sessionId, { id: item.id });
-            const steered = await requestAgent(host, STEER_METHOD, {
-              sessionId,
-              prompt: item.steer,
-              _meta: { steering: { idleBehavior: 'promptRequired' } }
-            }).catch(() => undefined);
-            if (steered?.outcome === 'injected' || steered?.outcome === 'startedNewTurn') {
-              respond({ sent: true, steered: true });
-              break;
-            }
-            promptQueue.putFirst(sessionId, [item]);
+          if (item.steer && (await steerQueued(host, sessionId, [item]))) {
+            respond({ sent: true, steered: true });
+            break;
           }
           promptQueue.sendFirst(sessionId, item.id, { afterCancel: chatRunning(host, sessionId) });
           if (chatRunning(host, sessionId)) interruptChat(host, sessionId);
@@ -3919,6 +3940,17 @@ export async function startBridge(options) {
       },
       flush: () => recorder?.flush(),
       noteShown,
+      // The user's messages waiting for the chat's turn (an orchestrator's,
+      // between its executor's steps): steered into the turn now, or left
+      // waiting where the agent cannot take them (orchestrators.js).
+      async deliverQueued(sessionId) {
+        const items = promptQueue.waiting(sessionId);
+        const own = items.filter((item) => item.editable && item.steer);
+        if (!own.length) return { steered: 0, waiting: items.filter((item) => item.editable).length };
+        const host = agentHost;
+        if (host && (await steerQueued(host, sessionId, own))) return { steered: own.length, waiting: 0 };
+        return { steered: 0, waiting: own.length };
+      },
       commands,
       // The chats whose agent or a subagent works, for a wrap-up: idle ones,
       // even those waiting for the user, have nothing to wrap up.
@@ -4424,6 +4456,14 @@ export async function startBridge(options) {
           if (!orchestrators) throw new InvalidRequest('This worker keeps no chats');
           respond(await orchestrators.share({ executor: params.executor, key: params.orchestrator ?? undefined, path: params.path }));
           break;
+        // A chat action of the orchestrator's (the report), chosen in its executor's chat.
+        case '_codeflower/orchestrators/runAction': {
+          if (!orchestrators) throw new InvalidRequest('This worker keeps no chats');
+          const action = actions.find((candidate) => candidate.id === params.id);
+          if (!action) throw new InvalidRequest(`No action ${params.id}`);
+          respond(orchestrators.runAction({ executor: params.executor, action }));
+          break;
+        }
         case '_codeflower/orchestrators/disconnect':
           if (!orchestrators) throw new InvalidRequest('This worker keeps no chats');
           respond(await orchestrators.disconnect({ key: params.key }));
@@ -4705,6 +4745,10 @@ export async function startBridge(options) {
       thumbnails,
       fileOptions,
       folders: async () => searchFolders(workspace, (await describe())?.mounts ?? []),
+      workspace,
+      executorText,
+      ...(orchestratorRootsCommand ? { rootsCommand: orchestratorRootsCommand } : {}),
+      rootsEnvironment: { CODEFLOWER_SHOW_SOCKET: showSocket, ...(workerEnvironment.CODEFLOWER_ROOTS_DIR ? { CODEFLOWER_ROOTS_DIR: workerEnvironment.CODEFLOWER_ROOTS_DIR } : {}) },
       changed: (list) => {
         for (const target of clients) {
           if (target.agentName === undefined) target.send({ jsonrpc: '2.0', method: '_codeflower/orchestrators/changed', params: { orchestrators: list } });

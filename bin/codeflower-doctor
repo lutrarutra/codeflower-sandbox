@@ -220,15 +220,6 @@ function otherChats() {
   ];
 }
 
-// Orchestrators of this chat (codeflower-orchestrator), which only a worker's bridge serves.
-function orchestrators() {
-  if (!process.env.CODEFLOWER_ORCHESTRATOR_SOCKET) return ['- Unavailable: this sandbox runs no code flower worker (e.g. a batch job or a run task).'];
-  return [
-    '- The user may connect an orchestrator to a chat: a hosted model that directs and checks your work, and may not see the data. `codeflower-orchestrator whoami` lists this chat\'s.',
-    '- Send it code, schemas and aggregates, never rows or identifiers; ask it with `codeflower-orchestrator ask "…"`. Follow the codeflower-executor skill.'
-  ];
-}
-
 // Waiting for something (codeflower-watch), which the worker's bridge runs.
 function watches() {
   if (!process.env.CODEFLOWER_WATCH_SOCKET) {
@@ -272,6 +263,48 @@ function paperAudit() {
   ];
 }
 
+// The user's mounts as the app reported them: [{ target, readOnly, source? }].
+function mounts() {
+  const list = JSON.parse(process.env.CODEFLOWER_MOUNTS ?? 'null');
+  if (!Array.isArray(list)) throw new Error('mount metadata not provided or not an array');
+  for (const mount of list) {
+    if (typeof mount.target !== 'string' || typeof mount.readOnly !== 'boolean') throw new Error('invalid mount metadata');
+  }
+  return list;
+}
+
+// An orchestrator's executor (templates/EXECUTOR.md) gets the facts it sizes
+// its steps by, without the sections for what it does not do (other chats,
+// Roots, paper audits).
+function startupFacts({ executor = false } = {}) {
+  const file = process.env.CODEFLOWER_ENVIRONMENT_FILE;
+  if (!file) {
+    console.log('Startup facts are unavailable: CODEFLOWER_ENVIRONMENT_FILE is not set.');
+    process.exitCode = 1;
+    return;
+  }
+  try {
+    const text = readFileSync(file, 'utf8');
+    process.stdout.write(executor ? text.replace(/\n## Paper audit\n[\s\S]*?(?=\n## |$)/, '\n') : text);
+  } catch (error) {
+    console.error(`codeflower-doctor: cannot read startup facts: ${error.message}`);
+    process.exitCode = 1;
+  }
+}
+
+function networkAllowlist() {
+  if (process.env.CODEFLOWER_NETWORK !== 'isolated') return;
+  console.log('\n## Current network allowlist');
+  try {
+    process.stdout.write(execFileSync('codeflower-network', [], {
+      encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe']
+    }));
+  } catch (error) {
+    console.error(`codeflower-doctor: cannot retrieve allowlist: ${error.stderr?.toString().trim() || error.message}`);
+    process.exitCode = 1;
+  }
+}
+
 function launchFacts() {
   const lines = [
     '# Sandbox environment at worker startup',
@@ -288,20 +321,14 @@ function launchFacts() {
     '## Configured user mounts'
   ];
   try {
-    const mounts = JSON.parse(process.env.CODEFLOWER_MOUNTS ?? 'null');
-    if (!Array.isArray(mounts)) throw new Error('mount metadata not provided or not an array');
-    for (const mount of mounts) {
-      if (typeof mount.target !== 'string' || typeof mount.readOnly !== 'boolean') {
-        throw new Error('invalid mount metadata');
-      }
-    }
+    const list = mounts();
     const host = (mount) => typeof mount.source === 'string'
       ? `, ${JSON.stringify(mount.source)}${mount.given ? ` (given as ${JSON.stringify(mount.given)})` : ''} on the user's computer`
       : '';
-    lines.push(...(mounts.length
-      ? mounts.map((mount) => `- ${JSON.stringify(mount.target)}: ${mount.readOnly ? 'read-only' : 'read-write'}${host(mount)}`)
+    lines.push(...(list.length
+      ? list.map((mount) => `- ${JSON.stringify(mount.target)}: ${mount.readOnly ? 'read-only' : 'read-write'}${host(mount)}`)
       : ['- No user mounts reported.']));
-    if (mounts.length) lines.push('', 'Host paths do not exist in the sandbox: `codeflower-path PATH` translates either way.');
+    if (list.length) lines.push('', 'Host paths do not exist in the sandbox: `codeflower-path PATH` translates either way.');
   } catch (error) {
     lines.push(`- Mount metadata unavailable: ${error.message}`);
   }
@@ -314,41 +341,38 @@ const args = process.argv.slice(2);
 try {
   if (args.length === 1 && args[0] === '--json') {
     process.stdout.write(`${JSON.stringify(resourcesJSON())}\n`);
+  } else if (args.length === 2 && args.includes('--executor') && args.includes('--json')) {
+    // What an orchestrator plans compute by (its `environment` tool): no host paths, which name the user's folders, unless it asks.
+    let list = [];
+    try {
+      list = mounts();
+    } catch {}
+    process.stdout.write(`${JSON.stringify({
+      ...resourcesJSON(),
+      network: process.env.CODEFLOWER_NETWORK === 'isolated' ? 'isolated' : 'not isolated',
+      workspace: process.env.CODEFLOWER_WORKSPACE || `${state}/workspace`,
+      mounts: list.map((mount) => ({ target: mount.target, readOnly: mount.readOnly, ...(typeof mount.source === 'string' ? { source: mount.source } : {}) }))
+    })}\n`);
   } else if (args.length === 2 && args[0] === '--write-startup') {
     writeFileSync(args[1], launchFacts(), { mode: 0o600 });
+  } else if (args.length === 1 && args[0] === '--executor') {
+    startupFacts({ executor: true });
+    console.log('\n## Current allocation\n' + allocation().join('\n'));
+    console.log('\n## Current resources\n' + resources().join('\n'));
+    console.log('\n## Batch jobs\n' + batchJobs().join('\n'));
+    console.log('\n## Waiting (watches)\n' + watches().join('\n'));
+    networkAllowlist();
   } else if (args.length === 0) {
-    const file = process.env.CODEFLOWER_ENVIRONMENT_FILE;
-    if (file) {
-      try {
-        process.stdout.write(readFileSync(file, 'utf8'));
-      } catch (error) {
-        console.error(`codeflower-doctor: cannot read startup facts: ${error.message}`);
-        process.exitCode = 1;
-      }
-    } else {
-      console.log('Startup facts are unavailable: CODEFLOWER_ENVIRONMENT_FILE is not set.');
-      process.exitCode = 1;
-    }
+    startupFacts();
     console.log('\n## Current allocation\n' + allocation().join('\n'));
     console.log('\n## Current resources\n' + resources().join('\n'));
     console.log('\n## Batch jobs\n' + batchJobs().join('\n'));
     console.log('\n## Roots (the map of ideas)\n' + roots().join('\n'));
     console.log('\n## Other chats\n' + otherChats().join('\n'));
-    console.log('\n## Orchestrators\n' + orchestrators().join('\n'));
     console.log('\n## Waiting (watches)\n' + watches().join('\n'));
-    if (process.env.CODEFLOWER_NETWORK === 'isolated') {
-      console.log('\n## Current network allowlist');
-      try {
-        process.stdout.write(execFileSync('codeflower-network', [], {
-          encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe']
-        }));
-      } catch (error) {
-        console.error(`codeflower-doctor: cannot retrieve allowlist: ${error.stderr?.toString().trim() || error.message}`);
-        process.exitCode = 1;
-      }
-    }
+    networkAllowlist();
   } else {
-    console.error('Usage: codeflower-doctor [--json]');
+    console.error('Usage: codeflower-doctor [--executor] [--json]');
     process.exitCode = 2;
   }
 } catch (error) {

@@ -578,6 +578,18 @@ input.on('line', async (line) => {
         }, every);
         break;
       }
+      if (text.startsWith('write script ')) {
+        // A file tool's write, as Claude Code's Write reports it: the path and the text it wrote.
+        const { sessionId } = message.params;
+        const path = text.slice('write script '.length);
+        const content = "import pandas as pd\nprint(pd.read_csv('x.csv').shape)\n";
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(path, content);
+        update(sessionId, { sessionUpdate: 'tool_call', toolCallId: 'write-1', title: `Write ${path}`, kind: 'edit', status: 'pending', rawInput: { file_path: path, content } });
+        update(sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'write-1', status: 'completed' });
+        reply(sessionId, message.id, 'Done: wrote the script.');
+        break;
+      }
       if (text === 'run failing command') {
         // As dsh-acp reports a command that exited 1: completed, with the marker.
         const { sessionId } = message.params;

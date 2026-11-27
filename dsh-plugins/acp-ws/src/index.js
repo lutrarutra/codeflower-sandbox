@@ -10,10 +10,22 @@ import { connectionUrl, pageLink, readyMessage, startBridge } from './server.js'
 import { EXIT_CODES, runTask } from './task.js';
 import { parseResume, runTui } from './tui.js';
 import { readVersions } from './versions.js';
+import { resolveIncludes } from './executor-folder.js';
 
 const RUNTIME_MODULES = '/opt/codeflower/runtime/node_modules';
 const STATE = '/codeflower-state';
 const TEMPLATES = '/opt/codeflower/templates';
+
+// The executor's instructions (executor-folder.js), or none in an image without the template.
+async function readExecutorText() {
+  try {
+    const [template, agents] = await Promise.all([readFile(`${TEMPLATES}/EXECUTOR.md`, 'utf8'), readFile(`${TEMPLATES}/AGENTS.md`, 'utf8')]);
+    return resolveIncludes(template, { 'AGENTS.md': agents });
+  } catch (error) {
+    process.stderr.write(`Executors get no instructions: ${error.message}\n`);
+    return undefined;
+  }
+}
 const INITIAL_PROMPT_FILE = process.env.CODEFLOWER_INITIAL_PROMPT_FILE;
 // `--server`: the worker also serves the chat page on its port.
 const SERVE_PAGE = process.env.CODEFLOWER_PAGE === '1';
@@ -251,6 +263,7 @@ const bridge = await startBridge({
   // The batch job's end, from the app (Slurm, PBS, HTCondor or --time-limit).
   allocationEnd: Date.parse(process.env.CODEFLOWER_ALLOCATION_END ?? '') || undefined,
   actions: await readActions(`${TEMPLATES}/actions`),
+  executorText: await readExecutorText(),
   wrapUpTemplate: await readFile(`${TEMPLATES}/wrap-up.md`, 'utf8'),
   wrapUpQuitTemplate: await readFile(`${TEMPLATES}/wrap-up-quit.md`, 'utf8'),
   versions: await readVersions({ runtimeModules: RUNTIME_MODULES, pageDirectory: PAGE_DIRECTORY }),

@@ -8,10 +8,10 @@ import { basename } from 'node:path';
 
 const usage = `Usage: codeflower-orchestrator COMMAND [ARGS...]
 
-The orchestrators of this chat: hosted models the user connected to it to
-direct and check your work. They may not see the data, so send them code,
-schemas, column names, aggregates and errors, never rows or identifiers
-(the codeflower-executor skill).
+The orchestrator of this executor chat: the hosted model the user paired
+with it to decide and check your work. It may not see the data, so send it
+code, schemas, column names, aggregates and errors, never rows or identifiers
+(the AGENTS.md of this chat's folder).
 
   ask [--to KEY] [--file FILE] MESSAGE | -
                             ask the orchestrator something and wait for its
@@ -22,7 +22,7 @@ schemas, column names, aggregates and errors, never rows or identifiers
                             the only one)
   whoami                    this chat's key and its orchestrators
 
-At most 5 questions per turn. Exit status 3: the user withheld the question,
+At most 10 questions per turn. Exit status 3: the user withheld the question,
 or it got no answer.
 
 Add --json to any command for JSON.`;

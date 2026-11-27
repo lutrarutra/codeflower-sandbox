@@ -102,6 +102,11 @@ export function createPromptQueue({ onChange = () => {} } = {}) {
       return taken;
     },
 
+    /** The chat's waiting prompts, first first (a copy). */
+    waiting(sessionId) {
+      return [...(chats.get(sessionId)?.items ?? [])];
+    },
+
     find(sessionId, id) {
       return chats.get(sessionId)?.items.find((item) => item.id === id);
     },

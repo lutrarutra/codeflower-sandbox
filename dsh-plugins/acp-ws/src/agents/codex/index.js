@@ -53,6 +53,12 @@ export default function codex({ descriptor, home, nodePath, modules }) {
           ...(resume === 'last' ? ['resume', '--last'] : resume === 'pick' ? ['resume'] : resume ? ['resume', resume] : [])
         ]
       : undefined,
+    // An executor's chat (orchestrators.js) works in a folder of its own, and
+    // writes in the workspace: Codex's "Full access" mode, as the image's
+    // config.toml has for every chat (sandbox_mode), which a new chat's
+    // default mode (Auto review) would narrow to its working folder. Its tools
+    // cannot be limited per chat.
+    executor: () => ({ settings: { options: { mode: 'agent-full-access' } } }),
     // The chat its terminal UI wrote last: sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl.
     async lastSession({ since }) {
       if (!home) return undefined;

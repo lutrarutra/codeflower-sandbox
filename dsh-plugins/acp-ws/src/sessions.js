@@ -441,6 +441,8 @@ export async function listSessions(directory, now = Date.now()) {
       ...(meta.role === 'orchestrator'
         ? { role: meta.role, executor: meta.executor, access: meta.access, ...(meta.disconnected ? { disconnected: true } : {}) }
         : {}),
+      // An orchestrator's executor's: the orchestrator it works for.
+      ...(meta.role === 'executor' ? { role: meta.role, ...(typeof meta.orchestrator === 'string' ? { orchestrator: meta.orchestrator } : {}) } : {}),
       ...(leaseIsFresh(lease, now) ? { openOn: lease.instanceId } : {})
     });
   }

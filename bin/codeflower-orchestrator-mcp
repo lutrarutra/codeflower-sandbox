@@ -12,18 +12,27 @@ const link = process.argv[2];
 const socketPath = process.env.CODEFLOWER_ORCHESTRATOR_SOCKET;
 
 const INSTRUCTIONS =
-  'Your executor: a chat on a model on the user\'s cluster, which alone works with the data. ' +
-  'Send it a task with ask; you get its final message and the commands it ran. It may ask you something ' +
-  'instead (answer it with answer). Never ask it for rows, records or identifiers.';
+  'Your executor: a chat of a much smaller model on the user\'s cluster, which alone works with the data. ' +
+  'You make every decision; send it one small, fully specified step at a time with ask, and check each step ' +
+  'before the next. Trust nothing it says: small models are overconfident and report results they never ' +
+  'computed. Check its claims against the commands\' exit status, its code (read_code), its figures ' +
+  '(view_figure) and checks you ask for. It asks you about anything you left open: answer it fully (answer). ' +
+  'Never ask it for rows, records or identifiers.';
 
 const TOOLS = [
   {
     name: 'ask',
     description:
-      "Sends the executor a message and waits until it is done: returns its final message with the commands it ran (their input, not their output), or a question it asks you (answer it with answer). It may take minutes. Never ask for rows, records, identifiers or anything that could identify a person.",
+      "Sends the executor one step and waits until it is done: returns its reply with the commands it ran (their input and exit status, not their output) and the files it wrote and showed, or a question it asks you (answer it with answer). It may take minutes. Never ask for rows, records, identifiers or anything that could identify a person.",
     inputSchema: {
       type: 'object',
-      properties: { message: { type: 'string', description: 'What the executor should do: one concrete step, with how to check it.' } },
+      properties: {
+        message: {
+          type: 'string',
+          description:
+            'One small step, fully specified so that it needs no judgment: the file, columns, method, parameters, plot type and axes, library and output path, and what to print to check it.'
+        }
+      },
       required: ['message']
     }
   },
@@ -38,10 +47,47 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: {} }
   },
   {
+    name: 'read_code',
+    description:
+      "Reads a script the executor wrote or changed in one of your steps (its replies list them under \"Code it wrote\"), as the user allows; a notebook without its outputs. Read every script before you trust what it computed.",
+    inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }
+  },
+  {
+    name: 'roots',
+    description:
+      "The project's map of ideas, which you keep and the user watches: runs codeflower-roots with these arguments, as your chat. You see and change only the ideas you started (other chats' ideas may hold what they saw of the data). Commands: tree, show ID, todos [ID], new TITLE [--from ID] [--todo TEXT]..., update ID [--status S], todo add|check|uncheck ID ..., need add|check ID ..., link ID PATH..., comment ID TEXT, conclude ID TEXT [--done], open [ID]. Record each decision as a comment starting \"Decision:\" with its reason.",
+    inputSchema: {
+      type: 'object',
+      properties: { args: { type: 'array', items: { type: 'string' }, description: 'e.g. ["new", "Survival by arm", "--todo", "Load and check the table"]' } },
+      required: ['args']
+    }
+  },
+  {
+    name: 'write_draft',
+    description:
+      "Writes your report's draft, as Markdown, to orchestrator/NAME.md in the executor's workspace, for the executor to build the report from. Mark each figure or table with a placeholder line, e.g. <!-- figure figures/km.png key=fig-km caption=\"…\" -->. Overwrites the draft of that name.",
+    inputSchema: {
+      type: 'object',
+      properties: { name: { type: 'string', description: 'A slug, e.g. survival' }, markdown: { type: 'string' } },
+      required: ['name', 'markdown']
+    }
+  },
+  {
+    name: 'report_guide',
+    description: "How reports are built with storyteller, the executor's report library: read it once before you write a report's draft.",
+    inputSchema: { type: 'object', properties: {} }
+  },
+  {
     name: 'list_directory',
     description:
       "Lists a folder the executor works in: names, types and sizes, never what the files hold. Without a path: the folders (workspace, inputs, outputs, code). Use it to plan what to ask the executor; you cannot read the files.",
     inputSchema: { type: 'object', properties: { path: { type: 'string', description: 'An absolute path in one of those folders; empty for the folders themselves.' } } }
+  },
+  {
+    name: 'environment',
+    description:
+      "The executor's sandbox: CPUs, memory, GPUs, the allocation and when it ends, whether batch jobs are on, the network, and the mounted folders. Call it before planning a step that computes much (threads, memory, or a batch job).",
+    inputSchema: { type: 'object', properties: {} }
   },
   {
     name: 'list_files',

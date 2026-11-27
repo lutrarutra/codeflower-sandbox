@@ -97,6 +97,17 @@ export default function claude({ descriptor, home, modules, environment }) {
         systemPrompt: { append: prompt }
       };
     },
+    // An executor's session (orchestrators.js), on every start of it: the
+    // tools to work on the data and nothing else (no web, no subagents), the
+    // workspace writable next to its own folder (the working folder, whose
+    // CLAUDE.md is its prompt), and only the user's and that folder's settings.
+    executor({ workspace }) {
+      const tools = ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'NotebookEdit'];
+      return {
+        tools,
+        meta: { claudeCode: { options: { tools, additionalDirectories: [workspace], settingSources: ['user', 'project'] } } }
+      };
+    },
     // Claude Code starts turns by itself, e.g. when a background command it said
     // it waits for ends. The adapter tells of them only to a client of AIR's
     // async tasks: as a task of type `turn`, spawned when the turn starts and
