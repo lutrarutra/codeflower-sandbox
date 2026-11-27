@@ -12,7 +12,9 @@
     "variable": "DSH_HOME",
     "path": "dsh-home"
   },
-  "env": {},
+  "env": {
+    "DSH_PERMISSION_MODE": "danger-full-access"
+  },
   "credentialVariables": [
     "DEEPSEEK_API_KEY",
     "CODEFLOWER_OPENAI_COMPAT_API_KEY"
