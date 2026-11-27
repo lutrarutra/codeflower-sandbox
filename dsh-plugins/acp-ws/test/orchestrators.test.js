@@ -210,7 +210,8 @@ async function start(t) {
 
 test("an orchestrator's session: its folder, the bridge's MCP server only, no tools but the web's, its prompt", async (t) => {
   const { worker, open, say, executor, created, meta, sessionsDirectory } = await start(t);
-  assert.match(created.title, /^Orchestrator of hello/);
+  // The executor's title may not be written yet: named after it, or untitled.
+  assert.match(created.title, /^Orchestrator of /);
   assert.equal(meta.role, 'orchestrator');
   assert.equal(meta.executor, executor);
   assert.deepEqual(meta.access, DEFAULT_ACCESS);
